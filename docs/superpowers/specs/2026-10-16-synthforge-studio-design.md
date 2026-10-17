@@ -25,7 +25,7 @@ SynthForge Studio 是一款本地桌面 AI 游戏开发工作站：同一软件�
 - Blender 建模区：固定资产库目录、右键分类文件夹；两种建模模式（低模 = Blender MCP 直操、3D 云 API = 混元3D / Tripo / 自定义）。
 - 提示词总结 agent：把口语化需求改写为专业提示词，以可编辑草稿形式确认后再生成。
 - Unity 区：自选游戏工程、单一激活工程互斥切换、文件变更双源同步、Unity MCP 对话驱动（建物体 / 脚本 / 组件 / 截图 / Console 回读）。
-- 跨区资产流转：「添加资产」选择器 → glb 自动经 Blender 转 fbx → unity-mcp 导入实例化。
+- 跨区资产流转：「添加资产」选择器 → glb 自动经 Blender 转 fbx → Unity MCP 导入实例化。
 - 两栏式设置（Agent 模型 / 3D 模型）、配置本地持久化、会话持久化、任务日志。
 - Windows 桌面单 exe 分发（Qt + WebEngine）。
 
@@ -209,7 +209,7 @@ agent 开始执行
 
 - 独立会话（与 blender 区完全隔离）。
 - 可用工具集 = Unity MCP 工具：创建 GameObject、挂组件、改 Transform / 光源 / 材质、读写编译 C# 脚本、读 Console、截 Game 窗口。
-- 执行流程：需求 → agent 循环（Agent 模型 + unity-mcp）→ 步骤卡 + **Game 截图回传对话区** → 编译报错自动回读 Console 继续修。
+- 执行流程：需求 → agent 循环（Agent 模型 + Unity MCP）→ 步骤卡 + **Game 截图回传对话区** → 编译报错自动回读 Console 继续修。
 - 前置检查：Unity 链就绪，否则引导提示。
 
 ### 6.4 「添加资产」跨区联动
@@ -225,7 +225,7 @@ agent 处理链：
   · 附件是 .glb 且无配对 .fbx → 先调 Blender 链转换 glb→fbx（存回同一资产文件夹）
   · 附件是 .fbx → 直接用
    ↓
-unity-mcp 导入资产 → 按用户要求实例化（坐标 / 命名 / 挂载）
+Unity MCP 导入资产 → 按用户要求实例化（坐标 / 命名 / 挂载）
    ↓
 对话区回传操作结果 + Game 截图
 ```
@@ -303,8 +303,8 @@ unity-mcp 导入资产 → 按用户要求实例化（坐标 / 命名 / 挂载�
 │                                                              │
 │  C++ 核心                        │  C++ ↔ 前端：WebSocket       │
 │   ├─ WS 服务端 (127.0.0.1 随机端口 + token 握手)               │
-│   ├─ MCP 客户端模块（自研）──QProcess──┬→ blender-mcp 桥接(Py)  │
-│   ├─ LLM 网关（OpenAI兼容+SSE流式）    └→ unity-mcp 桥接(Py)    │
+│   ├─ MCP 客户端模块（自研）──QProcess──┬→ mcp-for-blender(Py)   │
+│   ├─ LLM 网关（OpenAI兼容+SSE流式）    └→ mcp-for-unity(Py)     │
 │   ├─ 云3D适配层（Tripo / 混元TC3签名 / 自定义）                  │
 │   ├─ Agent 编排器（总结agent / 主循环 / 工具路由）               │
 │   ├─ 任务管理器（绑定工程、取消、重试）                          │
@@ -359,8 +359,10 @@ unity-mcp 导入资产 → 按用户要求实例化（坐标 / 命名 / 挂载�
 
 ### 8.6 进程与环境管理
 
-- 桥接进程由 QProcess 拉起：`uvx blender-mcp`（连 Blender 插件 socket）、unity-mcp 官方桥接（连 Unity 包服务）。
-- `uvx` 会自动拉取对应的 Python 包；本机须具备 Python + uv 环境（纳入 8.8 环境自检）。
+- 桥接进程由 QProcess 拉起，内置两条默认命令（与当前开发机实测一致；写在配置默认值中，不占用设置页 UI，换包 / 升级时改配置即可）：
+  - Blender：`uvx --python 3.11 mcp-for-blender`，附加环境变量 `UV_PYTHON_PREFERENCE=only-managed`；桥接再连 Blender 内插件 socket。
+  - Unity：`uvx --from mcpforunityserver mcp-for-unity --transport stdio`；桥接再连 Unity 编辑器内的包服务。
+- `uvx` 会自动拉取对应的 Python 包（首次运行联网下载，可能耗时数十秒，前端显示"连接中"）；本机须具备 Python + uv 环境（纳入 8.8 环境自检）。
 - 桥接进程的 stderr 全部重定向到程序日志；**stderr 绝不能混入 stdout 的 JSON-RPC 数据流**（stdout 只承载协议数据）。
 - 心跳检测（定时 ping / tools-list）+ 断线指数退避重连。
 - 程序退出时确保桥接子进程全部终止，不留孤儿。
@@ -373,7 +375,7 @@ unity-mcp 导入资产 → 按用户要求实例化（坐标 / 命名 / 挂载�
 
 ### 8.8 运行前置条件（环境自检项）
 
-- Blender（含 blender-mcp 插件）与 Unity（含 unity-mcp 包）由用户自行安装，软件只通过 MCP 连接，不内置。
+- Blender（含 mcp-for-blender 配套插件）与 Unity（含 MCP for Unity 包）由用户自行安装，软件只通过 MCP 连接，不内置。
 - MCP 桥接为 Python 进程：需要本机 Python + uv；自检页给出各依赖的检测结果与安装引导。
 - 开发机：Qt 6（含 WebEngine 模块）+ MSVC + CMake；Windows 10/11。
 
