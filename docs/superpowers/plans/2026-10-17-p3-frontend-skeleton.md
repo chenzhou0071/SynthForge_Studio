@@ -266,8 +266,10 @@ onMounted(async () => {
       <div class="content">
         <FileTree :area="active" />
         <PreviewPane v-if="active === 'blender'" />
-        <ChatPanel :area="active" :client="client" />
+        <ChatPanel v-show="active === 'blender'" area="blender" :client="client" />
+        <ChatPanel v-show="active === 'unity'" area="unity" :client="client" />
       </div>
+      <!-- 两个 ChatPanel 均为常驻实例：切区只 v-show，不卸载、不重建、不丢后台事件 -->
     </div>
     <SettingsDialog v-model:open="settingsOpen" :client="client" />
   </div>
@@ -295,7 +297,7 @@ const color = (s: string) => (s === "ready" ? "#4ec9b0" : s === "reconnecting" ?
 </template>
 ```
 
-`ChatPanel.vue` 核心逻辑：消息列表 + 输入框；`send()` → `client.request("chat.send", {area, text})`；订阅 `chat.message` append；`chat.delta` 追加到 streaming 气泡；`error.card` 显示红色卡片。
+`ChatPanel.vue` 核心逻辑：消息列表 + 输入框；`send()` → `client.request("chat.send", {area, text})`；订阅 `chat.message` append；`chat.delta` 追加到 streaming 气泡；`error.card` 显示红色卡片。`App.vue` 同时挂载两个实例，每个实例只处理 `d.area === props.area` 的事件，因此后台区的事件仍会写入自己的面板。
 
 `FileTree.vue` / `PreviewPane.vue`：P3 先静态骨架（文件树渲染 `client.request("session.load")` 之外的数据留空，P4/P6 填数据源），保持布局位置。
 
@@ -474,11 +476,11 @@ Expected: 窗口加载 `app://ui/index.html`，布局与 dev 一致；设置保�
 - Modify: `web/src/components/ChatPanel.vue`（历史加载 / 清空 / chat.image / 模式切换 / 云徽标）
 - Modify: `web/src/components/FileTree.vue`（右键菜单五項）
 - Modify: `web/src/components/PreviewPane.vue`（文本高亮 / 图片 / 信息卡）
-- Modify: `web/src/App.vue`（PreviewPane 两区都显示；FileTree 传入 client）
+- Modify: `web/src/App.vue`（PreviewPane 两区都显示；FileTree 传入 client；**两个常驻 ChatPanel**）
 - Modify: `web/package.json`（新增 `highlight.js`）
 
 **Interfaces:**
-- `ChatPanel`：props `area`、`client`；内部 `mode: 'lowpoly' | 'cloud3d'`（blender 区专属，默认 lowpoly）；`chat.send` 参数追加 `mode`；挂载与切区时 `session.load` 回填；`chat.image {area, taskId, dataUrl, caption}` 渲染为截图卡；「清空」→ `chat.clear`（二次确认）；任务进行中显示「停止」→ `chat.cancel {area}`（结束时不删除消息）；`task.progress` / `asset.created` 维护 `busy`（按区保存，开始显停止、落盘/成功隐藏）。
+- `ChatPanel`：props `area`、`client`；内部 `mode: 'lowpoly' | 'cloud3d'`（blender 区专属，默认 lowpoly）；`chat.send` 参数追加 `mode`；**每区一个常驻实例，仅在挂载时 `session.load` 回填一次，切区不重载**；`chat.image {area, taskId, dataUrl, caption}` 渲染为截图卡；「清空」→ `chat.clear`（二次确认）；任务进行中显示「停止」→ `chat.cancel {area}`（结束时不删除消息）；`task.progress` / `asset.created` 维护本实例的 `busy`（开始显停止、落盘/成功隐藏）。
 - `FileTree`：props `area`、`client`；右键菜单五项 → `fs.operate {area, op, path, name?}`，`op ∈ mkdir|rename|delete|reveal|refresh`（C++ handler 在 P4，Unity 区复用 P6）。
 - `PreviewPane`：props `area`、`file: {path, kind: 'text'|'image'|'info', content?, dataUrl?, language?} | null`；`null` 时显示概览/信息卡。three.js 模型预览在 P4 接管 `kind === 'model'`。
 - 规格映射：4.4 右键菜单、4.5 预览区、4.6 对话区、5.1 模式切换。
@@ -491,7 +493,7 @@ Run: `cd web; npm i highlight.js`
 
 ```vue
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { onMounted, ref } from "vue";
 import type { WsClient } from "../ws/WsClient";
 
 interface ChatItem {
@@ -509,12 +511,8 @@ const input = ref("");
 const mode = ref<"lowpoly" | "cloud3d">("lowpoly");
 const cloudConfigured = ref(false);
 let streaming: ChatItem | null = null; // 当前流式气泡（非响应式引用）
-// 任务进行中状态按区保存：ChatPanel 为单实例常驻，切区时不能把 A 区的停止按钮带到 B 区
-const busyByArea = ref<Record<string, boolean>>({});
-const busy = computed({
-  get: () => busyByArea.value[props.area] ?? false,
-  set: (v: boolean) => { busyByArea.value = { ...busyByArea.value, [props.area]: v }; },
-});
+// 每区一个常驻实例：busy 属于本实例，无需按区索引；切区只 v-show，状态不会串区
+const busy = ref(false);
 
 async function refreshCloudBadge() {
   if (props.area !== "blender") return;
@@ -562,11 +560,9 @@ async function clearChat() {
   busy.value = false; // chat.clear 会取消本区任务
 }
 
-watch(() => props.area, loadHistory);
-
 onMounted(() => {
   loadHistory();
-  // ChatPanel 为常驻实例（不卸载），订阅无需 off
+  // 每个区一个常驻实例（v-show 切换，不卸载）：订阅无需 off，也不监听 props.area 重载历史
   props.client.on("chat.message", (d: any) => {
     if (d.area !== props.area) return;
     if (d.role === "assistant") busy.value = false;
@@ -772,7 +768,8 @@ function highlighted(content: string, language?: string) {
       <div class="content">
         <FileTree :area="active" :client="client" />
         <PreviewPane :area="active" :file="previewFile" />
-        <ChatPanel :area="active" :client="client" />
+        <ChatPanel v-show="active === 'blender'" area="blender" :client="client" />
+        <ChatPanel v-show="active === 'unity'" area="unity" :client="client" />
       </div>
 ```
 
@@ -789,7 +786,7 @@ const previewFile = ref<null | {
 }>(null);
 ```
 
-> 原 Task 2 的 `<PreviewPane v-if="active === 'blender'" />` 必须删掉 `v-if`：规格 4.5 两区都有预览区。
+> 原 Task 2 的 `<PreviewPane v-if="active === 'blender'" />` 必须删掉 `v-if`：规格 4.5 两区都有预览区。两个 `ChatPanel` 必须用 `v-show`（不是 `v-if`）且 `area` 传静态值：`v-if` 会销毁/重建实例，导致消息、流式气泡、busy 和卡片丢失；`v-show` 让两个区在后台继续接收并保存自己的事件。
 
 - [ ] **Step 6: 构建验证**
 
@@ -798,11 +795,12 @@ Expected: 无 TS 错误；`web/dist` 更新。
 
 - [ ] **Step 7: 手工验证（dev 模式）**
 
-1. 两个区来回切换：对话历史自动加载且互不串区（先在两区各发一句后重启 `--headless` 再刷新页面）。
-2. 「清空」弹二次确认，确认后本区清空、另一区不变。
-3. blender 区切换低模/云API：模式按钮高亮；未配置云API 时徽标为黄色「未配置」，在设置中填入 tripo apiKey 后重新切换区刷新为绿色「已配置」。
-4. 文件树右键弹出五項菜单；重命名/删除均弹输入或确认框（fs.operate 在 P4 接入前预期返回错误帧，不崩溃即可）。
-5. 手动构造预览数据（DevTools 中调用组件方法或临时默认值）验证 C# 高亮、图片、信息卡三类渲染。
+1. 两个区来回切换：首次挂载各自加载历史；之后切区不重建、不重载、不清空消息。先在两区各发一句后重启 `--headless` 再刷新页面，历史仍互不串区。
+2. blender 区发起长任务后立即切到 unity 区：blender 面板的停止按钮与流式输出继续更新；unity 面板不出现 blender 的消息，切回后内容完整。
+3. 「清空」弹二次确认，确认后本区清空、另一区不变。
+4. blender 区切换低模/云API：模式按钮高亮；未配置云API 时徽标为黄色「未配置」，在设置中填入 tripo apiKey 后刷新为绿色「已配置」（常驻实例不会因切区而重建，设置保存后需重新拉取徽标状态）。
+5. 文件树右键弹出五項菜单；重命名/删除均弹输入或确认框（fs.operate 在 P4 接入前预期返回错误帧，不崩溃即可）。
+6. 手动构造预览数据（DevTools 中调用组件方法或临时默认值）验证 C# 高亮、图片、信息卡三类渲染。
 
 - [ ] **Step 8: Commit**
 
@@ -819,7 +817,8 @@ git commit -m "feat: 对话区历史/清空/截图卡/模式切换，文件树�
 - [ ] `synthforge_app.exe` 直接启动可见完整布局，且内置 WS 已连通（`?ws=` 注入生效：设置保存回读、未配置 Agent 时聊天返回错误卡）
 - [ ] dev 模式下浏览器可完成：设置保存回读、聊天 send → error.card（未配置）/ 文本流（已配置）
 - [ ] 活动栏切换 blender/unity 时，顶部栏导入按钮/固定路径正确切换
-- [ ] 切换区自动加载各自的 `session.load` 历史；「清空」二次确认后仅清本区
+- [ ] 两个 ChatPanel 常驻：切区只 `v-show`，不重建、不重载历史；消息、流式、busy、草稿/计划/错误卡互不串区，后台区事件不丢失
+- [ ] 每个区首次挂载时各自 `session.load`；「清空」二次确认后仅清本区
 - [ ] blender 区模式切换 `[低模|云API]` 与云配置徽标可见；`chat.send` 携带 `mode`
 - [ ] 文件树右键菜单五項（新建/重命名/删除/资源管理器/刷新）均可触发 `fs.operate`
 - [ ] 预览区支持代码高亮/图片/信息卡三类渲染，且 Unity 区也有预览区

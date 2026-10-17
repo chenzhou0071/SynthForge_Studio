@@ -107,6 +107,7 @@ SynthForge Studio 是一款本地桌面 AI 游戏开发工作站：同一软件�
 ### 4.6 对话区
 
 - 永远位于最右侧；blender 会话与 unity 会话**互相独立**（历史、上下文、可用工具各不相同），各自持久化。
+- **两个常驻对话面板**：blender 区与 unity 区各持有一个常驻 `ChatPanel` 实例（切区只做 `v-show` 显隐，不卸载、不重建、不重新加载历史）。消息、流式输出、进行中状态（停止按钮）、草稿卡 / 计划卡 / 错误卡均按区保存在各自实例中：任一区在后台产生的事件不会丢失，也不会串到另一区。
 - **会话上下文**：每次发起新任务时自动携带本区最近 20 条历史消息（纯文本，不含截图 base64；超预算从最旧截断）组装 LLM 上下文；两区历史互不可见。
 - 顶部显示当前区名；blender 区额外显示当前建模模式（低模 / 云 API）与云 API 配置徽标（未配置 / 已配置）。
 - 消息形态：普通文字、工具调用步骤卡（可折叠）、截图图片、资产产出卡（[查看] 按钮 → 预览区加载）、**专业提示词草稿卡**（可编辑，见 5.2）、**建造计划卡**（分组 / 清单 / 验收标准，见 5.3）。
@@ -247,6 +248,10 @@ Unity MCP 导入资产 → 按用户要求实例化（坐标 / 命名 / 挂载�
 ```
 
 - 转换步骤需要 Blender 链就绪；未就绪 → 提示"请先启动 Blender" + [重试]。
+- **Blender 会话互斥（v1）**：低模 / 修改任务全程持有 `BlenderGate`（owner=`blender-agent`）；Unity 的无配对 GLB 转换以 owner=`unity-convert` 获取同一把门禁，多附件转换全程持有，结束即释放。门禁是单 owner 租约，不排队。
+- 门禁被占用 → 立即返回 `error.card {reason:"blender-busy"}`（不新增 WS 方法 / 事件），文案提示"建模区正在工作 / Unity 正在转换，请等当前任务完成后再试"；用户稍后重试，系统不自动排队、不锁 ActivityBar。
+- 反向同样成立：Unity 转换进行中在 blender 区发起低模 / 修改任务 → `blender-busy`；`plan.confirm` 被门禁拒绝时计划卡保留，可稍后再点 [开始生成]。
+- 正常任务（blender 低模 / 修改 vs unity agent）不共享 Blender 会话，可并行；门禁只在"GLB→FBX 转换"与"Blender 任务"之间生效。
 - v1 不做"建模完成自动导入 Unity"的流水线——一切由用户在 unity 区显式发起。
 
 ### 6.5 两区关系小结
@@ -256,6 +261,8 @@ Unity MCP 导入资产 → 按用户要求实例化（坐标 / 命名 / 挂载�
 | 目录 | 固定资产库 | 自选工程 |
 | 会话 | 独立 | 独立 |
 | 工具 | Blender MCP + 资产写入 | Unity MCP + 资产导入 |
+| 任务并发 | 每区同时 1 个；两区可并行 | 同左 |
+| Blender 会话 | 低模 / 修改任务持有 `BlenderGate` | 仅无配对 GLB 转换时持有 `BlenderGate`；忙则 `blender-busy` |
 | 唯一交互点 | 提供模型文件 | 添加资产选择器 + 自动转换 |
 
 ## 7. 设置与本地数据
@@ -392,7 +399,7 @@ Unity MCP 导入资产 → 按用户要求实例化（坐标 / 命名 / 挂载�
 
 ### 8.7 前端结构（Vue3 + TS）
 
-- 组件：`ActivityBar / FileExplorer(树) / PreviewPane(three.js viewer、代码高亮、图片) / ChatPanel(消息流、草稿卡、计划卡、步骤卡、资产卡、附件chip) / SettingsDialog / StatusLights / 弹窗(存放位置选择、切换工程确认、添加资产选择器)`。
+- 组件：`ActivityBar / FileExplorer(树) / PreviewPane(three.js viewer、代码高亮、图片) / ChatPanel(消息流、草稿卡、计划卡、步骤卡、资产卡、附件chip；**每区一个常驻实例**，切区用 `v-show` 显隐) / SettingsDialog / StatusLights / 弹窗(存放位置选择、切换工程确认、添加资产选择器)`。
 - Pinia 状态管理；markdown-it 渲染回复；highlight.js 代码高亮；three.js GLTFLoader + OrbitControls。
 - dev：Vite dev server + 浏览器直连 WS（后端 `--headless`）；prod：vite build → qrc → `app://` 自定义协议加载。
 
@@ -413,6 +420,7 @@ Unity MCP 导入资产 → 按用户要求实例化（坐标 / 命名 / 挂载�
 7. **安全**：WS 仅监听 127.0.0.1 + token 握手；密钥明文仅存本机配置文件。
 8. **中文路径兼容**：资产文件与文件夹名由 agent 规范生成英文 / 拼音名。
 9. **QtWebEngine 约束**：Windows 必须 MSVC 构建；打包体积约 150MB+（可接受）。
+10. **Blender 会话互斥**：低模 / 修改任务与 Unity 的 GLB→FBX 转换共用 Blender MCP 会话；忙时返回 `blender-busy` 错误卡并提示等待后重试，不自动排队、不锁区。
 
 ## 10. 测试策略
 
@@ -439,6 +447,7 @@ Unity MCP 导入资产 → 按用户要求实例化（坐标 / 命名 / 挂载�
 4. 混元 TC3 签名实现是云适配层最容易出错的部分——单测覆盖 + 官方示例对齐。
 5. LLM 长提示词 + 截图回传的 token 开销：截图统一压缩，工具结果超长时截断。
 6. **ReadDirectoryChangesW 缓冲区溢出**：高频文件变更（批量生成 / 复制资产）可能触发事件溢出；监控模块做事件队列限流、合并去重，超限事件丢弃并写日志；发生缓冲区溢出（界面树可能已与磁盘不一致）时补一次全量刷新兜底，防止 WebSocket 消息风暴压垮前端。
+7. **GLB→FBX 转换会重置 Blender 场景**：转换脚本使用 `read_factory_settings(use_empty=True)` 清空当前场景。v1 的 `BlenderGate` 只能防止应用内任务与转换并发，无法保护用户手动编辑但未保存的场景；转换前应保存。彻底方案（独立 headless Blender 进程）留待后续阶段。
 
 ## 13. 附录：总结 agent 参考提示词（低模模板基准）
 

@@ -24,6 +24,7 @@
 - 记住上次浏览目录：选中后写 `unity.lastBrowseDir`，下次打开对话框从该目录开始；无记录时用上次工程的父目录，再退到「文档」。
 - Unity 区路径基准：树、`file.read`、`fs.operate` 的相对路径均以 `<project>/Assets` 为根；`tree.refresh {area:"unity", path?}` 为唯一树数据源。
 - 附件 chip：unity 区 `chat.send` 支持 `attachments: [相对资产库路径]`；发送后前端清空 chip；`.glb` 无配对 `.fbx` 时先经 Blender 链转换。
+- **并发与门禁**：ProjectService 只负责 Unity 工程激活，不感知 Blender 区任务；两区普通任务（blender 低模 / 修改 vs unity agent）可并行。仅 Unity 的 GLB→FBX 转换与 Blender 任务共用同一把 `BlenderGate`（P4 Task 2B），忙时返回 `blender-busy`，不自动排队。
 - Unity 区文件事件只由 watcher 产生（`fileTree.changed {area:"unity", reason, paths}`）；MCP 工具调用期间由抑制窗口吞掉回声。
 
 ## File Structure
@@ -57,6 +58,7 @@ tests/tst_asset_importer.cpp
   - `QString activePath() const`；`QString assetsPath() const`（`<active>/Assets`）；`QString absoluteFor(const QString& relative) const`；`bool isInsideAssets(const QString& absolute) const`。
   - 注入：`setBridgeHooks(stopBridge, startBridge, cancelProjectTasks)`、`setBridgeReadyQuery(std::function<bool()>)`、`setRunningTaskQuery(std::function<int()>)`、`setWaitIntervalForTest(int ms)`。
   - 信号：`stateChanged(ProjectInfo)`、`waitingUnity(path, attempt)`、`errorOccurred(reason)`。**不新增 `switchRequired` 信号**——确认信息走 `project.select` 的返回值。
+  - 并发边界：ProjectService 不感知 Blender 区任务；Blender 会话互斥由 CoreApp 的 `BlenderGate` 统一协调（P4 Task 2B），P6 只在 AssetImporter 转换期间使用它。
 - `dialog.pickFolder {purpose:"unityProject", requestId}` → 立即返回 `{accepted:true}`；拒绝返回 `{accepted:false, reason}`（`busy` / `unsupported-purpose` / `bad-request` / `dialog-unavailable`）。用户选中或取消后广播 `dialog.result {requestId, path?, cancelled}`；`requestId` 由前端生成（避免事件先于响应到达时丢结果）。
 - `CoreApp::setFolderPicker(std::function<void(const QString& startDir, std::function<void(const QString&)> done)>)` — 由 GUI 入口注入（`QFileDialog`）；core 不依赖 QtWidgets。未注入（headless/单测）→ `dialog-unavailable`；单测注入 fake 直接回调临时目录。
 - Consumes: `TaskManager::runningCount(area)`（P2 Task 3 追加，含运行中 + 排队数）、`SettingsStore`（P2 Task 1）。
@@ -1262,9 +1264,10 @@ if (area == QLatin1String("unity")) {
 
 **Interfaces:**
 - `class AssetImporter : QObject`：
-  - 构造 `AssetImporter(AssetLibrary* library, McpRuntime* blender, McpRuntime* unity, QObject* parent = nullptr)`。
+  - 构造 `AssetImporter(AssetLibrary* library, McpRuntime* blender, McpRuntime* unity, QObject* parent = nullptr)`；`void setBlenderGate(BlenderGate* gate)`（保留构造签名，避免已有测试改动）。
   - `bool hasPairedFbx(const QString& glbPath) const`；`QString fbxPathFor(const QString& glbPath) const`（同目录同名 `.fbx`）。
-  - `void prepare(const QJsonArray& attachments, PrepareCallback done)`：逐个校验（存在且在库内）→ `.fbx` 直接用；`.glb` 有配对直接用；无配对则经 Blender MCP `execute_blender_code` 转换；返回 `(ok, fbx 绝对路径列表, 错误码)`。错误码：`invalid-attachment` / `blender-not-ready` / `blender-convert-failed`。
+  - `void prepare(const QJsonArray& attachments, PrepareCallback done)`：逐个校验（存在且在库内）→ `.fbx` 直接用；`.glb` 有配对直接用；无配对则经 Blender MCP `execute_blender_code` 转换；返回 `(ok, fbx 绝对路径列表, 错误码)`。错误码：`invalid-attachment` / `blender-busy` / `blender-not-ready` / `blender-convert-failed`。
+  - 门禁：一组附件中首次遇到无配对 GLB 时以 owner `"unity-convert"` 获取租约，多附件转换全程持有；`finishPrepare`（成功或失败）统一释放。检查顺序为先门禁（`blender-busy`）再 `blender-not-ready`，门禁忙时不启动转换。纯 `.fbx` / 已有配对 `.fbx` 的附件不获取门禁，不影响 Blender 区任务。
   - `void importToUnity(const QString& fbxAbsolutePath, const QJsonObject& options, std::function<void(bool, const QString&)> done)`：调 Unity MCP `import_model_file`（字段以 `tools/list` 返回的 schema 为准）。
 - `chat.send` unity 分支新增 `attachments: [相对资产库路径]`：任务入队后先 `prepare`，成功则以「原文 + 附件清单（fbx 绝对路径）」执行 `m_unityOrch->execute(...)`。
 - `asset.import {glbRelativePath, instanceName?, position?}`：直接导入路径（不经 agent）；成功广播 `chat.message` + `fileTree.changed {area:"unity", reason:"incremental", paths:[父目录]}`。**不新增 `asset.imported` 事件**（保持事件族固定）。
@@ -1277,6 +1280,7 @@ if (area == QLatin1String("unity")) {
 #include <QTemporaryDir>
 #include <QtTest>
 #include "core/assets/AssetLibrary.h"
+#include "core/mcp/BlenderGate.h"
 #include "core/unity/AssetImporter.h"
 
 class AssetImporterTest : public QObject
@@ -1332,6 +1336,55 @@ private slots:
         QTRY_VERIFY(finished);
         QCOMPARE(error, QStringLiteral("blender-not-ready"));
     }
+
+    void glbWithoutFbxWhileGateBusy()
+    {
+        QTemporaryDir dir;
+        AssetLibrary library(dir.path());
+        QFile glb(dir.path() + "/crate.glb");
+        QVERIFY(glb.open(QIODevice::WriteOnly));
+        glb.write("glTF");
+        glb.close();
+        BlenderGate gate;
+        QVERIFY(gate.tryAcquire(QStringLiteral("blender-agent")));
+        AssetImporter importer(&library, nullptr, nullptr);
+        importer.setBlenderGate(&gate);
+        bool finished = false;
+        QString error;
+        importer.prepare(QJsonArray{QStringLiteral("crate.glb")},
+                         [&](bool ok, const QStringList&, const QString& err) {
+                             QVERIFY(!ok);
+                             error = err;
+                             finished = true;
+                         });
+        QTRY_VERIFY(finished);
+        QCOMPARE(error, QStringLiteral("blender-busy"));
+        QCOMPARE(gate.owner(), QStringLiteral("blender-agent")); // 不释放他人租约
+    }
+
+    void failedConversionReleasesGate()
+    {
+        QTemporaryDir dir;
+        AssetLibrary library(dir.path());
+        QFile glb(dir.path() + "/crate.glb");
+        QVERIFY(glb.open(QIODevice::WriteOnly));
+        glb.write("glTF");
+        glb.close();
+        BlenderGate gate;
+        AssetImporter importer(&library, nullptr, nullptr);
+        importer.setBlenderGate(&gate);
+        bool finished = false;
+        QString error;
+        importer.prepare(QJsonArray{QStringLiteral("crate.glb")},
+                         [&](bool ok, const QStringList&, const QString& err) {
+                             QVERIFY(!ok);
+                             error = err;
+                             finished = true;
+                         });
+        QTRY_VERIFY(finished);
+        QCOMPARE(error, QStringLiteral("blender-not-ready"));
+        QVERIFY(!gate.isBusy());               // 获取后因链未就绪失败，必须释放
+    }
 };
 
 QTEST_MAIN(AssetImporterTest)
@@ -1341,6 +1394,8 @@ QTEST_MAIN(AssetImporterTest)
 - [ ] **Step 2: 实现 AssetImporter**
 
 ```cpp
+class BlenderGate;
+
 class AssetImporter : public QObject
 {
     Q_OBJECT
@@ -1351,6 +1406,7 @@ public:
 
     AssetImporter(AssetLibrary* library, McpRuntime* blender, McpRuntime* unity,
                   QObject* parent = nullptr);
+    void setBlenderGate(BlenderGate* gate) { m_gate = gate; }
 
     bool hasPairedFbx(const QString& glbPath) const;
     QString fbxPathFor(const QString& glbPath) const;
@@ -1367,6 +1423,8 @@ private:
     AssetLibrary* m_library;
     McpRuntime* m_blender;
     McpRuntime* m_unity;
+    BlenderGate* m_gate = nullptr;
+    bool m_gateHeld = false;
     QJsonArray m_attachments;
     int m_prepareIndex = 0;
     QStringList m_fbxPaths;
@@ -1419,6 +1477,14 @@ void AssetImporter::continuePrepare()
             ++m_prepareIndex;
             continue;
         }
+        if (m_gate && !m_gateHeld) {
+            // 先门禁后链就绪：忙时直接返回 blender-busy，不启动转换；成功后持有到整组附件处理完
+            if (!m_gate->tryAcquire(QStringLiteral("unity-convert"))) {
+                finishPrepare(false, QStringLiteral("blender-busy"));
+                return;
+            }
+            m_gateHeld = true;
+        }
         ensureFbx(absolute, [this](bool ok, const QString& fbx, const QString& error) {
             if (!ok) {
                 finishPrepare(false, error);
@@ -1435,6 +1501,9 @@ void AssetImporter::continuePrepare()
 
 void AssetImporter::finishPrepare(bool ok, const QString& error)
 {
+    if (m_gateHeld && m_gate)
+        m_gate->release(QStringLiteral("unity-convert"));
+    m_gateHeld = false;
     PrepareCallback done = m_prepareDone;
     const QStringList paths = m_fbxPaths;
     m_prepareDone = nullptr;
@@ -1494,9 +1563,16 @@ void AssetImporter::importToUnity(const QString& fbx, const QJsonObject& options
 }
 ```
 
-> `prepare` 使用成员状态串行推进（unity 区任务队列本身串行），避免 `std::function` 自捕获悬垂；转换脚本对路径中的单引号需转义（Windows 常规路径不包含）。
+> `prepare` 使用成员状态串行推进（unity 区任务队列本身串行），避免 `std::function` 自捕获悬垂；转换脚本对路径中的单引号需转义（Windows 常规路径不包含）。`.cpp` 需 `#include "core/mcp/BlenderGate.h"`；门禁在 `finishPrepare` 统一释放，覆盖成功、`blender-busy`、`blender-not-ready`、`blender-convert-failed` 全部出口。
 
 - [ ] **Step 3: CoreApp 接 attachments + asset.import**
+
+创建 importer 并注入门禁（`CoreApp.h` 增加 `AssetImporter* m_importer = nullptr;`，并 `#include "core/unity/AssetImporter.h"`）：
+
+```cpp
+m_importer = new AssetImporter(m_library, m_blender, m_unity, this);
+m_importer->setBlenderGate(&m_blenderGate);   // 与 P4 blender orchestrator 共用同一把门禁
+```
 
 将 Task 3 unity 分支 enqueue 内的 `execute` 替换为：
 
@@ -1690,6 +1766,9 @@ async function send() {
 4. 关闭 Blender 时发送带 glb 附件 → `error.card {reason:"blender-not-ready"}`，无 Unity 导入。
 5. 多选两个 GLB → 两个 chip → 均完成转换与导入。
 6. 断开 Blender 后调用 `asset.import` → `blender-not-ready`；正常时直接导入并触发文件树局部刷新。
+7. Blender 区长任务运行中，从 unity 区发送无 FBX 的 GLB 附件 → `blender-busy`，无转换、无 Unity 导入；建模任务结束后重发同一消息 → 转换并导入成功。
+8. Unity 区大 GLB 转换进行中，在 blender 区确认计划或发送修改指令 → `blender-busy`；计划卡保留，转换结束后再点 [开始生成] 成功。
+9. 纯 `.fbx` 或已有配对 `.fbx` 的附件在 Blender 任务运行中发送 → 不触发转换，正常导入（不占用门禁）。
 
 - [ ] **Step 6: Commit**（`feat: 跨区添加资产（附件 chip / glb→fbx 转换 / unity 导入实例化）`）
 
@@ -1703,6 +1782,7 @@ async function send() {
 - [ ] `tree.refresh` 可全量/单目录拉取；`fs.operate` 与 `file.read` 的 unity 分支以 `<project>/Assets` 为根且越界拒绝；文件树局部刷新
 - [ ] Unity agent 真实跑通创建物体 + 截图回传 + 编译错误 Console 回读自修；前置未满足时零 LLM 调用
 - [ ] 添加资产：chip 多选 → 发送后清空；配对直接导入 / 无配对转换 / 转换后再次添加三条路径均验证；Blender 未就绪正确报错
+- [ ] 转换期间持有 `BlenderGate`（owner=`unity-convert`），成功 / 失败均释放；Blender 任务运行中转换返回 `blender-busy`，反向（转换中发 Blender 任务）亦然；纯 FBX / 已有配对路径不占门禁
 - [ ] 导入走系统文件夹选择框：`dialog.pickFolder` → `dialog.result` → `project.select`；取消静默、busy 时不可重复弹框；headless 返回 `dialog-unavailable`
 - [ ] 方法/事件族仅新增 `dialog.pickFolder` / `dialog.result` 一对；切换确认仍走 `project.select` 返回值，导入结果仍用 `chat.message` + `fileTree.changed`
-- [ ] `tst_project_service`、`tst_folder_pick`、`tst_watcher`、`tst_asset_importer` 全绿
+- [ ] `tst_project_service`、`tst_folder_pick`、`tst_watcher`、`tst_asset_importer` 全绿（后者含门禁忙拒绝与失败释放两用例）

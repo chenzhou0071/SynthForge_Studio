@@ -203,7 +203,7 @@ LogService::setEventSink(this, [this](const QJsonObject& entry) {
   - `blender` / `unity`：对应 `McpRuntime::isReady()` + `tools().size()`；未连接回 `{state:"failed", detail:"blender-not-ready"}` / `"unity-not-ready"`。
 - `env.check` 请求：立即返回 `{ok:true}` 并触发 `run()`；结果异步以 `env.status {uvx, blender, unity}` 事件广播（不阻塞 WS 线程）。
 - `conn.status` 事件载荷：`{blender:"off|ready|reconnecting", unity:"...", hints:{blender?:detail, unity?:detail}}`（P4 `broadcastConnStatus` 已实现，P7 只消费 `hints`）；P4/P6 的 `statusChanged` 接线在「曾就绪后变 off」时广播 `error.card {reason:"bridge-crashed", message:hint}`（主动 stop 与首次启动失败不报）。`off` 的来源：P1 `McpClient::onTransportStopped` 在意外退出（含心跳超时）时 `emit failed(...)`，`McpRuntime` 映射为 `off`；`m_crashNotified` 保证一次断链只出卡一次，恢复 `ready` 后才允许下次再报。
-- `error.card` 原因字典（前后端同步，15 条 + 兜底）：
+- `error.card` 原因字典（前后端同步，16 条 + 兜底）：
 
 | reason | 展示文案 | 动作 |
 |---|---|---|
@@ -217,12 +217,15 @@ LogService::setEventSink(this, [this](const QJsonObject& entry) {
 | `bridge-crashed` | MCP 桥接异常退出，正在自动重连 | 重启桥接 |
 | `project-not-active` | 未激活 Unity 工程：请先在顶部导入工程 | 无 |
 | `invalid-attachment` | 附件无效：文件不存在或不在资产库内 | 无 |
+| `blender-busy` | Blender 会话正忙：建模区正在工作，或 Unity 正在转换 GLB；请等当前任务完成后再试 | 重试 |
 | `blender-convert-failed` | glb→fbx 转换失败：请查看 Blender 日志后重试 | 重试 / 重启桥接 |
 | `import-failed` | 导入 Unity 失败：请查看 Unity Console 后重试 | 重试 |
 | `max-steps-exceeded` | Agent 步数超限，任务已停止 | 重试 |
 | `empty-plan` | 建造计划为空（规划结果无分组）：请重试或补充需求描述 | 重试 |
 | `bridge-not-registered` | 当前区未注册桥接，无法重启（P6 未接入或配置错误） | 无 |
 | （未收录） | 显示 `message`；无 `message` 时显示 reason 原文 | 重试 |
+
+> `blender-busy` 的 [重试] 会重放最近一次 `chat.send` 参数（对 Unity 附件路径有效）。若是在计划卡上点 [开始生成] 被拒，计划卡仍保留，优先再点一次计划卡，避免重走草稿 / 规划。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -358,6 +361,7 @@ const dictionary: Record<string, Entry> = {
   "bridge-crashed": { text: "MCP 桥接异常退出，正在自动重连", actions: ["restart"] },
   "project-not-active": { text: "未激活 Unity 工程：请先在顶部导入工程", actions: [] },
   "invalid-attachment": { text: "附件无效：文件不存在或不在资产库内", actions: [] },
+  "blender-busy": { text: "Blender 会话正忙：建模区正在工作，或 Unity 正在转换 GLB；请等当前任务完成后再试", actions: ["retry"] },
   "blender-convert-failed": { text: "glb→fbx 转换失败：请查看 Blender 日志后重试", actions: ["retry", "restart"] },
   "import-failed": { text: "导入 Unity 失败：请查看 Unity Console 后重试", actions: ["retry"] },
   "max-steps-exceeded": { text: "Agent 步数超限，任务已停止", actions: ["retry"] },
@@ -414,7 +418,7 @@ async function restartBridge(item: ErrorItem) {
            @open-settings="emit('openSettings')" />
 ```
 
-> `ChatPanel` 新增 `defineEmits<{ openSettings: [] }>()`，`ErrorCard` 的 `openSettings` 直接透传给 `App.vue` 打开设置弹窗；错误项不被 `chat.clear` 之外的事件清除。
+> `ChatPanel` 新增 `defineEmits<{ openSettings: [] }>()`，`ErrorCard` 的 `openSettings` 直接透传给 `App.vue` 打开设置弹窗；错误项不被 `chat.clear` 之外的事件清除。两个 ChatPanel 常驻：`error.card` 订阅仍保留 `if (d.area !== props.area) return;`，错误项落在本区实例；`ErrorCard` 按 item.area 发请求，不会串区。
 
 `TopBar.vue`（P3 版本上扩展 hints 与日志入口）：
 
@@ -516,7 +520,10 @@ client.on("log.append", (d: any) => logDrawer.value?.push(d));
 <TopBar :area="active" :blender="lamp.blender as any" :unity="lamp.unity as any"
         :hints="hints" :importing="picking" @import-project="importProject"
         @open-logs="logsOpen = true" />
-<ChatPanel :area="active" :client="client" @open-settings="settingsOpen = true" />
+<ChatPanel v-show="active === 'blender'" area="blender" :client="client"
+           @open-settings="settingsOpen = true" />
+<ChatPanel v-show="active === 'unity'" area="unity" :client="client"
+           @open-settings="settingsOpen = true" />
 <LogDrawer ref="logDrawer" :open="logsOpen" :env="envReport" @close="logsOpen = false" />
 ```
 
@@ -590,6 +597,7 @@ install(TARGETS synthforge_app RUNTIME DESTINATION .)
 4. 低模全链跑一次（发送 → 草稿 → 选目录 → 生成 → 预览）。
 5. 检查 `logs/` 有当天日志且无 ERROR 级噪音；点顶栏「日志」能看到 `env.status` 三链路结果。
 6. 关掉 Blender 后发一条消息 → 错误卡出现 →点「重试」重新提交；再点「重启桥接」→ 灯先黄后绿。
+7. 两区同时工作：blender 区长任务运行时切到 unity 区，对话/停止按钮不丢；Unity 转换期间确认低模计划 → `blender-busy` 错误卡且计划卡保留；建模结束后重试成功。
 
 - [ ] **Step 4: Commit**（`chore: Release 打包脚本与整机冒烟清单`）
 
@@ -600,16 +608,16 @@ install(TARGETS synthforge_app RUNTIME DESTINATION .)
 - [ ] 日志按天落盘、50MB 轮转、跨天序号归零、stderr 同步输出
 - [ ] `log.append` 仅广播 warning/error，日志抽屉环形缓冲≤200 条且 sink 内日志不递归
 - [ ] `env.check` 立即返回，`env.status` 异步给出三链路状态；双灯灰/黄/绿与 hints 文案正确
-- [ ] 全部 15 个 `error.card.reason` 有中文文案与正确动作；未收录 reason 不出现空白卡
+- [ ] 全部 16 个 `error.card.reason` 有中文文案与正确动作；未收录 reason 不出现空白卡
 - [ ] `[重试]` 发 `chat.retry {area}`、`[重启桥接]` 发 `bridge.restart {area}`、`[打开设置]` 打开设置弹窗
 - [ ] 干净 Windows 机器直接运行 `dist/SynthForgeStudio/synthforge_app.exe`
-- [ ] 冒烟清单 6 项全过
+- [ ] 冒烟清单 7 项全过
 
 ---
 
 ## 全阶段收尾（P1~P7 汇总验收）
 
-- [ ] `ctest --test-dir build -C Debug` 全部测试可执行全绿（P1 6 个 + P2 5 个 + P4 4 个 + P5 2 个 + P6 3 个 + P7 1 个 = 21 个）
+- [ ] `ctest --test-dir build -C Debug` 全部测试可执行全绿（P1 6 个 + P2 5 个 + P4 5 个 + P5 2 个 + P6 4 个 + P7 1 个 = 23 个）
 - [ ] 双模式建模真实跑通（低模 Blender MCP / 云 API 至少一家）
 - [ ] Unity 区互斥切换 + 文件双源同步 + 添加资产真实跑通
 - [ ] 打包产物在干净机器可启动、可用

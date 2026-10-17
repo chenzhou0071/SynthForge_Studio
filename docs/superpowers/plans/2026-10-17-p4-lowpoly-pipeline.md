@@ -25,6 +25,7 @@
 
 ```
 src/core/mcp/McpRuntime.h/.cpp               ← 桥接运行时（工具缓存/重连状态/主动重启，Task 0）
+src/core/mcp/BlenderGate.h/.cpp              ← Blender 会话互斥租约（单 owner，Task 2B）
 src/core/preflight/PreflightChecker.h/.cpp   ← Blender/云链就绪检查
 src/core/agent/SummarizerAgent.h/.cpp        ← 草稿生成（draft.created/draft.send）
 src/core/agent/AgentOrchestrator.h/.cpp      ← plan() 规划调用 + execute() 分组执行状态机 + 截图压缩 + 取消
@@ -37,6 +38,7 @@ web/src/components/FolderPicker.vue          ← 存放位置确认弹窗
 web/src/components/PreviewPane.vue           ← three.js GLB 预览（升级 Task 5）
 tests/tst_preflight.cpp
 tests/tst_mcp_runtime.cpp                    ← mock server 握手/工具缓存/重启
+tests/tst_blender_gate.cpp                   ← 门禁获取/拒绝抢占/非 owner 释放无效
 tests/tst_asset_library.cpp                  ← 资产库文件操作与越界校验
 tests/tst_orchestrator.cpp                   ← mock MCP + mock LLM 集成
 ```
@@ -541,6 +543,114 @@ const text = ref(props.prompt);
 
 ---
 
+### Task 2B: BlenderGate（Blender 会话互斥租约）
+
+> **为何存在**：blender 区的低模 / 修改任务与 unity 区的 glb→fbx 转换复用同一个 Blender MCP 会话，而转换脚本会 `read_factory_settings(use_empty=True)` 清空场景，必须与 Blender agent 任务互斥。仅检查 `TaskManager::runningCount()` 存在 TOCTOU（检查后、真正调用前被另一区抢先），因此用一把显式的单 owner 租约。
+
+**Files:** Create `src/core/mcp/BlenderGate.h/.cpp`、`tests/tst_blender_gate.cpp`；Modify `CoreApp.h`（值成员 `BlenderGate m_blenderGate;`）、`CMakeLists.txt`。
+
+**Interfaces:**
+- `class BlenderGate`（非 QObject，只在 CoreApp / UI 线程使用）：
+  - `bool tryAcquire(const QString& owner)`：空闲则记录 owner 并返回 true；已占用返回 false（同 owner 也不可重入）。
+  - `void release(const QString& owner)`：仅 owner 匹配时清空；不匹配静默忽略，防误释放他人租约。
+  - `bool isBusy() const`；`QString owner() const`。
+- owner 约定：`"blender-agent"`（低模 / 修改任务全程持有）、`"unity-convert"`（多附件转换全程持有）。
+- Consumes: 无。Produces: `AgentOrchestrator::setBlenderGate()`（Task 3）、`plan.confirm` 预检查（Task 4）、`AssetImporter::setBlenderGate()`（P6 Task 4）。
+
+- [ ] **Step 1: 写失败测试**
+
+```cpp
+#include <QtTest>
+#include "core/mcp/BlenderGate.h"
+
+class BlenderGateTest : public QObject
+{
+    Q_OBJECT
+private slots:
+    void acquireAndRelease()
+    {
+        BlenderGate gate;
+        QVERIFY(!gate.isBusy());
+        QVERIFY(gate.tryAcquire(QStringLiteral("blender-agent")));
+        QVERIFY(gate.isBusy());
+        QCOMPARE(gate.owner(), QStringLiteral("blender-agent"));
+        QVERIFY(!gate.tryAcquire(QStringLiteral("unity-convert"))); // 不可抢占
+        gate.release(QStringLiteral("unity-convert"));               // 非 owner 释放无效
+        QVERIFY(gate.isBusy());
+        gate.release(QStringLiteral("blender-agent"));
+        QVERIFY(!gate.isBusy());
+        QVERIFY(gate.tryAcquire(QStringLiteral("unity-convert")));   // 释放后可再获取
+    }
+};
+
+QTEST_MAIN(BlenderGateTest)
+#include "tst_blender_gate.moc"
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `ctest --test-dir build -C Debug -R tst_blender_gate --output-on-failure`
+Expected: FAIL（`BlenderGate` 未定义 / target 未加入 CMake）
+
+- [ ] **Step 3: 实现**
+
+```cpp
+#pragma once
+
+#include <QString>
+
+class BlenderGate
+{
+public:
+    bool tryAcquire(const QString& owner);
+    void release(const QString& owner);
+    bool isBusy() const { return !m_owner.isEmpty(); }
+    QString owner() const { return m_owner; }
+
+private:
+    QString m_owner;
+};
+```
+
+```cpp
+#include "core/mcp/BlenderGate.h"
+
+bool BlenderGate::tryAcquire(const QString& owner)
+{
+    if (!m_owner.isEmpty())
+        return false;
+    m_owner = owner;
+    return true;
+}
+
+void BlenderGate::release(const QString& owner)
+{
+    if (m_owner == owner)
+        m_owner.clear();
+}
+```
+
+- [ ] **Step 4: CMake + 跑测试 + Commit**
+
+`synthforge_core` 源列表追加 `src/core/mcp/BlenderGate.cpp`；追加 target：
+
+```cmake
+add_executable(tst_blender_gate tests/tst_blender_gate.cpp)
+target_link_libraries(tst_blender_gate PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_blender_gate COMMAND tst_blender_gate)
+```
+
+Run: `ctest --test-dir build -C Debug -R tst_blender_gate --output-on-failure`
+Expected: 1 用例 Passed。
+
+```bash
+git add CMakeLists.txt src/core/mcp/BlenderGate.h src/core/mcp/BlenderGate.cpp tests/tst_blender_gate.cpp
+```
+
+Commit（`feat: BlenderGate 会话互斥租约`）。
+
+---
+
 ### Task 3: AgentOrchestrator（Planner + Executor 两阶段）
 
 **Files:** Create `src/core/agent/AgentOrchestrator.h/.cpp`、`web/src/components/PlanCard.vue`、`tests/tst_orchestrator.cpp`；Modify `CoreApp`（draft.send → 启动规划；plan.confirm / plan.cancel 在 Task 4 接线）。
@@ -557,6 +667,7 @@ struct BuildPlan { QVector<BuildGroup> groups; int maxSteps = 50; };
   - `void plan(const QString& taskId, TaskManager* tm, const QString& prompt, const QString& area);`：一次**纯文本**调用（不传 tools），解析 JSON；失败重试 1 次，仍失败降级默认四分组。
   - `void execute(const QString& taskId, TaskManager* tm, const QJsonArray& tools, const BuildPlan& plan, const QString& prompt, const QString& targetFolder, const QString& area);`：按组「建造 → 自检」状态机执行。
   - 信号：`planReady(area, taskId, QJsonObject plan)`、`groupProgress(area, int index, int count, QString title)`、`finalText(area, QString)`、`failed(area, QString)`、`toolStep(area, tool, status)`、`delta(area, text)`、`imageReceived(area, taskId, dataUrl, caption)`、`artifactsReady(area, QStringList absoluteGlbs)`（结束时扫描目标目录新 GLB，供 CoreApp 广播 `asset.created` / `fileTree.changed`）。
+  - `void setBlenderGate(BlenderGate* gate)` — 仅注入给 blender orchestrator（unity orchestrator 不注入）。`execute()` 在 `area=="blender"` 时以 owner `"blender-agent"` 获取租约，持有到 `finishOk/finishCancelled/fail`；忙则直接 `failed("blender-busy")`，不碰 LLM / MCP。
   - `void setToolCallHook(std::function<void(const QString& name, bool running)> hook)` — P6 注入：工具调用前 running=true（进入抑制窗口），回调返回后 running=false（结束抑制）。
   - `void setConversationHistory(const QJsonArray& history)` — 规格 8.4 上下文组装：`system + 本区最近 20 条纯文本历史 + 本次任务指令`；CoreApp 在每次 `plan()/execute()` 前用 `m_sessions->recentMessages(area, 20)` 注入（成员 `QJsonArray m_history`）。
 - 事件：`plan.created {area, taskId, groups, totalSteps}`；`task.progress {area, groupIndex, groupCount, title}`；`tool.step` 沿用；结束时 `asset.created`（Task 4 编排）。
@@ -582,6 +693,7 @@ struct BuildPlan { QVector<BuildGroup> groups; int maxSteps = 50; };
 
 class TaskManager;
 class McpClient;
+class BlenderGate;
 
 struct BuildGroup { QString title; QStringList items; QString acceptance; };
 struct BuildPlan { QVector<BuildGroup> groups; int maxSteps = 50; };
@@ -597,6 +709,7 @@ public:
     void execute(const QString& taskId, TaskManager* tm, const QJsonArray& tools,
                  const BuildPlan& plan, const QString& prompt,
                  const QString& targetFolder, const QString& area);
+    void setBlenderGate(BlenderGate* gate) { m_gate = gate; }
     void setToolCallHook(std::function<void(const QString& name, bool running)> hook);
     void setConversationHistory(const QJsonArray& history);
     bool isPlanning(const QString& area) const { return m_planning.contains(area); }
@@ -624,6 +737,7 @@ private:
     void finishOk(const QString& text);
     void finishCancelled();
     void fail(const QString& reason);
+    void releaseGate();
     QStringList collectNewGlbs() const;
 
     LlmGateway* m_llm;
@@ -648,6 +762,8 @@ private:
     GroupPhase m_phase = GroupPhase::Build;
     QSet<QString> m_planning;          // 规划进行中的区（chat.cancel 可丢弃迟到结果）
     QDateTime m_startedAt;
+    BlenderGate* m_gate = nullptr;     // 仅 blender orchestrator 注入
+    bool m_gateHeld = false;
     std::function<void(const QString&, bool)> m_toolCallHook;
 };
 ```
@@ -828,6 +944,46 @@ void executorAdvancesGroups()
     QCOMPARE(progress.count(), 2);                      // 两组各一次进度
     QCOMPARE(progress.at(1).at(1).toInt(), 2);          // 第二组 index
 }
+
+// 文件顶部追加：#include "core/mcp/BlenderGate.h"
+void executorRefusesWhenBlenderGateBusy()
+{
+    MockLlmServer llm({});                 // 不应发出任何请求
+    AgentOrchestrator orch(&llm, nullptr, nullptr);
+    BlenderGate gate;
+    QVERIFY(gate.tryAcquire(QStringLiteral("unity-convert")));
+    orch.setBlenderGate(&gate);
+    BuildPlan plan;
+    plan.groups = {{"底座与环境", {}, "检查底座"}};
+    QSignalSpy failed(&orch, &AgentOrchestrator::failed);
+
+    orch.execute("t1", nullptr, {}, plan, "p", "/tmp/out", "blender");
+
+    QCOMPARE(failed.count(), 1);
+    QCOMPARE(failed.first().at(1).toString(), QStringLiteral("blender-busy"));
+    QCOMPARE(llm.requestCount(), 0);                         // 门禁失败不碰 LLM / MCP
+    QCOMPARE(gate.owner(), QStringLiteral("unity-convert")); // 不释放他人租约
+}
+
+void executorReleasesGateOnFinish()
+{
+    MockLlmServer llm({toolCallChunk("execute_blender_code"),
+                       textChunk("本组建造完成"), textChunk("自检通过"),
+                       textChunk("已导出 glb/fbx/blend")});
+    MockMcpHarness mcp;
+    AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+    BlenderGate gate;
+    orch.setBlenderGate(&gate);
+    BuildPlan plan;
+    plan.groups = {{"底座与环境", {}, "检查底座"}};
+    plan.maxSteps = 18;
+    QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
+
+    orch.execute("t1", nullptr, {{/* schema */}}, plan, "p", "/tmp/out", "blender");
+
+    QTRY_COMPARE(finalSpy.count(), 1);
+    QVERIFY(!gate.isBusy());               // 成功出口必须释放
+}
 ```
 
 `MockLlmServer`（`tests/mock/mock_llm_server.h`）：构造收 SSE 响应脚本（按请求顺序逐轮返回）；`requestCount()` 与 `requestAt(i)` 返回该轮原始请求体（用于断言注入消息）。`toolCallChunk/textChunk` 为脚本包装小工具。
@@ -875,6 +1031,13 @@ void AgentOrchestrator::execute(const QString& taskId, TaskManager* tm, const QJ
     if (m_plan.groups.isEmpty()) {
         fail(QStringLiteral("empty-plan"));
         return;
+    }
+    if (m_gate && m_area == QLatin1String("blender")) {
+        if (!m_gate->tryAcquire(QStringLiteral("blender-agent"))) {
+            fail(QStringLiteral("blender-busy")); // 不排队：调用方提示用户稍后重试
+            return;
+        }
+        m_gateHeld = true;
     }
     m_messages = initialMessages(
         blenderSystemPrompt(),
@@ -959,20 +1122,29 @@ void AgentOrchestrator::tick()
         }});
 }
 
+void AgentOrchestrator::releaseGate()
+{
+    if (m_gateHeld && m_gate)
+        m_gate->release(QStringLiteral("blender-agent"));
+    m_gateHeld = false;
+}
+
 void AgentOrchestrator::finishOk(const QString& text)
 {
     const QStringList glbs = collectNewGlbs();
     if (!glbs.isEmpty())
         emit artifactsReady(m_area, glbs); // 先报产出，再收尾对话
     emit finalText(m_area, text);
+    releaseGate();                        // 先释放门禁，再推进同区队列
     if (m_tm)
-        m_tm->finish(m_taskId);           // 推进同区串行队列
+        m_tm->finish(m_taskId);
     m_taskId.clear();
 }
 
 void AgentOrchestrator::finishCancelled()
 {
     m_planning.remove(m_area);
+    releaseGate();
     if (m_tm)
         m_tm->finish(m_taskId);           // TaskManager 已记录取消，finished(cancelled=true)
     m_taskId.clear();
@@ -985,12 +1157,15 @@ void AgentOrchestrator::fail(const QString& reason)
         finishCancelled();
         return;
     }
-    if (m_taskId.isEmpty())
+    if (m_taskId.isEmpty()) {
+        releaseGate();                    // 防御：无任务 id 也不遗留租约
         return;
+    }
     const QString normalized = reason == QLatin1String("max steps exceeded")
                                    ? QStringLiteral("max-steps-exceeded")
                                    : reason;
     emit failed(m_area, normalized);
+    releaseGate();
     if (m_tm)
         m_tm->finish(m_taskId);
     m_taskId.clear();
@@ -1119,6 +1294,7 @@ void openFolderPick(const QString& area);
 
 ```cpp
 m_orch = new AgentOrchestrator(m_llm, m_blender->client(), this);
+m_orch->setBlenderGate(&m_blenderGate);   // 只给 blender orchestrator；unity orchestrator 不注入
 connect(m_orch, &AgentOrchestrator::toolStep, this,
         [this](const QString& area, const QString& tool, const QString& status) {
             m_ws->broadcastEvent("tool.step",
@@ -1192,7 +1368,7 @@ connect(m_orch, &AgentOrchestrator::artifactsReady, this,
         });
 ```
 
-> 每次 `plan()/execute()` 之前调用 `m_orch->setModelConfig(primaryAgentConfig())` 与 `m_orch->setConversationHistory(m_sessions->recentMessages(area, 20))`；`m_orch` 加入 `CoreApp.h` 成员（`AgentOrchestrator* m_orch = nullptr;`），并 `#include "core/agent/AgentOrchestrator.h"`（`PendingPick` 持有 `BuildPlan` 需要完整类型）。P6 Task 3 把同一组 connect 封装为 `wireOrchestrator(orch)`（含 `artifactsReady`），blender 与 unity 共用，P6 落地时删除本段内联 connect。
+> 每次 `plan()/execute()` 之前调用 `m_orch->setModelConfig(primaryAgentConfig())` 与 `m_orch->setConversationHistory(m_sessions->recentMessages(area, 20))`；`m_orch` 加入 `CoreApp.h` 成员（`AgentOrchestrator* m_orch = nullptr;`），并 `#include "core/agent/AgentOrchestrator.h"`（`PendingPick` 持有 `BuildPlan` 需要完整类型）；`m_blenderGate` 是 Task 2B 的 CoreApp 值成员，`#include "core/mcp/BlenderGate.h"`。P6 Task 3 把同一组 connect 封装为 `wireOrchestrator(orch)`（含 `artifactsReady`），blender 与 unity 共用，P6 落地时删除本段内联 connect；`setBlenderGate` 不放进共用 wiring，只对 `m_orch` 调用一次。
 
 - [ ] **Step 5: 前端 PlanCard.vue + ChatPanel 接入**
 
@@ -1207,10 +1383,21 @@ const props = defineProps<{
   plan: { taskId: string; groups: { title: string; items: string[]; acceptance: string }[]; totalSteps: number };
 }>();
 const decided = ref<"pending" | "started" | "cancelled">("pending");
+const error = ref("");
 
-function start() {
+async function start() {
+  error.value = "";
+  const res: any = await props.client.request("plan.confirm", {
+    area: props.area, taskId: props.plan.taskId,
+  });
+  if (res?.ok === false) {
+    // blender-busy：计划卡保留，等当前建模/转换结束后可再次点开始
+    error.value = res.error === "blender-busy"
+      ? "Blender 会话正忙：请等当前建模/转换完成后再点开始"
+      : (res.error ?? "确认失败");
+    return;
+  }
   decided.value = "started";
-  props.client.request("plan.confirm", { area: props.area, taskId: props.plan.taskId });
 }
 function cancel() {
   decided.value = "cancelled";
@@ -1228,6 +1415,7 @@ function cancel() {
         <div class="group-accept">验收：{{ g.acceptance }}</div>
       </li>
     </ol>
+    <div v-if="error" class="plan-error">{{ error }}</div>
     <div v-if="decided === 'pending'" class="plan-actions">
       <button @click="start">开始生成</button>
       <button @click="cancel">取消</button>
@@ -1239,9 +1427,9 @@ function cancel() {
 </template>
 ```
 
-`ChatPanel.vue` 新增订阅 `plan.created` → 追加计划卡并 `busy.value = false`（等待用户决策）；计划卡 `start` → `busy.value = true` 后 `client.request("plan.confirm", {area, taskId})`，`cancel` → `client.request("plan.cancel", {area, taskId})`；收到 `folderPick.open`（Task 4）后弹存放位置。
+`ChatPanel.vue` 新增订阅 `plan.created` → 追加计划卡并 `busy.value = false`（等待用户决策）；计划卡 `start` 等待 `plan.confirm` 返回，`ok:false` 时保持 pending 并显示错误（`blender-busy` 时计划卡保留，可稍后再点）；`cancel` → `client.request("plan.cancel", {area, taskId})`；收到 `folderPick.open`（Task 4）后弹存放位置。
 
-- [ ] **Step 6: CMake + 跑测试 + Commit**（`tst_orchestrator` 4 用例：规划解析 / 降级 / 单组执行 / 多组推进；`feat: Planner→Executor 两阶段主循环（计划卡/分组自检）`）
+- [ ] **Step 6: CMake + 跑测试 + Commit**（`tst_orchestrator` 6 用例：规划解析 / 降级 / 单组执行 / 多组推进 / 门禁忙拒绝 / 成功释放门禁；`feat: Planner→Executor 两阶段主循环（计划卡/分组自检）`）
 
 ---
 
@@ -1252,6 +1440,7 @@ function cancel() {
 **Interfaces:**
 - 事件 `folderPick.open {area, requestId, rootName:"ModelLibrary", tree}`（tree 由 `AssetLibrary::folderTree()` 生成，`{name, path, children}`）。
 - 请求 `folderPick.submit {requestId, relativePath}` → 校验（必须已存在、必须在根内）→ 调用 `orchestrator.execute(taskId, tm, tools, plan, prompt, targetFolder, area)`（plan/prompt 来自 `plan.confirm` 时缓存）。
+- 门禁：`plan.confirm` 与 `folderPick.submit` 各做一次预检查（忙时分别保留计划卡 / 目录弹窗）；最终以 `execute()` 的 `tryAcquire("blender-agent")` 为准。若在提交与任务启动的极小窗口内被抢先，任务以 `blender-busy` 失败并提示稍后重试（不自动排队）。
 - 请求 `folderPick.mkdir {requestId, path, name}` → 在弹窗内新建子文件夹，返回 `{ok, tree}` 供弹窗刷新；名称非法/重名返回 `invalid-path` / `already-exists`。
 - 请求 `folderPick.cancel {requestId}` → 任务结束，广播 `error.card {reason:"user-cancelled"}`。
 - 请求 `fs.operate {area, op, path, name?}` → `op ∈ mkdir|rename|delete|reveal|refresh`；仅 `area=="blender"` 由本任务实现（P6 接管 `unity` 的工程根）；操作成功后广播 `fileTree.changed {area:"blender", reason, paths}`（`mkdir/rename/delete` 为 `incremental` 且带受影响相对路径，`refresh` 为 `full` 且 `paths:[]`；`reveal` 不广播）；失败返回 `{ok:false, error}`（`invalid-path|already-exists|not-found|io-error|unknown-op`）。
@@ -1395,9 +1584,14 @@ m_router->registerHandler("draft.cancel", [this](const QJsonObject& params) {
 
 m_router->registerHandler("plan.confirm", [this](const QJsonObject& params) {
     const QString area = params.value("area").toString(QStringLiteral("blender"));
-    const QJsonObject json = m_pendingPlans.take(area);
-    if (json.isEmpty())
+    if (!m_pendingPlans.contains(area))
         return QJsonValue(QJsonObject{{"ok", false}, {"error", "plan-not-found"}});
+    if (m_blenderGate.isBusy()) {
+        // 必须在 take 之前检查：忙时保留计划卡，用户等 Blender 空闲后可再次点开始
+        m_ws->broadcastEvent("error.card", {{"area", area}, {"reason", "blender-busy"}});
+        return QJsonValue(QJsonObject{{"ok", false}, {"error", "blender-busy"}});
+    }
+    const QJsonObject json = m_pendingPlans.take(area);
     BuildPlan plan;
     for (const QJsonValue& value : json.value("groups").toArray()) {
         const QJsonObject item = value.toObject();
@@ -1436,13 +1630,20 @@ m_router->registerHandler("chat.cancel", [this](const QJsonObject& params) {
 
 m_router->registerHandler("folderPick.submit", [this](const QJsonObject& params) {
     const QString requestId = params.value("requestId").toString();
-    const QString area = m_pickRequests.take(requestId);
+    const QString area = m_pickRequests.value(requestId);   // 先不 take：失败时弹窗可重试
     if (area.isEmpty() || !m_pendingPicks.contains(area))
         return QJsonValue(QJsonObject{{"ok", false}, {"error", "request-not-found"}});
     const QString relative = params.value("relativePath").toString();
     if (!m_library->isValidTarget(relative))
         return QJsonValue(QJsonObject{{"ok", false}, {"error", "invalid-path"}});
-    const PendingPick pick = m_pendingPicks.take(area);
+    const PendingPick pick = m_pendingPicks.value(area);
+    if (pick.mode != "cloud3d" && m_blenderGate.isBusy()) {
+        // 保留 requestId 与 pendingPick：弹窗不关，Blender 空闲后可再次确认
+        m_ws->broadcastEvent("error.card", {{"area", area}, {"reason", "blender-busy"}});
+        return QJsonValue(QJsonObject{{"ok", false}, {"error", "blender-busy"}});
+    }
+    m_pickRequests.remove(requestId);
+    m_pendingPicks.remove(area);
     const QString targetFolder = m_library->absoluteFor(relative);
     if (pick.mode == "cloud3d") {
         // P4 阶段占位；P5 在此调用 Cloud3dService::start(area, taskId, prompt, targetFolder)
@@ -1490,7 +1691,7 @@ void CoreApp::openFolderPick(const QString& area)
 }
 ```
 
-> `folderPick.submit` 把 TaskManager 回调参数 `tid` 传给 `execute()`（与入队 id 相同，但以回调参数为准）；此后由 `execute()` 内部 `finishOk/finishCancelled/fail` 调用 `TaskManager::finish` 推进队列。`plan.maxSteps` 直接采用 planReady 的 `totalSteps`（已在规划阶段算好并封顶 60）。
+> `folderPick.submit` 先检查门禁再消费 `requestId` / `pendingPick`：`blender-busy` 或 `invalid-path` 时弹窗保持打开，用户可修正路径或等 Blender 空闲后再次确认；成功后才 `remove`。随后把 TaskManager 回调参数 `tid` 传给 `execute()`（与入队 id 相同，但以回调参数为准）；此后由 `execute()` 内部 `finishOk/finishCancelled/fail` 调用 `TaskManager::finish` 推进队列。`plan.maxSteps` 直接采用 planReady 的 `totalSteps`（已在规划阶段算好并封顶 60）。
 
 `fs.operate` 与 `folderPick.mkdir` handler：
 
@@ -1585,7 +1786,7 @@ Expected: 2 用例 Passed。
 
 - [ ] **Step 3: 前端 FolderPicker.vue**
 
-弹窗树（缩进列表 + 单选），顶部 `[新建文件夹]`（`window.prompt` 名称 → `folderPick.mkdir {requestId, path: selectedPath, name}`，用返回的 `tree` 刷新），底部 `[取消] [确认]`；确认发 `folderPick.submit {requestId, relativePath: 选中相对路径}`。props：`{client, area, requestId, tree}`（由 ChatPanel 在 `folderPick.open` 时传入；只渲染 `area` 匹配的弹窗）。样式复用设置弹窗的遮罩类。
+弹窗树（缩进列表 + 单选），顶部 `[新建文件夹]`（`window.prompt` 名称 → `folderPick.mkdir {requestId, path: selectedPath, name}`，用返回的 `tree` 刷新），底部 `[取消] [确认]`；确认发 `folderPick.submit {requestId, relativePath: 选中相对路径}` 并等待返回，`ok:false` 时不关闭弹窗并显示错误（`blender-busy` 提示等 Blender 空闲后重试，`invalid-path` 提示换目录）。props：`{client, area, requestId, tree}`（由 ChatPanel 在 `folderPick.open` 时传入；只渲染 `area` 匹配的弹窗）。样式复用设置弹窗的遮罩类。
 
 - [ ] **Step 4: 手工验证**（真实 Blender：发送需求 → 草稿 → 发送 → 计划卡确认 → 选子文件夹（先新建一个）→ 模型按组生成并落盘 → `asset.created` 触发文件树刷新；右键重命名/删除后树刷新）
 
@@ -1833,7 +2034,8 @@ onMounted(() => {
 
 **Interfaces:**
 - 前端：FileTree 选中 `.glb` → ChatPanel 输入框上方显示 `目标资产：<name> ✕` chip；发送 `chat.send {area:"blender", mode:"modify", asset:"道具/sword_01/sword_01.glb", text:"把剑改短一点"}`。
-- CoreApp：`mode=="modify"` → `checkLowpoly()` → 校验 `asset` 在库内且存在（否则返回 `{"accepted":false, "error":"asset-not-found"}`，不占 error.card 字典）→ 构造单组计划并调 `execute()`，**不经过** SummarizerAgent、plan 卡、folderPick。
+- `CoreApp`：`mode=="modify"` → `checkLowpoly()` → 校验 `asset` 在库内且存在（否则返回 `{"accepted":false, "error":"asset-not-found"}`，不占 error.card 字典）→ 构造单组计划并调 `execute()`，**不经过** SummarizerAgent、plan 卡、folderPick。
+- 门禁：`execute()` 以 `"blender-agent"` 获取同一把 `BlenderGate`；Unity 转换进行中直接 `failed("blender-busy")`，用户等待后重新发送修改指令。
 - prompt 包装：`"打开并修改已有资产 <绝对路径>。要求：<用户原话>。完成后覆盖导出同名 GLB/FBX 并保存 .blend。"`；`targetFolder = 资产所在目录`。
 - 完成后 `asset.created` 同名覆盖并触发 `fileTree.changed`。
 
@@ -1922,8 +2124,10 @@ async function send() {
 - [ ] 修改已有资产路径跑通，且全程无草稿卡/计划卡/位置弹窗
 - [ ] 规划解析失败自动降级默认四分组，流程不中断；`plan.cancel` 正确取消任务
 - [ ] 前置检查先于总结 agent；`blender-not-ready` 时零 LLM 调用
+- [ ] Blender 低模 / 修改任务全程持有 `BlenderGate`（owner=`blender-agent`）；成功 / 失败 / 取消三个出口均释放；门禁忙时 `failed("blender-busy")` 且零 LLM / MCP 调用
+- [ ] `plan.confirm` 在门禁忙时返回 `blender-busy` 且**不消费** `m_pendingPlans`（计划卡保留，可稍后再点开始）
 - [ ] 截图压缩后回喂（长边 ≤1024、JPEG q80），且同一截图以 `chat.image` 事件在对话区渲染为图片卡
 - [ ] 取消任务后 MCP 调用在工具边界停止，任务事件 `finished(cancelled=true)`；草稿/规划/计划/执行四个可等待阶段的「停止」均生效（规划丢弃迟到结果不弹卡）
-- [ ] `tst_preflight`、`tst_mcp_runtime`、`tst_asset_library`、`tst_orchestrator` 全绿
+- [ ] `tst_preflight`、`tst_mcp_runtime`、`tst_blender_gate`、`tst_asset_library`、`tst_orchestrator` 全绿（`tst_orchestrator` 6 用例，含门禁忙拒绝与成功释放）
 - [ ] `fs.operate` 五项操作全部可用（mkdir/rename/delete/reveal/refresh），越界路径返回 `invalid-path`；`folderPick.mkdir` 可在弹窗内新建文件夹
 - [ ] `file.read` 支持文本/图片/GLB 三类；`asset.created` 后预览区自动加载新资产；未选中时显示概览卡
