@@ -25,7 +25,7 @@
 
 ```
 src/core/settings/SettingsStore.h/.cpp   ← settings.json 读写 + 默认值（provider 表）
-src/core/store/SessionStore.h/.cpp       ← SQLite：messages / drafts / tasks
+src/core/store/SessionStore.h/.cpp       ← SQLite：messages / drafts / tasks / assets
 src/core/tasks/TaskManager.h/.cpp        ← 每区串行队列 + 协作式取消
 src/core/ws/ProtocolRouter.h/.cpp        ← method → handler 注册表
 src/core/ws/WsServer.h/.cpp              ← QWebSocketServer + token + 帧编解码
@@ -454,6 +454,8 @@ QTEST_MAIN(TaskManagerTest)
 #include <QObject>
 #include <QQueue>
 #include <QString>
+#include <QStringList>
+#include <QSet>
 #include <functional>
 #include <memory>
 
@@ -474,6 +476,7 @@ public:
     void finish(const QString& taskId);
     void cancelArea(const QString& area);
     void cancelProject(const QString& projectId);
+    int runningCount(const QString& area) const;   // 运行中 + 排队（P6 切换确认用）
     bool isCancelled(const QString& taskId) const;
 
 signals:
@@ -485,21 +488,25 @@ private:
 
     QHash<QString, QQueue<Task>> m_queues;
     QHash<QString, QString> m_running;           // area -> taskId
-    QHash<QString, Task> m_tasks;                // taskId -> Task（查 projectId / 取消标志）
+    QHash<QString, Task> m_tasks;                // taskId -> Task（查 projectId）
+    QSet<QString> m_cancelled;                   // taskId 集合（不是 area，避免误伤后续任务）
 };
-
-inline constexpr QLatin1String kCancelledAreaPrefix = QLatin1String("cancelled:");
 ```
 
 ```cpp
 #include "core/tasks/TaskManager.h"
 
+int TaskManager::runningCount(const QString& area) const
+{
+    return (m_running.contains(area) ? 1 : 0) + m_queues.value(area).size();
+}
+
 void TaskManager::enqueue(Task task)
 {
+    const QString area = task.area;
     m_tasks.insert(task.id, task);
-    m_queues[task.area].enqueue(std::move(task));
-    pump(m_queues.value(task.area).isEmpty() ? QString() : task.area == "blender"
-                  ? QStringLiteral("__nop__") : QStringLiteral("__nop__"));
+    m_queues[area].enqueue(std::move(task));
+    pump(area);
 }
 
 void TaskManager::pump(const QString& area)
@@ -515,7 +522,7 @@ void TaskManager::pump(const QString& area)
 void TaskManager::finish(const QString& taskId)
 {
     const Task task = m_tasks.take(taskId);
-    const bool cancelled = isCancelled(taskId);
+    const bool cancelled = m_cancelled.remove(taskId);
     const QString area = task.area;
     if (m_running.value(area) == taskId)
         m_running.remove(area);
@@ -525,50 +532,34 @@ void TaskManager::finish(const QString& taskId)
 
 void TaskManager::cancelArea(const QString& area)
 {
-    // 标记运行中任务
     const QString runningId = m_running.value(area);
     if (!runningId.isEmpty())
-        m_tasks[runningId].id = runningId; // 保留；取消状态通过 m_cancelled 集合
+        m_cancelled.insert(runningId);           // 运行中任务：协作式取消
 
-    QQueue<Task> kept;
     while (!m_queues[area].isEmpty()) {
         const Task task = m_queues[area].dequeue();
         m_tasks.remove(task.id);
-        emit finished(task.id, true);
+        emit finished(task.id, true);            // 未启动任务：直接结束
     }
-    // 运行中任务的取消标志由 cancelSet 提供
-    m_cancelled.insert(area);
 }
 
 bool TaskManager::isCancelled(const QString& taskId) const
 {
-    const auto it = m_tasks.find(taskId);
-    if (it == m_tasks.end())
-        return false;
-    return m_cancelled.contains(it->area);
+    return m_cancelled.contains(taskId);
 }
 
 void TaskManager::cancelProject(const QString& projectId)
 {
+    QStringList areas;
     for (auto it = m_tasks.constBegin(); it != m_tasks.constEnd(); ++it)
-        if (it->projectId == projectId)
-            cancelArea(it->area);
+        if (it->projectId == projectId && !areas.contains(it->area))
+            areas << it->area;                   // 先收集，避免取消过程中迭代器失效
+    for (const QString& area : areas)
+        cancelArea(area);
 }
 ```
 
-> 注：上面 `enqueue` 中 `pump` 的调用写法需要修正为直接 `pump(task.area)`（task 已 move，先取 area 局部变量）。实现时按此修正：
->
-> ```cpp
-> void TaskManager::enqueue(Task task)
-> {
->     const QString area = task.area;
->     m_tasks.insert(task.id, task);
->     m_queues[area].enqueue(std::move(task));
->     pump(area);
-> }
-> ```
->
-> 且 `m_cancelled` 为 `QSet<QString>`（存 area）。`cancelArea` 中清空队列后无需保留 `kept`。
+> 注：`m_cancelled` 存 taskId，`cancelArea` 只标记当前运行中任务并直接结束排队任务；同区后续新任务不会被历史取消误伤。`cancelProject` 先收集 area 再逐个取消，避免遍历 `m_tasks` 时被 `remove` 导致迭代器失效。
 
 - [ ] **Step 3: CMake + 测试**（target 模板同前；预期 3 用例 Passed）
 
@@ -852,7 +843,7 @@ void LlmGateway::chatStream(const LlmConfig& cfg, const QJsonArray& messages,
 **Interfaces:**
 - `struct CoreOptions { QString dataDir; bool headless = false; }`
 - `class CoreApp : QObject { explicit CoreApp(CoreOptions, QObject* parent=nullptr); bool start(); WsServer* ws() const; }`
-- 注册 handler：`settings.get` / `settings.save` / `session.load` / `session.append` / `chat.send`（P2 版：落库 user 消息 → 发 `chat.message` 事件 → 若已配置 Agent 模型则经 LlmGateway 流式回 `chat.delta`，`[DONE]` 后落库 assistant 消息；未配置则 `error.card` 事件 `{"reason":"agent-not-configured"}`）。
+- 注册 handler：`settings.get` / `settings.save` / `session.load` / `chat.send`（P2 版：落库 user 消息 → 发 `chat.message` 事件 → 若已配置 Agent 模型则经 LlmGateway 流式回 `chat.delta`，`[DONE]` 后落库 assistant 消息；未配置则 `error.card` 事件 `{"reason":"agent-not-configured"}`）。
 - CLI：`synthforge_cli --headless` → 以 `defaultDataDir()` 启动 CoreApp，stderr 打印 `READY ws=ws://127.0.0.1:<port>/?token=<token>`，进入事件循环。
 
 - [ ] **Step 1: 写失败的集成测试**
@@ -910,7 +901,9 @@ private slots:
                      .value("primary").toObject().value("model").toString(),
                  QStringLiteral("deepseek-chat"));
 
-        request("session.append", {{"area", "blender"}, {"role", "user"}, {"content", "hello"}});
+        // chat.send 先落库 user 消息再检查模型配置（未配置只影响 accepted，不影响持久化）
+        const QJsonObject sent = request("chat.send", {{"area", "blender"}, {"text", "hello"}});
+        QVERIFY(sent.value("result").toObject().contains("accepted"));
         const QJsonObject loaded = request("session.load", {{"area", "blender"}});
         QCOMPARE(loaded.value("result").toArray().size(), 1);
 
@@ -988,12 +981,6 @@ bool CoreApp::start()
     });
     m_router->registerHandler("session.load", [this](const QJsonObject& params) {
         return QJsonValue(m_sessions->messages(params.value("area").toString()));
-    });
-    m_router->registerHandler("session.append", [this](const QJsonObject& params) {
-        m_sessions->appendMessage(params.value("area").toString(),
-                                  params.value("role").toString(),
-                                  params.value("content").toString());
-        return QJsonValue(QJsonObject{{"ok", true}});
     });
     m_router->registerHandler("chat.send", [this](const QJsonObject& params) {
         const QString area = params.value("area").toString();
@@ -1080,10 +1067,451 @@ Expected: 全部测试 Passed（含 settings/session 往返、未知 method 错�
 
 ---
 
+### Task 7: 会话持久化扩展与协议补全（chat.clear / chat.retry / bridge.restart）
+
+**Files:**
+- Modify: `src/core/store/SessionStore.h/.cpp`（补 tasks / assets 表、recentMessages、clearMessages）
+- Modify: `src/core/coreapp/CoreApp.h/.cpp`（新增 3 个 handler、历史裁剪、每任务独立流缓冲）
+- Modify: `tests/tst_session_store.cpp`（追加 3 用例）
+- Modify: `tests/tst_headless_ws.cpp`（追加 retry/clear 用例）
+
+**Interfaces:**
+- Consumes: `SessionStore`（Task 2）、`TaskManager`（Task 3）、`CoreApp`（Task 6）。
+- Produces:
+  - `SessionStore::recentMessages(area, limit)` — 最近 N 条（时间升序），供 LLM 上下文组装（规格 4.6）。
+  - `SessionStore::clearMessages(area)`、`SessionStore::upsertTask / tasks / upsertAsset / assets` — 对应规格 7.2 的「任务记录、资产卡引用」。
+  - `CoreApp::registerBridge(area, std::function<bool()> restartFn)` — 由 P4（blender）/ P6（unity）注入桥接重启回调；未注册时 `bridge.restart` 返回 `bridge-not-registered`。
+  - 协议：`chat.cancel {area}`（只取消本区运行中/排队任务，保留消息与重试缓存；实现为 `TaskManager::cancelArea`）、`chat.clear {area}`（取消本区任务 + 清空本区消息 + 清掉重试缓存）、`chat.retry {area}`（重走最近一次 `chat.send` 参数，不重复落库 user 消息）。
+  - `chat.retry` 语义：重新提交整个任务（低模会重新规划；云任务由 P5 的 `Cloud3dService` 判断是否复用上次作业）。无重试目标时返回 `accepted=false, error=no-task-to-retry`。
+
+- [ ] **Step 1: 写 SessionStore 扩展的失败测试**
+
+在 `tests/tst_session_store.cpp` 的 `private slots:` 中追加：
+
+```cpp
+    void recentMessagesCapsAtLimit()
+    {
+        QTemporaryDir dir;
+        SessionStore store(dir.path() + "/sessions.db");
+        QVERIFY(store.open());
+        for (int i = 0; i < 30; ++i)
+            store.appendMessage("blender", "user", QStringLiteral("m%1").arg(i));
+
+        const QJsonArray recent = store.recentMessages("blender", 20);
+        QCOMPARE(recent.size(), 20);
+        QCOMPARE(recent.first().toObject().value("content").toString(),
+                 QStringLiteral("m10"));
+        QCOMPARE(recent.last().toObject().value("content").toString(),
+                 QStringLiteral("m29"));
+    }
+
+    void clearMessagesKeepsOtherArea()
+    {
+        QTemporaryDir dir;
+        SessionStore store(dir.path() + "/sessions.db");
+        QVERIFY(store.open());
+        store.appendMessage("blender", "user", "a");
+        store.appendMessage("unity", "user", "b");
+        store.clearMessages("blender");
+        QCOMPARE(store.messages("blender").size(), 0);
+        QCOMPARE(store.messages("unity").size(), 1);
+    }
+
+    void tasksAndAssetsRoundTrip()
+    {
+        QTemporaryDir dir;
+        SessionStore store(dir.path() + "/sessions.db");
+        QVERIFY(store.open());
+        store.upsertTask("t1", "blender", "lowpoly", "running", {{"text", "便利店"}});
+        store.upsertTask("t1", "blender", "lowpoly", "done", {{"text", "便利店"}},
+                         {{"asset", "便利店.blend"}});
+        const QJsonArray tasks = store.tasks("blender");
+        QCOMPARE(tasks.size(), 1);
+        QCOMPARE(tasks.first().toObject().value("state").toString(), QStringLiteral("done"));
+        QCOMPARE(tasks.first().toObject().value("result").toObject()
+                     .value("asset").toString(),
+                 QStringLiteral("便利店.blend"));
+
+        store.upsertAsset("a1", "blender", "C:/lib/便利店/便利店.blend",
+                          {{"name", "便利店"}, {"kind", "blend"}});
+        const QJsonArray assets = store.assets("blender");
+        QCOMPARE(assets.size(), 1);
+        QCOMPARE(assets.first().toObject().value("path").toString(),
+                 QStringLiteral("C:/lib/便利店/便利店.blend"));
+    }
+```
+
+- [ ] **Step 2: 扩展 SessionStore**
+
+`SessionStore.h` 整文件替换为：
+
+```cpp
+#pragma once
+
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QSqlDatabase>
+#include <QString>
+
+class SessionStore
+{
+public:
+    explicit SessionStore(QString dbPath);
+    bool open(); // 建表 + PRAGMA journal_mode=WAL
+    void appendMessage(const QString& area, const QString& role, const QString& content);
+    QJsonArray messages(const QString& area) const;
+    QJsonArray recentMessages(const QString& area, int limit) const; // 最近 N 条，时间升序
+    void clearMessages(const QString& area);
+    void saveDraft(const QString& area, const QString& content);
+    QString draft(const QString& area) const;
+    void upsertTask(const QString& id, const QString& area, const QString& kind,
+                    const QString& state, const QJsonObject& payload,
+                    const QJsonObject& result = QJsonObject{});
+    QJsonArray tasks(const QString& area) const; // 最近 50 条，updated 降序
+    void upsertAsset(const QString& id, const QString& area, const QString& path,
+                     const QJsonObject& card);
+    QJsonArray assets(const QString& area) const;
+
+private:
+    QString m_path;
+    QSqlDatabase m_db;
+};
+```
+
+`SessionStore.cpp`：`open()` 中追加建表（在 drafts 建表之后）：
+
+```cpp
+    q.exec("CREATE TABLE IF NOT EXISTS tasks("
+           "id TEXT PRIMARY KEY, area TEXT NOT NULL, kind TEXT NOT NULL,"
+           "state TEXT NOT NULL, payload TEXT NOT NULL, result TEXT NOT NULL DEFAULT '{}',"
+           "updated INTEGER NOT NULL)");
+    q.exec("CREATE TABLE IF NOT EXISTS assets("
+           "id TEXT PRIMARY KEY, area TEXT NOT NULL, path TEXT NOT NULL,"
+           "card TEXT NOT NULL, updated INTEGER NOT NULL)");
+```
+
+文件末尾追加方法实现（新增 `#include <QJsonDocument>`）：
+
+```cpp
+QJsonArray SessionStore::recentMessages(const QString& area, int limit) const
+{
+    QJsonArray out;
+    QSqlQuery q(m_db);
+    q.prepare("SELECT role, content FROM messages WHERE area=? ORDER BY id DESC LIMIT ?");
+    q.addBindValue(area);
+    q.addBindValue(limit);
+    q.exec();
+    while (q.next())
+        out.prepend(QJsonObject{{"role", q.value(0).toString()},
+                                {"content", q.value(1).toString()}});
+    return out;
+}
+
+void SessionStore::clearMessages(const QString& area)
+{
+    QSqlQuery q(m_db);
+    q.prepare("DELETE FROM messages WHERE area=?");
+    q.addBindValue(area);
+    q.exec();
+}
+
+void SessionStore::upsertTask(const QString& id, const QString& area, const QString& kind,
+                              const QString& state, const QJsonObject& payload,
+                              const QJsonObject& result)
+{
+    QSqlQuery q(m_db);
+    q.prepare("INSERT INTO tasks(id, area, kind, state, payload, result, updated)"
+              " VALUES(?,?,?,?,?,?,?)"
+              " ON CONFLICT(id) DO UPDATE SET state=excluded.state,"
+              " result=excluded.result, updated=excluded.updated");
+    q.addBindValue(id);
+    q.addBindValue(area);
+    q.addBindValue(kind);
+    q.addBindValue(state);
+    q.addBindValue(QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+    q.addBindValue(QString::fromUtf8(QJsonDocument(result).toJson(QJsonDocument::Compact)));
+    q.addBindValue(QDateTime::currentMSecsSinceEpoch());
+    q.exec();
+}
+
+QJsonArray SessionStore::tasks(const QString& area) const
+{
+    QJsonArray out;
+    QSqlQuery q(m_db);
+    q.prepare("SELECT id, kind, state, payload, result FROM tasks WHERE area=?"
+              " ORDER BY updated DESC LIMIT 50");
+    q.addBindValue(area);
+    q.exec();
+    while (q.next()) {
+        out.append(QJsonObject{
+            {"id", q.value(0).toString()},
+            {"kind", q.value(1).toString()},
+            {"state", q.value(2).toString()},
+            {"payload", QJsonDocument::fromJson(q.value(3).toString().toUtf8()).object()},
+            {"result", QJsonDocument::fromJson(q.value(4).toString().toUtf8()).object()}});
+    }
+    return out;
+}
+
+void SessionStore::upsertAsset(const QString& id, const QString& area, const QString& path,
+                               const QJsonObject& card)
+{
+    QSqlQuery q(m_db);
+    q.prepare("INSERT INTO assets(id, area, path, card, updated) VALUES(?,?,?,?,?)"
+              " ON CONFLICT(id) DO UPDATE SET path=excluded.path,"
+              " card=excluded.card, updated=excluded.updated");
+    q.addBindValue(id);
+    q.addBindValue(area);
+    q.addBindValue(path);
+    q.addBindValue(QString::fromUtf8(QJsonDocument(card).toJson(QJsonDocument::Compact)));
+    q.addBindValue(QDateTime::currentMSecsSinceEpoch());
+    q.exec();
+}
+
+QJsonArray SessionStore::assets(const QString& area) const
+{
+    QJsonArray out;
+    QSqlQuery q(m_db);
+    q.prepare("SELECT id, path, card FROM assets WHERE area=? ORDER BY updated DESC");
+    q.addBindValue(area);
+    q.exec();
+    while (q.next()) {
+        out.append(QJsonObject{
+            {"id", q.value(0).toString()},
+            {"path", q.value(1).toString()},
+            {"card", QJsonDocument::fromJson(q.value(2).toString().toUtf8()).object()}});
+    }
+    return out;
+}
+```
+
+Run: `cmake --build build --config Debug --target tst_session_store`
+Run: `ctest --test-dir build -C Debug -R tst_session_store --output-on-failure`
+Expected: 5 用例 Passed。
+
+- [ ] **Step 3: 重写 CoreApp 的 chat handler**
+
+`CoreApp.h` 在 Task 6 版本上追加（`#include <functional>` 与 `<QHash>`）：
+
+```cpp
+public:
+    using RestartFn = std::function<bool()>;
+    void registerBridge(const QString& area, RestartFn fn);
+
+private:
+    QJsonValue handleChatSend(const QJsonObject& params, bool appendUser = true);
+    QHash<QString, QJsonObject> m_lastSend;     // area -> 最近一次 chat.send 参数
+    QHash<QString, RestartFn> m_bridgeRestarts; // area -> 桥接重启回调（P4/P6 注入）
+    qint64 m_seq = 0;
+```
+
+`CoreApp.cpp` 的 `start()` 中，把 Task 6 的 `chat.send` lambda 注册**整体替换**为下面五个 handler：
+
+```cpp
+    m_router->registerHandler("chat.send", [this](const QJsonObject& params) {
+        return handleChatSend(params);
+    });
+    m_router->registerHandler("chat.retry", [this](const QJsonObject& params) {
+        const QString area = params.value("area").toString();
+        const QJsonObject last = m_lastSend.value(area);
+        if (last.isEmpty())
+            return QJsonValue(QJsonObject{{"accepted", false},
+                                          {"error", "no-task-to-retry"}});
+        return handleChatSend(last, /*appendUser=*/false); // 不重复落库同一句 user 消息
+    });
+    m_router->registerHandler("chat.cancel", [this](const QJsonObject& params) {
+        const QString area = params.value("area").toString();
+        m_tasks->cancelArea(area); // 运行中任务在工具/回合边界停止，排队任务立即 finished(cancelled)
+        return QJsonValue(QJsonObject{{"ok", true}});
+    });
+    m_router->registerHandler("chat.clear", [this](const QJsonObject& params) {
+        const QString area = params.value("area").toString();
+        m_tasks->cancelArea(area); // 正在跑的任务放弃回写
+        m_sessions->clearMessages(area);
+        m_lastSend.remove(area);
+        return QJsonValue(QJsonObject{{"ok", true}});
+    });
+    m_router->registerHandler("bridge.restart", [this](const QJsonObject& params) {
+        const QString area = params.value("area").toString();
+        const auto fn = m_bridgeRestarts.value(area);
+        if (!fn)
+            return QJsonValue(QJsonObject{{"ok", false},
+                                          {"error", "bridge-not-registered"}});
+        return QJsonValue(QJsonObject{{"ok", fn()}});
+    });
+```
+
+在 `start()` 之后追加：
+
+```cpp
+void CoreApp::registerBridge(const QString& area, RestartFn fn)
+{
+    m_bridgeRestarts.insert(area, std::move(fn));
+}
+```
+
+`CoreApp.cpp` 末尾追加 `handleChatSend` 完整实现（替换 Task 6 中 lambda 里的原逻辑），重点变化：历史裁剪到 20 条（规格 4.6）、流式缓冲改为每任务独立 `shared_ptr<QString>`（两区可并行，不再共享 `m_streamBuf`）、任务状态落库：
+
+```cpp
+QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
+{
+    const QString area = params.value("area").toString();
+    const QString text = params.value("text").toString();
+    m_lastSend.insert(area, params);
+
+    if (appendUser) {
+        m_sessions->appendMessage(area, "user", text);
+        m_ws->broadcastEvent("chat.message",
+                             {{"area", area}, {"role", "user"}, {"content", text}});
+    }
+
+    const QJsonObject primary =
+        m_settings->data().value("agent").toObject().value("primary").toObject();
+    if (primary.value("apiKey").toString().isEmpty()
+        || primary.value("model").toString().isEmpty()) {
+        m_ws->broadcastEvent("error.card",
+                             {{"area", area}, {"reason", "agent-not-configured"}});
+        return QJsonValue(QJsonObject{{"accepted", false}});
+    }
+
+    LlmConfig cfg{primary.value("baseUrl").toString(),
+                  primary.value("apiKey").toString(),
+                  primary.value("model").toString()};
+    const QJsonArray history = m_sessions->recentMessages(area, 20); // 规格 4.6
+    const QString taskId = QStringLiteral("chat-%1").arg(++m_seq);
+
+    m_tasks->enqueue(Task{taskId, area, QString(),
+                          [=](const QString& tid, TaskManager* tm) {
+                              auto buf = std::make_shared<QString>(); // 每任务独立缓冲
+                              LlmGateway::StreamHandlers h;
+                              h.onDelta = [this, area, buf](const QString& delta) {
+                                  buf->append(delta);
+                                  m_ws->broadcastEvent("chat.delta",
+                                                       {{"area", area}, {"text", delta}});
+                              };
+                              h.onDone = [=]() {
+                                  m_sessions->appendMessage(area, "assistant", *buf);
+                                  m_sessions->upsertTask(tid, area, "chat", "done", params,
+                                                         {{"reply", *buf}});
+                                  m_ws->broadcastEvent("chat.message",
+                                                       {{"area", area},
+                                                        {"role", "assistant"},
+                                                        {"content", *buf}});
+                                  tm->finish(tid);
+                              };
+                              h.onError = [=](const QString& err) {
+                                  m_sessions->upsertTask(tid, area, "chat", "failed", params,
+                                                         {{"error", err}});
+                                  m_ws->broadcastEvent("error.card",
+                                                       {{"area", area}, {"reason", err}});
+                                  tm->finish(tid);
+                              };
+                              m_sessions->upsertTask(tid, area, "chat", "running", params);
+                              m_llm->chatStream(cfg, history, {}, h);
+                          }});
+    return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
+}
+```
+
+> 注：`chat.send` 返回的键从 `{"ok",true}` 变为 `{"accepted",true,"taskId"}`，与规格 8.3 示例一致；P2 集成测试需同步断言 `accepted`。
+
+- [ ] **Step 4: 追加集成测试**
+
+在 `tests/tst_headless_ws.cpp` 追加用例（复用 Task 6 的 `request` 辅助结构，或新建同类用例）：
+
+```cpp
+    void retryAndClearRoundTrip()
+    {
+        QTemporaryDir dir;
+        CoreApp app({dir.path(), true});
+        QVERIFY(app.start());
+
+        QWebSocket socket;
+        QSignalSpy connected(&socket, &QWebSocket::connected);
+        socket.open(QUrl(QStringLiteral("ws://127.0.0.1:%1/?token=%2")
+                             .arg(app.ws()->port()).arg(app.ws()->token())));
+        QVERIFY(connected.wait(5000));
+
+        int nextId = 1;
+        auto request = [&](const QString& method, const QJsonObject& params) {
+            QJsonObject frame{{"id", nextId}, {"method", method}, {"params", params}};
+            const int expected = nextId++;
+            QJsonObject received;
+            auto conn = connect(&socket, &QWebSocket::textMessageReceived, this,
+                                [&](const QString& text) {
+                                    const QJsonObject obj =
+                                        QJsonDocument::fromJson(text.toUtf8()).object();
+                                    if (obj.value("id").toInt() == expected)
+                                        received = obj;
+                                });
+            socket.sendTextMessage(QString::fromUtf8(
+                QJsonDocument(frame).toJson(QJsonDocument::Compact)));
+            QTRY_VERIFY(!received.isEmpty());
+            disconnect(conn);
+            return received;
+        };
+
+        // 无重试目标：返回错误而不是崩溃
+        const QJsonObject none = request("chat.retry", {{"area", "blender"}});
+        QCOMPARE(none.value("result").toObject().value("error").toString(),
+                 QStringLiteral("no-task-to-retry"));
+
+        // 配置一个不可达的本地端点：chat.send 接受任务但异步失败
+        request("settings.save",
+                {{"agent", QJsonObject{{"primary",
+                                        QJsonObject{{"provider", "deepseek"},
+                                                    {"baseUrl", "http://127.0.0.1:1/v1"},
+                                                    {"apiKey", "test"},
+                                                    {"model", "deepseek-chat"}}}}}});
+        const QJsonObject sent = request("chat.send", {{"area", "blender"},
+                                                      {"text", "做一个便利店"}});
+        QVERIFY(sent.value("result").toObject().value("accepted").toBool());
+        const QString firstTask = sent.value("result").toObject().value("taskId").toString();
+        QVERIFY(!firstTask.isEmpty());
+
+        // 重试：接受新任务且不重复落库 user 消息
+        const QJsonObject retried = request("chat.retry", {{"area", "blender"}});
+        QVERIFY(retried.value("result").toObject().value("accepted").toBool());
+        QVERIFY(retried.value("result").toObject().value("taskId").toString() != firstTask);
+        QCOMPARE(request("session.load", {{"area", "blender"}})
+                     .value("result").toArray().size(),
+                 1);
+
+        // 清空：本区消息归零，且原始任务被取消
+        QCOMPARE(request("chat.clear", {{"area", "blender"}})
+                     .value("result").toObject().value("ok").toBool(),
+                 true);
+        QCOMPARE(request("session.load", {{"area", "blender"}})
+                     .value("result").toArray().size(),
+                 0);
+
+        socket.close();
+    }
+```
+
+> 如果 Task 6 的 `settingsAndSessionRoundTrip` 中的 `request` 辅助是函数内 lambda，不允许跨用例复用；此用例自带一份完整 lambda（上面已给出），无需重构原用例。
+
+- [ ] **Step 5: 构建并跑测试**
+
+Run: `cmake --build build --config Debug`
+Run: `ctest --test-dir build -C Debug --output-on-failure`
+Expected: `tst_session_store` 5 用例 + `tst_headless_ws` 2 用例全部 Passed。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/core/store/SessionStore.h src/core/store/SessionStore.cpp src/core/coreapp/CoreApp.h src/core/coreapp/CoreApp.cpp tests/tst_session_store.cpp tests/tst_headless_ws.cpp
+git commit -m "feat: 会话持久化补全（历史裁剪/清空/任务与资产卡）与 chat.retry/chat.clear/bridge.restart 协议"
+```
+
+---
+
 ## P2 完成标准
 
 - [ ] `qa` 全绿：新增 5 个测试可执行全部通过
 - [ ] `synthforge_cli --headless` 启动后输出 `READY ws=...`，浏览器可用 wscat/DevTools 完成 settings.save → settings.get 往返
 - [ ] `sessions.db` 生成于数据目录且为 WAL 模式；重启后消息仍在
 - [ ] 未配置 Agent 密钥时 `chat.send` 触发 `error.card`（不崩溃、不调用 LLM）
-- [ ] 任务取消后 `finished(cancelled=true)` 事件可观测
+- [ ] `chat.cancel` / `chat.clear` 取消任务后 `finished(cancelled=true)` 事件可观测（消息不被清空的是 `chat.cancel`）
+- [ ] `chat.clear` 清空本区消息且不影响另一区；`chat.retry` 在无目标时返回 `no-task-to-retry`，有目标时以相同参数重新提交且不重复落库 user 消息
+- [ ] `bridge.restart` 在桥接未注册时返回 `bridge-not-registered`；P4 / P6 注入重启回调后由 P7 错误卡调用

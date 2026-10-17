@@ -1351,9 +1351,410 @@ git commit -m "feat: 默认桥接命令表与 MCP 冒烟 CLI（真实 Blender/Un
 
 ---
 
+### Task 6: 心跳检测与断线自动重连
+
+**Files:**
+- Modify: `src/core/mcp/McpClient.h`
+- Modify: `src/core/mcp/McpClient.cpp`
+- Modify: `src/core/mcp/StdioTransport.cpp`（`start()` 先清空行缓冲）
+- Modify: `tests/mock/mock_mcp_server.cpp`（故障注入：收到 ping 不回复）
+- Create: `tests/tst_reconnect.cpp`
+- Modify: `CMakeLists.txt`（新增 `tst_reconnect` target）
+
+**Interfaces:**
+- Consumes: `McpClient`（Task 3）、`StdioTransport`（Task 4）、`mock_mcp_server`（Task 4）。
+- Produces:
+  - `void setHeartbeatInterval(int ms)` — 心跳周期，默认 30000；`<= 0` 关闭心跳。
+  - `void setHeartbeatTimeout(int ms)` — 单次心跳响应超时，默认 5000；超时即判定连接死亡。
+  - `void shutdown()` — 主动停止：关心跳、停 transport、不触发自动重连；程序退出使用。
+  - `void prepareRestart()` — `bridge.restart` 用：解除 shutdown、清退避计数（但不起传输）；调用方随后 `transport->start()` 重新握手，启动失败仍能继续自动重连。
+  - 信号 `reconnecting(int attempt)`（attempt 从 1 起）与 `reconnected()`（仅断线后的重新握手成功才发射，首次 ready 不发射）。
+  - 重连退避 1s / 2s / 4s / 8s / 16s / 30s 封顶后保持 30s，无限重试；仅对「曾经握手成功」的连接生效（首次启动失败不自动重试，顶栏保持灰灯，发送时由前置检查报 `blender-not-ready` / `unity-not-ready`）。
+  - `P7` 的 `conn.status` 由这两个信号驱动：`reconnecting` → 黄灯，`ready`/`reconnected` → 绿灯。
+
+- [ ] **Step 1: 写失败的测试**
+
+`tests/tst_reconnect.cpp`：
+
+```cpp
+#include <QtTest>
+
+#include "core/mcp/McpClient.h"
+#include "core/mcp/StdioTransport.h"
+
+class ReconnectTest : public QObject
+{
+    Q_OBJECT
+
+private slots:
+    void crashedBridgeIsRestartedAndRehandshaked()
+    {
+        BridgeCommand command{QString::fromLocal8Bit(MOCK_SERVER_PATH), {},
+                              QProcessEnvironment::systemEnvironment()};
+        StdioTransport transport(command);
+        McpClient client(&transport);
+        connect(&transport, &McpTransport::started, &client, &McpClient::start);
+
+        QSignalSpy readySpy(&client, &McpClient::ready);
+        transport.start();
+        QVERIFY2(readySpy.wait(15000), "首次握手失败");
+
+        QSignalSpy reconnectingSpy(&client, &McpClient::reconnecting);
+        QSignalSpy reconnectedSpy(&client, &McpClient::reconnected);
+
+        transport.stop(); // 模拟桥接进程崩溃（McpClient 视角为意外断开）
+
+        QTRY_VERIFY_WITH_TIMEOUT(reconnectingSpy.count() >= 1, 5000);
+        QCOMPARE(reconnectingSpy.first().at(0).toInt(), 1);
+
+        QVERIFY2(reconnectedSpy.wait(15000), "崩溃后未自动重连并重新握手");
+
+        QJsonArray tools;
+        bool listed = false;
+        client.listTools([&](const QJsonArray& t) {
+            tools = t;
+            listed = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(listed, 15000);
+        QCOMPARE(tools.size(), 1);
+
+        client.shutdown();
+    }
+
+    void stalledBridgeIsDetectedByHeartbeat()
+    {
+        qputenv("MOCK_IGNORE_PING", "1"); // mock 收到 ping 不回复
+        BridgeCommand command{QString::fromLocal8Bit(MOCK_SERVER_PATH), {},
+                              QProcessEnvironment::systemEnvironment()};
+        StdioTransport transport(command);
+        McpClient client(&transport);
+        client.setHeartbeatInterval(200);
+        client.setHeartbeatTimeout(500);
+        connect(&transport, &McpTransport::started, &client, &McpClient::start);
+
+        QSignalSpy readySpy(&client, &McpClient::ready);
+        transport.start();
+        QVERIFY2(readySpy.wait(15000), "首次握手失败");
+
+        QSignalSpy reconnectingSpy(&client, &McpClient::reconnecting);
+        QTRY_VERIFY_WITH_TIMEOUT(reconnectingSpy.count() >= 1, 10000);
+
+        client.shutdown();
+        qunsetenv("MOCK_IGNORE_PING");
+    }
+};
+
+QTEST_MAIN(ReconnectTest)
+#include "tst_reconnect.moc"
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cmake --build build --config Debug --target tst_reconnect`
+Expected: 编译失败（`setHeartbeatInterval`、`shutdown`、`reconnecting` 均不存在；若提示 target 不存在，先执行 Step 6 的 CMake 注册再重试）。
+
+- [ ] **Step 3: 实现心跳与重连**
+
+`src/core/mcp/McpClient.h` 整文件替换为：
+
+```cpp
+#pragma once
+
+#include <QHash>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QJsonValue>
+#include <QObject>
+#include <QString>
+#include <QTimer>
+
+#include <functional>
+
+class McpTransport;
+
+class McpClient : public QObject
+{
+    Q_OBJECT
+
+public:
+    // error 为空对象表示成功；result 的语义由调用方解释。
+    using ReplyCallback = std::function<void(const QJsonValue& result, const QJsonObject& error)>;
+
+    explicit McpClient(McpTransport* transport, QObject* parent = nullptr);
+
+    void start(); // 发起 initialize 握手；成功后自动发送 notifications/initialized
+    void shutdown(); // 主动停止：关心跳、停 transport、不触发自动重连
+    void prepareRestart(); // bridge.restart：解除 shutdown 与退避计数，随后由调用方启动传输
+    bool isReady() const { return m_ready; }
+    void setRequestTimeout(int ms) { m_timeoutMs = ms; }
+    void setHeartbeatInterval(int ms); // <= 0 关闭心跳；默认 30000
+    void setHeartbeatTimeout(int ms) { m_heartbeatTimeoutMs = ms; } // 默认 5000
+
+    void listTools(std::function<void(const QJsonArray& tools)> onOk,
+                   ReplyCallback onErr = nullptr);
+    void callTool(const QString& name, const QJsonObject& arguments,
+                  ReplyCallback onDone);
+
+signals:
+    void ready(const QJsonObject& serverInfo);
+    void failed(const QString& reason);
+    void reconnecting(int attempt); // attempt 从 1 起
+    void reconnected();             // 仅断线后的重新握手成功才发射
+
+private:
+    qint64 sendRequest(const QString& method, const QJsonObject& params, ReplyCallback cb,
+                       int timeoutMs = -1);
+    void onLine(const QByteArray& line);
+    void resolve(qint64 id, const QJsonValue& result, const QJsonObject& error);
+    void failAllPending(const QString& reason);
+    void onTransportStopped();
+    void startHeartbeat();
+    void sendHeartbeat();
+    void scheduleReconnect();
+
+    McpTransport* m_transport;
+    QHash<qint64, ReplyCallback> m_pending;
+    qint64 m_lastId = 0;
+    int m_timeoutMs = 30000;
+    bool m_ready = false;
+
+    QTimer m_heartbeatTimer;
+    int m_heartbeatIntervalMs = 30000;
+    int m_heartbeatTimeoutMs = 5000;
+    bool m_heartbeatInFlight = false;
+
+    bool m_everReady = false; // 首次握手成功后才允许自动重连
+    bool m_shutdown = false;
+    bool m_reconnectScheduled = false;
+    int m_reconnectAttempt = 0;
+};
+```
+
+`src/core/mcp/McpClient.cpp` 修改以下函数（其余不变）：
+
+构造函数——接入接入点与心跳定时器：
+
+```cpp
+McpClient::McpClient(McpTransport* transport, QObject* parent)
+    : QObject(parent), m_transport(transport)
+{
+    connect(m_transport, &McpTransport::lineReceived, this, &McpClient::onLine);
+    connect(m_transport, &McpTransport::stopped, this,
+            [this](int) { onTransportStopped(); });
+    m_heartbeatTimer.setSingleShot(false);
+    connect(&m_heartbeatTimer, &QTimer::timeout, this, &McpClient::sendHeartbeat);
+}
+```
+
+`start()` 与 `shutdown()`——握手成功后启动心跳，断了重连上发 `reconnected`：
+
+```cpp
+void McpClient::start()
+{
+    m_shutdown = false;
+    const QJsonObject params{
+        {QStringLiteral("protocolVersion"), QStringLiteral("2025-06-18")},
+        {QStringLiteral("clientInfo"),
+         QJsonObject{{"name", QStringLiteral("SynthForgeStudio")},
+                     {"version", QStringLiteral("0.1.0")}}},
+        {QStringLiteral("capabilities"), QJsonObject{}}};
+    sendRequest(QStringLiteral("initialize"), params,
+                [this](const QJsonValue& result, const QJsonObject& error) {
+                    if (!error.isEmpty()) {
+                        emit failed(QStringLiteral("initialize failed: %1").arg(
+                            error.value(QStringLiteral("message")).toString()));
+                        if (m_everReady) { // 崩后重启的桥接尚未就绪：继续退避重试
+                            m_transport->stop();
+                            scheduleReconnect();
+                        }
+                        return;
+                    }
+                    m_transport->sendLine(JsonRpcLineCodec::makeNotification(
+                        QStringLiteral("notifications/initialized"), QJsonObject{}));
+                    m_ready = true;
+                    m_reconnectAttempt = 0;
+                    startHeartbeat();
+                    const QJsonObject serverInfo =
+                        result.toObject().value(QStringLiteral("serverInfo")).toObject();
+                    if (m_everReady)
+                        emit reconnected();
+                    m_everReady = true;
+                    emit ready(serverInfo);
+                });
+}
+
+void McpClient::shutdown()
+{
+    m_shutdown = true;
+    m_heartbeatTimer.stop();
+    m_ready = false;
+    failAllPending(QStringLiteral("client shutdown"));
+    m_transport->stop();
+}
+
+void McpClient::prepareRestart()
+{
+    m_shutdown = false;          // 启动失败时仍允许退避重连
+    m_reconnectAttempt = 0;
+    m_reconnectScheduled = false;
+}
+```
+
+`sendRequest()` 增加单次超时覆盖（心跳用 5s，普通请求仍用 `m_timeoutMs`）：
+
+```cpp
+qint64 McpClient::sendRequest(const QString& method, const QJsonObject& params,
+                              ReplyCallback cb, int timeoutMs)
+{
+    const qint64 id = ++m_lastId;
+    m_pending.insert(id, std::move(cb));
+    m_transport->sendLine(JsonRpcLineCodec::makeRequest(id, method, params));
+
+    const int timeout = timeoutMs > 0 ? timeoutMs : m_timeoutMs;
+    QTimer::singleShot(timeout, this, [this, id]() {
+        auto it = m_pending.find(id);
+        if (it == m_pending.end())
+            return; // 已被响应或断开处理
+        ReplyCallback cb = it.value();
+        m_pending.erase(it);
+        cb(QJsonValue(), QJsonObject{{"code", -32000},
+                                     {"message", QStringLiteral("request timeout")}});
+    });
+    return id;
+}
+```
+
+心跳、断线与指数退避——追加在 `failAllPending` 之后：
+
+```cpp
+void McpClient::setHeartbeatInterval(int ms)
+{
+    m_heartbeatIntervalMs = ms;
+    if (m_ready)
+        startHeartbeat();
+}
+
+void McpClient::startHeartbeat()
+{
+    m_heartbeatTimer.stop();
+    if (m_heartbeatIntervalMs > 0)
+        m_heartbeatTimer.start(m_heartbeatIntervalMs);
+}
+
+void McpClient::sendHeartbeat()
+{
+    if (!m_ready || m_heartbeatInFlight)
+        return;
+    m_heartbeatInFlight = true;
+    sendRequest(QStringLiteral("ping"), QJsonObject{},
+                [this](const QJsonValue&, const QJsonObject& error) {
+                    m_heartbeatInFlight = false;
+                    if (error.value(QStringLiteral("code")).toInt() != -32000)
+                        return; // 有响应（含服务端错误码）说明连接仍活着
+                    m_ready = false;
+                    m_heartbeatTimer.stop();
+                    failAllPending(QStringLiteral("heartbeat timeout"));
+                    m_transport->stop(); // 进程卡死时先杀掉，否则 restart 会失败
+                    scheduleReconnect();
+                },
+                m_heartbeatTimeoutMs);
+}
+
+void McpClient::onTransportStopped()
+{
+    const bool wasReady = m_ready;
+    m_ready = false;
+    m_heartbeatTimer.stop();
+    m_heartbeatInFlight = false;
+    failAllPending(QStringLiteral("transport stopped"));
+    if (m_shutdown)
+        return;                          // 主动 shutdown：不重连、不报错
+    if (wasReady) {
+        emit failed(QStringLiteral("MCP 桥接异常退出，正在自动重连")); // → status off + bridge-crashed 错误卡
+        scheduleReconnect();
+    } else if (m_everReady) {
+        scheduleReconnect();             // 重连/手动 restart 的进程没起来：继续退避，不让灯卡死在“重连中”
+    }
+}
+
+void McpClient::scheduleReconnect()
+{
+    if (m_reconnectScheduled || m_shutdown)
+        return;
+    m_reconnectScheduled = true;
+    ++m_reconnectAttempt;
+    emit reconnecting(m_reconnectAttempt);
+    const int delayMs = qMin(1000 * (1 << qMin(m_reconnectAttempt - 1, 5)), 30000);
+    QTimer::singleShot(delayMs, this, [this]() {
+        m_reconnectScheduled = false;
+        if (m_shutdown || m_ready)
+            return; // 已恢复就绪时，陈旧定时器不得再断开健康连接
+        m_transport->stop(); // 幂等：NotRunning 时直接返回
+        m_transport->start(); // started → 外部接线的 McpClient::start 自动重新握手
+    });
+}
+```
+
+> 崩溃语义：传输意外退出（含心跳超时触发的 `stop()`）先 `emit failed(...)`（顶栏变灰 + P7 `bridge-crashed` 错误卡），再 `scheduleReconnect()` 进入黄灯重连；重连尝试再次失败时只续退避、不重复 `emit failed`；`shutdown()` 主动断开不报错；首次启动时传输就起不来（`m_everReady == false` 的 `stopped` 分支）不 `emit failed`，而首次握手失败仍会 `emit failed`（但不会自动重试）。`bridge.restart` 用 `shutdown()` + `prepareRestart()` 组合：重启后的启动失败仍会退避重试，不会因 shutdown 标志卡死；重连定时器在 `m_ready` 时直接返回，避免陈旧定时器误断健康连接。
+
+- [ ] **Step 4: StdioTransport 支持重启**
+
+`StdioTransport::start()` 开头追加一行，避免崩溃前的半行残留在重连后拼进新响应：
+
+```cpp
+void StdioTransport::start()
+{
+    m_buffer.clear(); // 重连时丢弃上次连接的残留半行
+    m_process.setProcessChannelMode(QProcess::SeparateChannels);
+    if (!m_command.env.isEmpty())
+        m_process.setProcessEnvironment(m_command.env);
+    m_process.start(m_command.program, m_command.args);
+}
+```
+
+- [ ] **Step 5: mock server 故障注入**
+
+`tests/mock/mock_mcp_server.cpp` 在 `if (method == QStringLiteral("initialize")) {` 之前插入一个分支（并把原 `if` 改为 `else if`）：
+
+```cpp
+        if (method == QStringLiteral("ping")) {
+            if (qEnvironmentVariableIsSet("MOCK_IGNORE_PING"))
+                continue; // 故障注入：收到 ping 却不回复，模拟桥接卡死
+            response.insert(QStringLiteral("result"), QJsonObject{});
+        } else if (method == QStringLiteral("initialize")) {
+```
+
+- [ ] **Step 6: CMake 注册并跑测试**
+
+在文件末尾追加：
+
+```cmake
+add_executable(tst_reconnect tests/tst_reconnect.cpp)
+target_link_libraries(tst_reconnect PRIVATE synthforge_core Qt6::Test)
+target_compile_definitions(tst_reconnect PRIVATE
+    MOCK_SERVER_PATH="$<TARGET_FILE:mock_mcp_server>")
+add_dependencies(tst_reconnect mock_mcp_server)
+add_test(NAME tst_reconnect COMMAND tst_reconnect)
+```
+
+Run: `cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH=<QT_KIT>`
+Run: `cmake --build build --config Debug`
+Run: `ctest --test-dir build -C Debug -R tst_reconnect --output-on-failure`
+Expected: 2 个用例 Passed（崩溃后 1s 重启并重新握手、卡死后 5s 内由心跳判定断线）。
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add CMakeLists.txt src/core/mcp/McpClient.h src/core/mcp/McpClient.cpp src/core/mcp/StdioTransport.cpp tests/mock/mock_mcp_server.cpp tests/tst_reconnect.cpp
+git commit -m "feat: MCP 心跳检测与桥接崩溃自动重连（指数退避 + reconnect 信号）"
+```
+
+---
+
 ## P1 完成标准（Definition of Done）
 
-- [ ] `ctest --test-dir build -C Debug` 全绿：`tst_smoke`、`tst_jsonrpc`、`tst_mcpclient`、`tst_stdio_transport`、`tst_bridge_commands`
+- [ ] `ctest --test-dir build -C Debug` 全绿：`tst_smoke`、`tst_jsonrpc`、`tst_mcpclient`、`tst_stdio_transport`、`tst_bridge_commands`、`tst_reconnect`
+- [ ] 心跳超时与桥接崩溃均能自动重连并恢复工具调用（`tst_reconnect` 2 用例）
 - [ ] 真实 Blender 链路：`--connect blender --list-tools` 返回工具清单（约 9 个）
 - [ ] 真实 Unity 链路：`--connect unity --list-tools` 返回工具清单（约 48 个）
 - [ ] 真实工具调用：`--call get_scene_info` 返回场景 JSON

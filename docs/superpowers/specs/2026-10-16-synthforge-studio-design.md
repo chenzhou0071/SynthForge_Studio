@@ -107,6 +107,7 @@ SynthForge Studio 是一款本地桌面 AI 游戏开发工作站：同一软件�
 ### 4.6 对话区
 
 - 永远位于最右侧；blender 会话与 unity 会话**互相独立**（历史、上下文、可用工具各不相同），各自持久化。
+- **会话上下文**：每次发起新任务时自动携带本区最近 20 条历史消息（纯文本，不含截图 base64；超预算从最旧截断）组装 LLM 上下文；两区历史互不可见。
 - 顶部显示当前区名；blender 区额外显示当前建模模式（低模 / 云 API）与云 API 配置徽标（未配置 / 已配置）。
 - 消息形态：普通文字、工具调用步骤卡（可折叠）、截图图片、资产产出卡（[查看] 按钮 → 预览区加载）、**专业提示词草稿卡**（可编辑，见 5.2）、**建造计划卡**（分组 / 清单 / 验收标准，见 5.3）。
 - 对话区头部右侧提供"清空本区对话"按钮（二次确认）。
@@ -204,7 +205,7 @@ agent 开始执行
 
 ### 6.1 工程接入与激活互斥
 
-- 顶部"导入"按钮 → 选文件夹 → 校验 `Assets/` + `ProjectSettings/` → 激活。
+- 顶部"导入"按钮 → C++ 唤起系统文件夹选择框（`dialog.pickFolder`）→ 校验 `Assets/` + `ProjectSettings/` → 激活。
 - **全局唯一激活工程**由 C++ 内核以单例状态机维护：`未激活 → 激活中 → 就绪 → 切换中`。
 - 切换工程流程（已有激活工程时再导入新工程）：
   1. 若旧工程有任务运行 → 确认框："当前工程有 N 个任务运行中，切换将终止这些任务"（无运行任务则直接切换 + 轻提示）。
@@ -352,12 +353,14 @@ Unity MCP 导入资产 → 按用户要求实例化（坐标 / 命名 / 挂载�
 {"event":"chat.delta","data":{"taskId":"t_041","text":"正在规划场景结构…"}}
 {"event":"plan.created","data":{"taskId":"t_041","groups":[{"title":"底座与环境","items":["底座","排水沟与井盖","街角护栏"],"acceptance":"俯视截图：底座完整、街角 L 形转折清晰"}],"totalSteps":42}}
 {"event":"tool.step","data":{"taskId":"t_041","stepId":"s3","tool":"execute_blender_code","status":"running","summary":"创建便利店墙体"}}
-{"event":"fileTree.changed","data":{"root":"vault","paths":["道具/sign_board_01/sign_board_01.glb"]}}
-{"event":"conn.status","data":{"target":"blender","state":"ready","detail":"42 个工具可用"}}
+{"event":"fileTree.changed","data":{"area":"blender","reason":"incremental","paths":["道具/sign_board_01"]}}
+{"event":"conn.status","data":{"blender":"ready","unity":"off","hints":{"blender":"已就绪 · 42 个工具"}}}
+{"event":"log.append","data":{"level":"warning","category":"mcp","message":"bridge stderr: ...","time":"21:03:11"}}
 ```
 
-- 方法族固定（参数在实现阶段细化）：`chat.send / chat.cancel / chat.clear / draft.send / draft.cancel / plan.confirm / plan.cancel / folderPick.submit / folderPick.cancel / asset.import / project.select / project.switchConfirm / tree.refresh / settings.get / settings.save / env.check / bridge.restart`。
-- 事件族固定：`chat.delta / chat.message / tool.step / task.progress / asset.created / draft.created / plan.created / folderPick.open / fileTree.changed / conn.status / project.state / log.append / error.card`。
+- 方法族固定（参数在实现阶段细化）：`chat.send / chat.cancel / chat.clear / chat.retry / draft.send / draft.cancel / plan.confirm / plan.cancel / folderPick.submit / folderPick.mkdir / folderPick.cancel / fs.operate / file.read / assets.list / asset.import / project.select / project.switchConfirm / tree.refresh / session.load / settings.get / settings.save / env.check / bridge.restart / dialog.pickFolder`。
+- 事件族固定：`chat.delta / chat.message / chat.image / tool.step / task.progress / asset.created / draft.created / plan.created / folderPick.open / fileTree.changed / conn.status / project.state / log.append / env.status / error.card / dialog.result`。
+- v1 唯一的一对扩展：`dialog.pickFolder` / `dialog.result`。WebEngine 无法读取目录绝对路径，因此由 C++ 唤起系统文件夹选择框并回传路径；前端传自生成的 `requestId`，C++ 以 `dialog.result` 回传（取消也回传，不报错卡）。除此之外方法/事件族不再扩。
 - 核心支持 `--headless` 模式（打印 WS 地址 + token），前端可在浏览器独立开发调试。
 
 ### 8.4 LLM 网关与 Agent 编排
@@ -366,6 +369,8 @@ Unity MCP 导入资产 → 按用户要求实例化（坐标 / 命名 / 挂载�
 - 工具清单**按区裁剪**：blender 区只带 Blender MCP + 文件工具；unity 区只带 Unity MCP + 文件工具，防工具过多选错。
 - 总结 agent = 独立配置的模型（未单独配置时回退主 agent 配置）+ 独立 system prompt（模板内嵌附录参考提示词的结构骨架）。
 - 主 agent 循环：LLM 决定工具 → C++ 执行 MCP 调用 → 结果 / 截图回喂 → 直到完成或失败；每步发 `tool.step` 事件给前端。
+- **上下文组装**：`system + 本区最近 20 条历史消息（纯文本）+ 本次任务指令`；截图 base64 不回放历史；历史超预算从最旧截断。
+- **截图回传**：工具结果中的图片压缩后双路使用——base64 回喂模型；同时发 `chat.image {area, taskId, dataUrl, caption}` 事件，前端在对话区渲染截图卡片。
 - 低模执行前置一个**规划阶段**（见 5.3）：一次纯文本调用产出分组计划 → 前端计划卡确认 → 执行器按组「建造 → 自检」推进，组间自动注入验收指令；步数预算按计划动态计算。规划失败降级默认分组，不阻塞。
 - 规划与执行共用主 agent 模型配置；Unity 区 v1 不启用规划阶段（架构预留开关）。
 

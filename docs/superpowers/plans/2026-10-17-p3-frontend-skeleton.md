@@ -228,7 +228,7 @@ Expected: 3 用例 Passed。
 
 **Interfaces:**
 - `ActivityBar`：props `active: 'blender'|'unity'`；emits `select(area)`、`openSettings()`。
-- `TopBar`：props `area`、`blender: LampState`、`unity: LampState`（`'off'|'ready'|'reconnecting'`）、`hints: {blender?: string; unity?: string}`；emits `importProject()`。
+- `TopBar`：props `area`、`blender: LampState`、`unity: LampState`（`'off'|'ready'|'reconnecting'`）、`hints: {blender?: string; unity?: string}`、`importing?: boolean`；emits `importProject()`。
 - `ChatPanel`：props `area`、`client: WsClient`；内部订阅 `chat.delta/chat.message/error.card`。
 
 - [ ] **Step 1: 实现布局（按 4.1 规格图；结构代码精简但可运行）**
@@ -280,13 +280,14 @@ onMounted(async () => {
 
 ```vue
 <script setup lang="ts">
-defineProps<{ area: string; blender: string; unity: string }>();
+defineProps<{ area: string; blender: string; unity: string; importing?: boolean }>();
+const emit = defineEmits<{ (e: "importProject"): void }>();
 const color = (s: string) => (s === "ready" ? "#4ec9b0" : s === "reconnecting" ? "#cca700" : "#555");
 </script>
 <template>
   <header class="topbar">
     <span v-if="area === 'blender'" class="fixed-path">模型库：文档/SynthForgeStudio/ModelLibrary（固定）</span>
-    <button v-else class="import">导入 Unity 工程</button>
+    <button v-else class="import" :disabled="importing" @click="emit('importProject')">导入 Unity 工程</button>
     <span class="spacer" />
     <span class="lamp" title="Blender 链路"><i :style="{ background: color(blender) }" />Blender</span>
     <span class="lamp" title="Unity 链路"><i :style="{ background: color(unity) }" />Unity</span>
@@ -331,7 +332,8 @@ const settings = ref<any>(null);
 const preview = ref(false);
 
 watch(() => props.open, async (v) => {
-  if (v && !settings.value) settings.value = await props.client.request("settings.get");
+  // 每次打开都重拉：后端会写入 unity.lastProject 等新字段，用缓存回存会丢数据
+  if (v) settings.value = await props.client.request("settings.get");
 });
 
 async function save() {
@@ -356,7 +358,7 @@ function masked(key: string) { return key ? "****" : "(未设置)"; }
 **Interfaces:**
 - `AppSchemeHandler : QWebEngineUrlSchemeHandler` — 将 `app://ui/<path>` 映射到 qrc `:/web/<path>`；`/` → `index.html`；按扩展名回 MIME（html/js/css/svg/png）。
 - `MainWindow(QUrl uiUrl)` — 内嵌 QWebEngineView 加载 `uiUrl`，窗口标题 `SynthForge Studio`，初始 1440x900。
-- `main.cpp`：`--dev-url <http://localhost:5173>` 优先；否则 `app://ui/index.html`；`QWebEngineUrlScheme` 注册必须在 `QApplication` 构造前。
+- `main.cpp`：`--dev-url <http://localhost:5173>` 优先；否则 `app://ui/index.html`；`QWebEngineUrlScheme` 注册必须在 `QApplication` 构造前；创建 `CoreApp({defaultDataDir(), false})` 并 `start()`，再把 `?ws=ws://127.0.0.1:<port>/?token=<token>` 追加到 `uiUrl`（前端 `?ws=` 的唯一来源；此前缺此接线，prod 下拿不到地址）。
 
 - [ ] **Step 1: 实现**
 
@@ -404,16 +406,27 @@ int main(int argc, char* argv[])
 
     const QStringList args = QCoreApplication::arguments();
     const int devIdx = args.indexOf("--dev-url");
-    const QUrl uiUrl = devIdx >= 0 && devIdx + 1 < args.size()
-                           ? QUrl(args.at(devIdx + 1))
-                           : QUrl("app://ui/index.html");
+    QUrl uiUrl = devIdx >= 0 && devIdx + 1 < args.size()
+                     ? QUrl(args.at(devIdx + 1))
+                     : QUrl("app://ui/index.html");
+
+    CoreApp core({defaultDataDir(), false});      // GUI 入口同样启动内核
+    if (!core.start())
+        return 1;
+    QUrlQuery query;
+    query.addQueryItem("ws", QStringLiteral("ws://127.0.0.1:%1/?token=%2")
+                                 .arg(core.ws()->port())
+                                 .arg(core.ws()->token()));
+    uiUrl.setQuery(query);                        // 前端从 ?ws= 读取完整地址
 
     auto* handler = new AppSchemeHandler(&app);
-    MainWindow window(uiUrl);
+    MainWindow window(uiUrl);                     // core 先声明：退出时窗口先销毀
     window.show();
     return app.exec();
 }
 ```
+
+> 需要 `#include "core/coreapp/CoreApp.h"`、`"core/settings/SettingsStore.h"`、`"core/ws/WsServer.h"`（`CoreApp.h` 仅前向声明 `WsServer`）与 `<QUrlQuery>`。
 
 `MainWindow` 构造中：`profile->installUrlSchemeHandler("app", handler)`（QWebEngineProfile::defaultProfile()），`m_view->setUrl(uiUrl)`。
 
@@ -449,15 +462,364 @@ Expected: `synthforge_app.exe` 启动后窗口内可见前端布局（dev-url �
 - [ ] **Step 2: prod 模式**
 
 Run: `build\Debug\synthforge_app.exe`
-Expected: 窗口加载 `app://ui/index.html`，布局与 dev 一致（无网络资源 404）。
+Expected: 窗口加载 `app://ui/index.html`，布局与 dev 一致；设置保存后重启仍能回读（`?ws=` 注入生效），未配置 Agent 时聊天返回错误卡。
 
 - [ ] **Step 3: Commit**（仅当有配置修正时；纯验证不提交）
+
+---
+
+### Task 6: 对话区补全 + 文件树右键菜单 + 预览渲染
+
+**Files:**
+- Modify: `web/src/components/ChatPanel.vue`（历史加载 / 清空 / chat.image / 模式切换 / 云徽标）
+- Modify: `web/src/components/FileTree.vue`（右键菜单五項）
+- Modify: `web/src/components/PreviewPane.vue`（文本高亮 / 图片 / 信息卡）
+- Modify: `web/src/App.vue`（PreviewPane 两区都显示；FileTree 传入 client）
+- Modify: `web/package.json`（新增 `highlight.js`）
+
+**Interfaces:**
+- `ChatPanel`：props `area`、`client`；内部 `mode: 'lowpoly' | 'cloud3d'`（blender 区专属，默认 lowpoly）；`chat.send` 参数追加 `mode`；挂载与切区时 `session.load` 回填；`chat.image {area, taskId, dataUrl, caption}` 渲染为截图卡；「清空」→ `chat.clear`（二次确认）；任务进行中显示「停止」→ `chat.cancel {area}`（结束时不删除消息）；`task.progress` / `asset.created` 维护 `busy`（按区保存，开始显停止、落盘/成功隐藏）。
+- `FileTree`：props `area`、`client`；右键菜单五项 → `fs.operate {area, op, path, name?}`，`op ∈ mkdir|rename|delete|reveal|refresh`（C++ handler 在 P4，Unity 区复用 P6）。
+- `PreviewPane`：props `area`、`file: {path, kind: 'text'|'image'|'info', content?, dataUrl?, language?} | null`；`null` 时显示概览/信息卡。three.js 模型预览在 P4 接管 `kind === 'model'`。
+- 规格映射：4.4 右键菜单、4.5 预览区、4.6 对话区、5.1 模式切换。
+
+- [ ] **Step 1: 安装 highlight.js**
+
+Run: `cd web; npm i highlight.js`
+
+- [ ] **Step 2: 重写 ChatPanel.vue**
+
+```vue
+<script setup lang="ts">
+import { computed, onMounted, ref, watch } from "vue";
+import type { WsClient } from "../ws/WsClient";
+
+interface ChatItem {
+  role: "user" | "assistant" | "error" | "image";
+  content?: string;
+  dataUrl?: string;
+  caption?: string;
+  streaming?: boolean;
+}
+
+const props = defineProps<{ area: "blender" | "unity"; client: WsClient }>();
+
+const messages = ref<ChatItem[]>([]);
+const input = ref("");
+const mode = ref<"lowpoly" | "cloud3d">("lowpoly");
+const cloudConfigured = ref(false);
+let streaming: ChatItem | null = null; // 当前流式气泡（非响应式引用）
+// 任务进行中状态按区保存：ChatPanel 为单实例常驻，切区时不能把 A 区的停止按钮带到 B 区
+const busyByArea = ref<Record<string, boolean>>({});
+const busy = computed({
+  get: () => busyByArea.value[props.area] ?? false,
+  set: (v: boolean) => { busyByArea.value = { ...busyByArea.value, [props.area]: v }; },
+});
+
+async function refreshCloudBadge() {
+  if (props.area !== "blender") return;
+  const s: any = await props.client.request("settings.get");
+  const c3 = s?.cloud3d ?? {};
+  const provider = c3.provider ?? "tripo";
+  const conf = c3[provider] ?? {};
+  const ready =
+    (provider === "tripo" && !!conf.apiKey) ||
+    (provider === "hunyuan" && !!conf.secretId && !!conf.secretKey) ||
+    (provider === "custom" && !!conf.baseUrl && !!conf.apiToken);
+  cloudConfigured.value = ready;
+}
+
+async function loadHistory() {
+  messages.value = [];
+  streaming = null;
+  const history: any = await props.client.request("session.load", { area: props.area });
+  messages.value = (history as any[]).map((m) => ({ role: m.role, content: m.content }));
+  await refreshCloudBadge();
+}
+
+async function send() {
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  const res: any = await props.client.request("chat.send", {
+    area: props.area,
+    mode: props.area === "blender" ? mode.value : undefined,
+    text,
+  });
+  busy.value = res?.accepted !== false; // 被前置检查拒绝时不进入“进行中”
+}
+
+async function cancelTask() {
+  await props.client.request("chat.cancel", { area: props.area });
+  busy.value = false;
+}
+
+async function clearChat() {
+  if (!window.confirm("清空本区对话？此操作不可撤销")) return;
+  await props.client.request("chat.clear", { area: props.area });
+  messages.value = [];
+  streaming = null;
+  busy.value = false; // chat.clear 会取消本区任务
+}
+
+watch(() => props.area, loadHistory);
+
+onMounted(() => {
+  loadHistory();
+  // ChatPanel 为常驻实例（不卸载），订阅无需 off
+  props.client.on("chat.message", (d: any) => {
+    if (d.area !== props.area) return;
+    if (d.role === "assistant") busy.value = false;
+    if (streaming && d.role === "assistant") {
+      streaming.content = d.content; // 流结束：用完整文本覆盖，避免重复气泡
+      streaming.streaming = false;
+      streaming = null;
+      return;
+    }
+    messages.value.push({ role: d.role, content: d.content });
+  });
+  props.client.on("chat.delta", (d: any) => {
+    if (d.area !== props.area) return;
+    if (!streaming) {
+      const bubble: ChatItem = { role: "assistant", content: "", streaming: true };
+      messages.value.push(bubble);
+      streaming = bubble;
+    }
+    streaming.content += d.text;
+  });
+  props.client.on("chat.image", (d: any) => {
+    if (d.area !== props.area) return;
+    messages.value.push({ role: "image", dataUrl: d.dataUrl, caption: d.caption });
+  });
+  props.client.on("task.progress", (d: any) => {
+    if (d.area !== props.area) return;
+    // 低模分组进度无 state；云任务 progress 带 state（P4/P5）
+    busy.value = d.state !== "success" && d.state !== "failed";
+  });
+  props.client.on("asset.created", (d: any) => {
+    if (d.area === props.area) busy.value = false; // 落盘即任务结束
+  });
+  props.client.on("error.card", (d: any) => {
+    if (d.area !== props.area) return;
+    busy.value = false;
+    messages.value.push({ role: "error", content: d.reason });
+  });
+});
+</script>
+
+<template>
+  <section class="chat">
+    <header class="chat-head">
+      <span class="area-name">{{ area === "blender" ? "Blender 建模区" : "Unity 游戏区" }}</span>
+      <template v-if="area === 'blender'">
+        <div class="mode-switch">
+          <button :class="{ active: mode === 'lowpoly' }" @click="mode = 'lowpoly'">低模</button>
+          <button :class="{ active: mode === 'cloud3d' }" @click="mode = 'cloud3d'">云API</button>
+        </div>
+        <span class="badge" :class="cloudConfigured ? 'ok' : 'warn'">
+          {{ cloudConfigured ? "云API 已配置" : "云API 未配置" }}
+        </span>
+      </template>
+      <span class="spacer" />
+      <button class="clear" title="清空本区对话" @click="clearChat">清空</button>
+    </header>
+
+    <div class="messages">
+      <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
+        <img v-if="m.role === 'image'" :src="m.dataUrl" class="shot" :alt="m.caption" />
+        <p v-else-if="m.role === 'error'" class="error-card">{{ m.content }}</p>
+        <p v-else class="text">{{ m.content }}</p>
+        <span v-if="m.role === 'image' && m.caption" class="caption">{{ m.caption }}</span>
+      </div>
+    </div>
+
+    <footer class="composer">
+      <textarea v-model="input" rows="2" placeholder="描述你的需求…"
+                @keydown.enter.exact.prevent="send" />
+      <button v-if="busy" class="stop" @click="cancelTask">停止</button>
+      <button @click="send">发送</button>
+    </footer>
+  </section>
+</template>
+
+<style scoped>
+.chat { width: 380px; display: flex; flex-direction: column; background: var(--panel); }
+.chat-head { display: flex; align-items: center; gap: 8px; padding: 6px 8px; }
+.mode-switch button.active { background: var(--accent); color: #fff; }
+.badge.ok { color: #4ec9b0; }
+.badge.warn { color: #cca700; }
+.messages { flex: 1; overflow-y: auto; padding: 8px; }
+.msg.user { text-align: right; }
+.msg.user .text { display: inline-block; background: var(--accent); color: #fff; padding: 4px 8px; border-radius: 6px; }
+.shot { max-width: 100%; border: 1px solid #3c3c3c; }
+.error-card { color: #f48771; border: 1px solid #f48771; padding: 6px; border-radius: 4px; }
+.composer { display: flex; gap: 6px; padding: 8px; }
+.composer textarea { flex: 1; resize: none; }
+</style>
+```
+
+- [ ] **Step 3: FileTree.vue 加右键菜单**
+
+在 P3 骨架基础上追加（树节点渲染仍为占位，P4/P6 填数据源；每个节点 `@contextmenu.prevent="openMenu($event, node.path)"`）：
+
+```vue
+<script setup lang="ts">
+import { ref } from "vue";
+import type { WsClient } from "../ws/WsClient";
+
+const props = defineProps<{ area: "blender" | "unity"; client: WsClient }>();
+const menu = ref<{ x: number; y: number; path: string } | null>(null);
+
+function openMenu(e: MouseEvent, path: string) {
+  menu.value = { x: e.clientX, y: e.clientY, path };
+}
+function closeMenu() {
+  menu.value = null;
+}
+
+async function runOp(op: "mkdir" | "rename" | "delete" | "reveal" | "refresh") {
+  const target = menu.value!;
+  let name: string | undefined;
+  if (op === "mkdir" || op === "rename") {
+    const input = window.prompt(op === "mkdir" ? "新建文件夹名称" : "重命名为", "");
+    if (!input) return closeMenu();
+    name = input;
+  }
+  if (op === "delete" && !window.confirm(`确定删除 ${target.path} ?`))
+    return closeMenu();
+  await props.client.request("fs.operate", {
+    area: props.area, op, path: target.path, name,
+  });
+  closeMenu();
+}
+</script>
+
+<template>
+  <aside class="filetree" @click="closeMenu">
+    <div class="tree-body"><!-- P4/P6 填树节点，节点绑 openMenu($event, node.path) --></div>
+    <ul v-if="menu" class="ctx-menu" :style="{ left: menu.x + 'px', top: menu.y + 'px' }">
+      <li @click.stop="runOp('mkdir')">新建文件夹</li>
+      <li @click.stop="runOp('rename')">重命名</li>
+      <li @click.stop="runOp('delete')">删除</li>
+      <li @click.stop="runOp('reveal')">在资源管理器中显示</li>
+      <li @click.stop="runOp('refresh')">刷新</li>
+    </ul>
+  </aside>
+</template>
+```
+
+- [ ] **Step 4: PreviewPane.vue 三类渲染**
+
+```vue
+<script setup lang="ts">
+import hljs from "highlight.js/lib/core";
+import csharp from "highlight.js/lib/languages/csharp";
+import json from "highlight.js/lib/languages/json";
+import typescript from "highlight.js/lib/languages/typescript";
+import lua from "highlight.js/lib/languages/lua";
+import "highlight.js/styles/vs2015.css";
+
+hljs.registerLanguage("csharp", csharp);
+hljs.registerLanguage("json", json);
+hljs.registerLanguage("typescript", typescript);
+hljs.registerLanguage("lua", lua);
+
+defineProps<{
+  area: "blender" | "unity";
+  file: {
+    path: string;
+    kind: "text" | "image" | "info";
+    content?: string;
+    dataUrl?: string;
+    language?: string;
+  } | null;
+}>();
+
+function highlighted(content: string, language?: string) {
+  const lang = language && hljs.getLanguage(language) ? language : "typescript";
+  return hljs.highlight(content, { language: lang }).value;
+}
+</script>
+
+<template>
+  <section class="preview">
+    <template v-if="file">
+      <img v-if="file.kind === 'image'" :src="file.dataUrl" class="preview-image" :alt="file.path" />
+      <pre v-else-if="file.kind === 'text'" class="code"><code v-html="highlighted(file.content ?? '', file.language)" /></pre>
+      <div v-else class="info-card">
+        <h3>{{ file.path }}</h3>
+        <p>暂无可用预览</p>
+      </div>
+    </template>
+    <div v-else class="info-card">
+      <h3>{{ area === "blender" ? "资产库概览" : "工程信息" }}</h3>
+      <p>{{ area === "blender" ? "选中资产后在此预览" : "选中文件后在此预览" }}</p>
+    </div>
+  </section>
+</template>
+
+<style scoped>
+.preview { flex: 1; min-width: 0; display: flex; align-items: stretch; justify-content: stretch; background: #1e1e1e; }
+.preview-image { max-width: 100%; max-height: 100%; margin: auto; object-fit: contain; }
+.code { flex: 1; overflow: auto; margin: 0; padding: 12px; }
+.info-card { margin: auto; text-align: center; color: #999; }
+</style>
+```
+
+- [ ] **Step 5: App.vue 修正两区预览与 FileTree 接线**
+
+```vue
+      <div class="content">
+        <FileTree :area="active" :client="client" />
+        <PreviewPane :area="active" :file="previewFile" />
+        <ChatPanel :area="active" :client="client" />
+      </div>
+```
+
+`script` 中追加（`previewFile` 由 P4 的 asset.created / file.read 填充）：
+
+```ts
+import { ref } from "vue";
+const previewFile = ref<null | {
+  path: string;
+  kind: "text" | "image" | "info";
+  content?: string;
+  dataUrl?: string;
+  language?: string;
+}>(null);
+```
+
+> 原 Task 2 的 `<PreviewPane v-if="active === 'blender'" />` 必须删掉 `v-if`：规格 4.5 两区都有预览区。
+
+- [ ] **Step 6: 构建验证**
+
+Run: `cd web; npm run build`
+Expected: 无 TS 错误；`web/dist` 更新。
+
+- [ ] **Step 7: 手工验证（dev 模式）**
+
+1. 两个区来回切换：对话历史自动加载且互不串区（先在两区各发一句后重启 `--headless` 再刷新页面）。
+2. 「清空」弹二次确认，确认后本区清空、另一区不变。
+3. blender 区切换低模/云API：模式按钮高亮；未配置云API 时徽标为黄色「未配置」，在设置中填入 tripo apiKey 后重新切换区刷新为绿色「已配置」。
+4. 文件树右键弹出五項菜单；重命名/删除均弹输入或确认框（fs.operate 在 P4 接入前预期返回错误帧，不崩溃即可）。
+5. 手动构造预览数据（DevTools 中调用组件方法或临时默认值）验证 C# 高亮、图片、信息卡三类渲染。
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add web/package.json web/package-lock.json web/src/App.vue web/src/components/ChatPanel.vue web/src/components/FileTree.vue web/src/components/PreviewPane.vue
+git commit -m "feat: 对话区历史/清空/截图卡/模式切换，文件树右键菜单与三类预览渲染"
+```
 
 ---
 
 ## P3 完成标准
 
 - [ ] `npm test` 3 用例通过；`npm run build` 无 TS 错误
-- [ ] `synthforge_app.exe` 直接启动可见完整布局（prod 模式）
+- [ ] `synthforge_app.exe` 直接启动可见完整布局，且内置 WS 已连通（`?ws=` 注入生效：设置保存回读、未配置 Agent 时聊天返回错误卡）
 - [ ] dev 模式下浏览器可完成：设置保存回读、聊天 send → error.card（未配置）/ 文本流（已配置）
 - [ ] 活动栏切换 blender/unity 时，顶部栏导入按钮/固定路径正确切换
+- [ ] 切换区自动加载各自的 `session.load` 历史；「清空」二次确认后仅清本区
+- [ ] blender 区模式切换 `[低模|云API]` 与云配置徽标可见；`chat.send` 携带 `mode`
+- [ ] 文件树右键菜单五項（新建/重命名/删除/资源管理器/刷新）均可触发 `fs.operate`
+- [ ] 预览区支持代码高亮/图片/信息卡三类渲染，且 Unity 区也有预览区
