@@ -617,7 +617,7 @@ install(TARGETS synthforge_app RUNTIME DESTINATION .)
 
 ## 全阶段收尾（P1~P7 汇总验收）
 
-- [ ] `ctest --test-dir build -C Debug` 全部测试可执行全绿（P1 6 个 + P2 5 个 + P4 5 个 + P5 2 个 + P6 4 个 + P7 1 个 = 23 个）
+- [ ] `ctest --test-dir build -C Debug` 全部测试可执行全绿（P1 6 个 + P2 6 个 + P4 5 个 + P5 2 个 + P6 4 个 + P7 1 个 = 24 个）
 - [ ] 双模式建模真实跑通（低模 Blender MCP / 云 API 至少一家）
 - [ ] Unity 区互斥切换 + 文件双源同步 + 添加资产真实跑通
 - [ ] 打包产物在干净机器可启动、可用

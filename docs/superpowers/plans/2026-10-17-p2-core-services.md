@@ -31,12 +31,14 @@ src/core/ws/ProtocolRouter.h/.cpp        ← method → handler 注册表
 src/core/ws/WsServer.h/.cpp              ← QWebSocketServer + token + 帧编解码
 src/core/llm/SseParser.h/.cpp            ← SSE 增量解析
 src/core/llm/LlmGateway.h/.cpp           ← chat/completions 流式 + tool_calls 聚合
+src/core/llm/ToolBridge.h/.cpp           ← MCP tools ↔ OpenAI function calling 格式转换（纯函数）
 src/core/coreapp/CoreApp.h/.cpp          ← 组合根：打开存储、注册 handler、启动 WS
 src/cli/main.cpp                         ← 增加 --headless（P3 起改造成 GUI 入口）
 tests/tst_settings_store.cpp
 tests/tst_session_store.cpp
 tests/tst_task_manager.cpp
 tests/tst_sse_parser.cpp
+tests/tst_tool_bridge.cpp
 tests/tst_headless_ws.cpp
 ```
 
@@ -692,13 +694,18 @@ Expected: 编译通过。
 
 ### Task 5: SseParser + LlmGateway
 
-**Files:** Create `src/core/llm/SseParser.h/.cpp`、`src/core/llm/LlmGateway.h/.cpp`、`tests/tst_sse_parser.cpp`。
+**Files:** Create `src/core/llm/SseParser.h/.cpp`、`src/core/llm/LlmGateway.h/.cpp`、`src/core/llm/ToolBridge.h/.cpp`、`tests/tst_sse_parser.cpp`、`tests/tst_tool_bridge.cpp`。
 
 **Interfaces:**
 - `class SseParser { QList<Event> feed(const QByteArray& chunk); /* Event { QString event; QByteArray data; } */ }`
-- `class LlmGateway : QObject { struct StreamHandlers { std::function<void(QString delta)> onDelta; std::function<void(QJsonArray toolCalls)> onToolCalls; std::function<void(QString error)> onError; std::function<void()> onDone; }; void chatStream(LlmConfig, QJsonArray messages, QJsonArray tools, StreamHandlers); void abort(); }`
+- `class LlmGateway : QObject { struct StreamHandlers { std::function<void(QString delta)> onDelta; std::function<void(QJsonArray toolCalls)> onToolCalls; std::function<void(QString error)> onError; std::function<void()> onDone; }; virtual void chatStream(LlmConfig, QJsonArray messages, QJsonArray tools, StreamHandlers); void abort(); }`
+  - `chatStream` 声明为 `virtual`，仅供 P4 的 `MockLlmServer` 继承重写（按脚本喂真实 SSE 分片）；生产路径只有这一个实现。
 - `struct LlmConfig { QString baseUrl; QString apiKey; QString model; }`
-- tool_calls 聚合结果元素：`{"id":string, "name":string, "arguments":object}`（arguments 为已解析 JSON 对象）。
+- `namespace ToolBridge`（纯函数，无 Qt 网络/状态依赖）：
+  - `QJsonArray mcpToolsToOpenAi(const QJsonArray& mcpTools)`：MCP `{name, description, inputSchema}` → OpenAI `{type:"function", function:{name, description, parameters}}`；`inputSchema` 改名为 `parameters`，缺省时用 `{"type":"object","properties":{}}`。
+  - `QJsonArray internalCallsToWire(const QJsonArray& calls)`：内部 `{id, name, arguments(object)}` → assistant 消息要求的 `{id, type:"function", function:{name, arguments:"<JSON 字符串>"}}`。
+- tool_calls 聚合结果元素（**内部格式，不是 wire format**）：`{"id":string, "name":string, "arguments":object}`（arguments 为已解析 JSON 对象）。
+- `chatStream` 的 `tools` 参数**必须是 OpenAI tools 格式**：调用方先经 `ToolBridge::mcpToolsToOpenAi` 转换，网关不感知 MCP schema。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -733,6 +740,65 @@ QTEST_MAIN(SseParserTest)
 #include "tst_sse_parser.moc"
 ```
 
+- [ ] **Step 1B: 写 ToolBridge 失败测试**
+
+```cpp
+#include <QtTest>
+#include "core/llm/ToolBridge.h"
+
+class ToolBridgeTest : public QObject
+{
+    Q_OBJECT
+private slots:
+    void mcpToolsBecomeOpenAiFunctions()
+    {
+        const QJsonArray mcp{
+            QJsonObject{
+                {"name", "execute_blender_code"},
+                {"description", "执行 Blender Python 代码"},
+                {"inputSchema", QJsonObject{
+                    {"type", "object"},
+                    {"properties", QJsonObject{
+                        {"code", QJsonObject{{"type", "string"}}}
+                    }}
+                }}
+            }
+        };
+
+        const QJsonArray tools = ToolBridge::mcpToolsToOpenAi(mcp);
+
+        QCOMPARE(tools.size(), 1);
+        const QJsonObject tool = tools.first().toObject();
+        QCOMPARE(tool.value("type").toString(), QStringLiteral("function"));
+        const QJsonObject fn = tool.value("function").toObject();
+        QCOMPARE(fn.value("name").toString(), QStringLiteral("execute_blender_code"));
+        QVERIFY(fn.contains("parameters"));      // inputSchema → parameters
+        QVERIFY(!fn.contains("inputSchema"));
+    }
+
+    void internalCallsBecomeWireFormat()
+    {
+        const QJsonArray internal{
+            QJsonObject{{"id", "call_1"},
+                        {"name", "execute_blender_code"},
+                        {"arguments", QJsonObject{{"code", "print(1)"}}}}};
+
+        const QJsonArray wire = ToolBridge::internalCallsToWire(internal);
+
+        QCOMPARE(wire.size(), 1);
+        const QJsonObject call = wire.first().toObject();
+        QCOMPARE(call.value("id").toString(), QStringLiteral("call_1"));
+        QCOMPARE(call.value("type").toString(), QStringLiteral("function"));
+        const QJsonObject fn = call.value("function").toObject();
+        QCOMPARE(fn.value("name").toString(), QStringLiteral("execute_blender_code"));
+        QCOMPARE(fn.value("arguments").toString(), QStringLiteral("{\"code\":\"print(1)\"}"));
+    }
+};
+
+QTEST_MAIN(ToolBridgeTest)
+#include "tst_tool_bridge.moc"
+```
+
 - [ ] **Step 2: 实现**
 
 `SseParser.cpp` 核心：
@@ -764,6 +830,64 @@ QList<SseParser::Event> SseParser::feed(const QByteArray& chunk)
 }
 ```
 
+`ToolBridge.h`：
+
+```cpp
+#pragma once
+
+#include <QJsonArray>
+
+namespace ToolBridge {
+QJsonArray mcpToolsToOpenAi(const QJsonArray& mcpTools);
+QJsonArray internalCallsToWire(const QJsonArray& calls);
+}
+```
+
+`ToolBridge.cpp`（纯函数，格式边界只在这里处理一次）：
+
+```cpp
+#include "core/llm/ToolBridge.h"
+
+#include <QJsonDocument>
+#include <QJsonObject>
+
+QJsonArray ToolBridge::mcpToolsToOpenAi(const QJsonArray& mcpTools)
+{
+    QJsonArray out;
+    for (const QJsonValue& value : mcpTools) {
+        const QJsonObject tool = value.toObject();
+        QJsonObject parameters = tool.value("inputSchema").toObject();
+        if (parameters.isEmpty())
+            parameters = QJsonObject{{"type", "object"}, {"properties", QJsonObject{}}};
+        out.append(QJsonObject{
+            {"type", "function"},
+            {"function", QJsonObject{{"name", tool.value("name")},
+                                     {"description", tool.value("description")},
+                                     {"parameters", parameters}}},
+        });
+    }
+    return out;
+}
+
+QJsonArray ToolBridge::internalCallsToWire(const QJsonArray& calls)
+{
+    QJsonArray out;
+    for (const QJsonValue& value : calls) {
+        const QJsonObject call = value.toObject();
+        const QJsonObject arguments = call.value("arguments").toObject();
+        out.append(QJsonObject{
+            {"id", call.value("id")},
+            {"type", "function"},
+            {"function", QJsonObject{
+                {"name", call.value("name")},
+                {"arguments", QString::fromUtf8(
+                    QJsonDocument(arguments).toJson(QJsonDocument::Compact))}}},
+        });
+    }
+    return out;
+}
+```
+
 `LlmGateway::chatStream` 核心（tool_calls 聚合）：
 
 ```cpp
@@ -772,7 +896,7 @@ void LlmGateway::chatStream(const LlmConfig& cfg, const QJsonArray& messages,
 {
     QJsonObject body{{"model", cfg.model}, {"messages", messages}, {"stream", true}};
     if (!tools.isEmpty())
-        body.insert("tools", tools);
+        body.insert("tools", tools);   // 已是 OpenAI tools；MCP → OpenAI 由调用方经 ToolBridge 转换
 
     QNetworkRequest req(QUrl(cfg.baseUrl + "/chat/completions"));
     req.setRawHeader("Authorization", "Bearer " + cfg.apiKey.toUtf8());
@@ -828,11 +952,26 @@ void LlmGateway::chatStream(const LlmConfig& cfg, const QJsonArray& messages,
 }
 ```
 
-> 实现注意：`QHash<int, QJsonObject>` 迭代顺序无保证，tool_calls 元素需带 `index` 字段供上游排序；上述代码在 `slot.insert("index", idx)` 时补充。`abort()` 即 `m_reply->abort()`。
+> 实现注意：`QHash<int, QJsonObject>` 迭代顺序无保证，tool_calls 元素需带 `index` 字段供上游排序；上述代码在 `slot.insert("index", idx)` 时补充。若服务端未返回 `id`，用 `call_<index>` 兜底，保证 assistant / tool 消息的 `tool_call_id` 可配对；`arguments` 解析失败按空对象处理，避免整轮任务失败。`abort()` 即 `m_reply->abort()`。
 
-- [ ] **Step 3: CMake + 测试**（`tst_sse_parser` target；预期 2 用例 Passed；LlmGateway 编译通过，网络行为在 P4 用 mock LLM 验证）
+- [ ] **Step 3: CMake + 测试**
 
-- [ ] **Step 4: Commit**（`feat: SSE 增量解析与 OpenAI 兼容流式网关（tool_calls 聚合）`）
+core 源文件追加 `src/core/llm/SseParser.cpp`、`src/core/llm/LlmGateway.cpp`、`src/core/llm/ToolBridge.cpp`；追加两个 target：
+
+```cmake
+add_executable(tst_sse_parser tests/tst_sse_parser.cpp)
+target_link_libraries(tst_sse_parser PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_sse_parser COMMAND tst_sse_parser)
+
+add_executable(tst_tool_bridge tests/tst_tool_bridge.cpp)
+target_link_libraries(tst_tool_bridge PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_tool_bridge COMMAND tst_tool_bridge)
+```
+
+Run: `ctest --test-dir build -C Debug -R "tst_sse_parser|tst_tool_bridge" --output-on-failure`
+Expected: `tst_sse_parser` 2 用例、`tst_tool_bridge` 2 用例，全部 Passed；LlmGateway 编译通过，网络行为在 P4 用 mock LLM 验证。
+
+- [ ] **Step 4: Commit**（`feat: SSE 解析、OpenAI 流式网关与 MCP→Function Calling 工具桥接`）
 
 ---
 

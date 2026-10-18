@@ -374,6 +374,7 @@ Unity MCP 导入资产 → 按用户要求实例化（坐标 / 命名 / 挂载�
 
 - OpenAI 兼容协议一套通吃：流式 SSE 解析（QNetworkAccessManager readyRead）、tool_calls 循环、截图 base64 压缩（转 JPEG + 降采样）后回传。
 - 工具清单**按区裁剪**：blender 区只带 Blender MCP + 文件工具；unity 区只带 Unity MCP + 文件工具，防工具过多选错。
+- **工具桥接**：MCP `tools/list` 的 `{name, description, inputSchema}` 由 `ToolBridge` 转成 OpenAI `{type:"function", function:{name, description, parameters}}` 后再交给 `LlmGateway`；模型返回的调用统一收敛为内部 `{id, name, arguments(object)}`，回灌 assistant 历史时再转回 wire format（`type:"function"`、`arguments` 为 JSON 字符串）。`LlmGateway` 只负责流式聚合，不做 schema 转换。
 - 总结 agent = 独立配置的模型（未单独配置时回退主 agent 配置）+ 独立 system prompt（模板内嵌附录参考提示词的结构骨架）。
 - 主 agent 循环：LLM 决定工具 → C++ 执行 MCP 调用 → 结果 / 截图回喂 → 直到完成或失败；每步发 `tool.step` 事件给前端。
 - **上下文组装**：`system + 本区最近 20 条历史消息（纯文本）+ 本次任务指令`；截图 base64 不回放历史；历史超预算从最旧截断。

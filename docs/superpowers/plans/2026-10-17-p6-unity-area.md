@@ -1041,7 +1041,7 @@ watch(() => props.area, () => { if (props.area === "unity") refreshTree(); });
 - Consumes: `McpRuntime`（P4 Task 0）、`AgentOrchestrator`（P4 Task 3）、`ProjectService`/`DirectoryWatcher`（本计划 Task 1/2）。
 - **P4 Task 0 补充（本任务前置）**：`McpRuntime` 必须暴露 `McpClient* client() const`（供 orchestrator 构造）与 `void stop()`（内部 `m_client->shutdown()`，不触发自动重连；供切工程断链）；若 P4 实现时未加，先补这两个成员。
 - **P4 Task 3 补充（本任务前置）**：`AgentOrchestrator` 增加 `void setConversationHistory(const QJsonArray& history)`；LLM 初始消息 = `system + 本区最近 20 条纯文本历史 + 本次任务指令`（规格 8.4）。CoreApp 在每次 `plan()/execute()` 前用 `m_sessions->recentMessages(area, 20)` 注入。
-- `m_unity` 构造与 P4 的 `m_blender` 同构（`defaultBridgeCommand("unity")` + `StdioTransport`）；`m_unityTools = filterUnityTools(m_unity->tools())` 为 Unity 区工具唯一来源。
+- `m_unity` 构造与 P4 的 `m_blender` 同构（`defaultBridgeCommand("unity")` + `StdioTransport`）；`m_unityTools = filterUnityTools(m_unity->tools())` 为 Unity 区工具唯一来源（保持 MCP 原始格式，用于白名单过滤与状态栏计数）；传给 `execute()` 前用 `ToolBridge::mcpToolsToOpenAi(m_unityTools)` 转成 OpenAI tools（`CoreApp.cpp` 已在 P4 `folderPick.submit` 引入该头文件）。
 - `m_unityOrch` 独立实例（不能与 blender 共用，否则两区并行任务会互相覆盖 `m_area/m_taskId`）；工具钩子只挂在 unity orchestrator 上。
 - unity `chat.send` 前置：`ProjectService.activePath()` 非空 + `m_unity->isReady()`；失败 `error.card {reason:"project-not-active"}` / `{reason:"unity-not-ready"}`（不消耗 LLM 调用）。
 - Unity 区不经草稿/计划两步（规格 8.4）：检查通过后直接构造单组计划 `BuildPlan{{"Unity 任务", {}, "read_console 无编译错误且 Game 截图正常"}}`，`maxSteps = 50`，`execute(..., targetFolder = m_projects->assetsPath(), area = "unity")`。
@@ -1237,8 +1237,9 @@ if (area == QLatin1String("unity")) {
                               m_unityOrch->setModelConfig(primaryAgentConfig());
                               m_unityOrch->setConversationHistory(
                                   m_sessions->recentMessages(area, 20));
-                              m_unityOrch->execute(tid, tm, m_unityTools, plan,
-                                                   text, assetsRoot, area);
+                              m_unityOrch->execute(tid, tm,
+                                                   ToolBridge::mcpToolsToOpenAi(m_unityTools),
+                                                   plan, text, assetsRoot, area);
                           }});
     return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
 }
@@ -1598,8 +1599,9 @@ m_tasks->enqueue(Task{taskId, area, project,
                                   m_unityOrch->setModelConfig(primaryAgentConfig());
                                   m_unityOrch->setConversationHistory(
                                       m_sessions->recentMessages(area, 20));
-                                  m_unityOrch->execute(tid, tm, m_unityTools, plan,
-                                                       withAttachmentBlock(text, fbxPaths),
+                                  m_unityOrch->execute(tid, tm,
+                                                       ToolBridge::mcpToolsToOpenAi(m_unityTools),
+                                                       plan, withAttachmentBlock(text, fbxPaths),
                                                        assetsRoot, area);
                               });
                       }});

@@ -665,7 +665,7 @@ struct BuildPlan { QVector<BuildGroup> groups; int maxSteps = 50; };
 
 - `class AgentOrchestrator : QObject`
   - `void plan(const QString& taskId, TaskManager* tm, const QString& prompt, const QString& area);`：一次**纯文本**调用（不传 tools），解析 JSON；失败重试 1 次，仍失败降级默认四分组。
-  - `void execute(const QString& taskId, TaskManager* tm, const QJsonArray& tools, const BuildPlan& plan, const QString& prompt, const QString& targetFolder, const QString& area);`：按组「建造 → 自检」状态机执行。
+    - `void execute(const QString& taskId, TaskManager* tm, const QJsonArray& tools, const BuildPlan& plan, const QString& prompt, const QString& targetFolder, const QString& area);`：按组「建造 → 自检」状态机执行。`tools` 必须是 **OpenAI tools 格式**，由 CoreApp 调用前用 `ToolBridge::mcpToolsToOpenAi(m_blenderTools)` 转换；编排层不感知 MCP `inputSchema`。
   - 信号：`planReady(area, taskId, QJsonObject plan)`、`groupProgress(area, int index, int count, QString title)`、`finalText(area, QString)`、`failed(area, QString)`、`toolStep(area, tool, status)`、`delta(area, text)`、`imageReceived(area, taskId, dataUrl, caption)`、`artifactsReady(area, QStringList absoluteGlbs)`（结束时扫描目标目录新 GLB，供 CoreApp 广播 `asset.created` / `fileTree.changed`）。
   - `void setBlenderGate(BlenderGate* gate)` — 仅注入给 blender orchestrator（unity orchestrator 不注入）。`execute()` 在 `area=="blender"` 时以 owner `"blender-agent"` 获取租约，持有到 `finishOk/finishCancelled/fail`；忙则直接 `failed("blender-busy")`，不碰 LLM / MCP。
   - `void setToolCallHook(std::function<void(const QString& name, bool running)> hook)` — P6 注入：工具调用前 running=true（进入抑制窗口），回调返回后 running=false（结束抑制）。
@@ -744,7 +744,7 @@ private:
     McpClient* m_mcp;
     TaskManager* m_tm = nullptr;
     LlmConfig m_cfg;
-    QJsonArray m_tools;
+    QJsonArray m_tools;                // OpenAI tools（CoreApp 经 ToolBridge 转换后传入）
     QJsonArray m_history;
     QJsonArray m_messages;
     BuildPlan m_plan;
@@ -902,6 +902,26 @@ void AgentOrchestrator::attemptPlan(int attempt)
 - [ ] **Step 3: 执行状态机测试（红）**
 
 ```cpp
+// 与 CoreApp 传入 execute 的格式一致：OpenAI tools，而不是 MCP 原始 tools
+static QJsonArray openAiTools()
+{
+    return QJsonArray{
+        QJsonObject{
+            {"type", "function"},
+            {"function", QJsonObject{
+                {"name", "execute_blender_code"},
+                {"description", "执行 Blender Python 代码"},
+                {"parameters", QJsonObject{
+                    {"type", "object"},
+                    {"properties", QJsonObject{
+                        {"code", QJsonObject{{"type", "string"}}}
+                    }}
+                }}
+            }}
+        }
+    };
+}
+
 void executorBuildThenSelfChecks()
 {
     MockLlmServer llm({toolCallChunk("execute_blender_code"),
@@ -915,7 +935,7 @@ void executorBuildThenSelfChecks()
     plan.maxSteps = 18;
     QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
 
-    orch.execute("t1", nullptr, {{/* execute_blender_code schema */}}, plan,
+    orch.execute("t1", nullptr, openAiTools(), plan,
                  "做一个雨夜便利店", "/tmp/out", "blender");
 
     QTRY_COMPARE(finalSpy.count(), 1);
@@ -938,7 +958,7 @@ void executorAdvancesGroups()
     QSignalSpy progress(&orch, &AgentOrchestrator::groupProgress);
     QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
 
-    orch.execute("t1", nullptr, {{/* schema */}}, plan, "p", "/tmp/out", "blender");
+    orch.execute("t1", nullptr, openAiTools(), plan, "p", "/tmp/out", "blender");
 
     QTRY_COMPARE(finalSpy.count(), 1);
     QCOMPARE(progress.count(), 2);                      // 两组各一次进度
@@ -979,14 +999,14 @@ void executorReleasesGateOnFinish()
     plan.maxSteps = 18;
     QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
 
-    orch.execute("t1", nullptr, {{/* schema */}}, plan, "p", "/tmp/out", "blender");
+    orch.execute("t1", nullptr, openAiTools(), plan, "p", "/tmp/out", "blender");
 
     QTRY_COMPARE(finalSpy.count(), 1);
     QVERIFY(!gate.isBusy());               // 成功出口必须释放
 }
 ```
 
-`MockLlmServer`（`tests/mock/mock_llm_server.h`）：构造收 SSE 响应脚本（按请求顺序逐轮返回）；`requestCount()` 与 `requestAt(i)` 返回该轮原始请求体（用于断言注入消息）。`toolCallChunk/textChunk` 为脚本包装小工具。
+`MockLlmServer`（`tests/mock/mock_llm_server.h`）：继承 `LlmGateway` 并重写 `chatStream`，按请求顺序逐轮把脚本转成 **真实 OpenAI SSE 分片**喂给与生产相同的聚合逻辑；`requestCount()` 与 `requestAt(i)` 返回该轮原始请求体（用于断言注入消息）。`toolCallChunk/textChunk` 为脚本包装小工具。`toolCallChunk(name, args = "{}")` 必须生成 **OpenAI 流式 wire format** 的 SSE 分片（`choices[0].delta.tool_calls[{index,id,function:{name,arguments}}]`，arguments 为 JSON 字符串），确保测试覆盖真实的 function calling 解析路径，而不是用内部结构左手对右手。
 
 - [ ] **Step 4: 执行状态机实现（绿）**
 
@@ -1186,21 +1206,21 @@ QStringList AgentOrchestrator::collectNewGlbs() const
 }
 ```
 
-`executeToolCalls`（含工具调用钩子与截图回传）：
+`executeToolCalls`（含工具调用钩子与截图回传；`AgentOrchestrator.cpp` 顶部 `#include "core/llm/ToolBridge.h"`）：
 
 ```cpp
 void AgentOrchestrator::executeToolCalls(const QJsonArray& calls)
 {
     m_awaitingTools = true;
     m_pendingToolCalls = calls.size();
+    // calls 是 LlmGateway 的内部格式 {id,name,arguments(object)}；回灌历史必须转回 OpenAI wire format
     m_messages.append(QJsonObject{{"role", "assistant"},
                                   {"content", m_stream},
-                                  {"tool_calls", calls}});
+                                  {"tool_calls", ToolBridge::internalCallsToWire(calls)}});
     for (const QJsonValue& value : calls) {
         const QJsonObject call = value.toObject();
-        const QString name = call.value("function").toObject().value("name").toString();
-        const QJsonObject args = QJsonDocument::fromJson(
-            call.value("function").toObject().value("arguments").toString().toUtf8()).object();
+        const QString name = call.value("name").toString();
+        const QJsonObject args = call.value("arguments").toObject();
         emit toolStep(m_area, name, "running");
         if (m_toolCallHook)
             m_toolCallHook(name, true); // P6：异步工具调用全程抑制 watcher
@@ -1439,7 +1459,7 @@ function cancel() {
 
 **Interfaces:**
 - 事件 `folderPick.open {area, requestId, rootName:"ModelLibrary", tree}`（tree 由 `AssetLibrary::folderTree()` 生成，`{name, path, children}`）。
-- 请求 `folderPick.submit {requestId, relativePath}` → 校验（必须已存在、必须在根内）→ 调用 `orchestrator.execute(taskId, tm, tools, plan, prompt, targetFolder, area)`（plan/prompt 来自 `plan.confirm` 时缓存）。
+- 请求 `folderPick.submit {requestId, relativePath}` → 校验（必须已存在、必须在根内）→ 调用 `orchestrator.execute(taskId, tm, ToolBridge::mcpToolsToOpenAi(m_blenderTools), plan, prompt, targetFolder, area)`（plan/prompt 来自 `plan.confirm` 时缓存；`CoreApp.cpp` 顶部 `#include "core/llm/ToolBridge.h"`）。
 - 门禁：`plan.confirm` 与 `folderPick.submit` 各做一次预检查（忙时分别保留计划卡 / 目录弹窗）；最终以 `execute()` 的 `tryAcquire("blender-agent")` 为准。若在提交与任务启动的极小窗口内被抢先，任务以 `blender-busy` 失败并提示稍后重试（不自动排队）。
 - 请求 `folderPick.mkdir {requestId, path, name}` → 在弹窗内新建子文件夹，返回 `{ok, tree}` 供弹窗刷新；名称非法/重名返回 `invalid-path` / `already-exists`。
 - 请求 `folderPick.cancel {requestId}` → 任务结束，广播 `error.card {reason:"user-cancelled"}`。
@@ -1658,7 +1678,8 @@ m_router->registerHandler("folderPick.submit", [this](const QJsonObject& params)
                  m_orch->setModelConfig(primaryAgentConfig());
                  m_orch->setConversationHistory(
                      m_sessions->recentMessages(pick.area, 20));
-                 m_orch->execute(tid, tm, m_blenderTools, pick.plan,
+                 m_orch->execute(tid, tm,
+                                 ToolBridge::mcpToolsToOpenAi(m_blenderTools), pick.plan,
                                  pick.prompt, targetFolder, pick.area);
              }});
     return QJsonValue(QJsonObject{{"ok", true}, {"taskId", taskId}});
@@ -2072,7 +2093,8 @@ if (mode == "modify") {
              [this, plan, prompt, targetFolder, area](const QString& tid, TaskManager* tm) {
                  m_orch->setModelConfig(primaryAgentConfig());
                  m_orch->setConversationHistory(m_sessions->recentMessages(area, 20));
-                 m_orch->execute(tid, tm, m_blenderTools, plan, prompt, targetFolder, area);
+                 m_orch->execute(tid, tm, ToolBridge::mcpToolsToOpenAi(m_blenderTools),
+                                 plan, prompt, targetFolder, area);
              }});
     return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
 }
