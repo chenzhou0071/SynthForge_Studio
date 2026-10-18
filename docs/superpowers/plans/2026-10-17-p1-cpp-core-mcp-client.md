@@ -430,7 +430,8 @@ git commit -m "feat: 实现 JSON-RPC 行编解码（响应/错误/通知解析�
 - Consumes: `JsonRpcLineCodec`（Task 2）。
 - Produces:
   - `class McpTransport : QObject` — 纯虚接口 `start() / sendLine(QByteArray) / stop()`；信号 `started()`、`lineReceived(const QByteArray&)`（不含换行）、`stderrChunk(const QByteArray&)`、`stopped(int exitCode)`。
-  - `class McpClient : QObject` — 构造 `McpClient(McpTransport* transport, QObject* parent = nullptr)`；方法 `start()`、`isReady()`、`setRequestTimeout(int ms)`（默认 30000）、`listTools(std::function<void(const QJsonArray&)>, ReplyCallback onErr = nullptr)`、`callTool(QString name, QJsonObject arguments, ReplyCallback onDone)`；信号 `ready(const QJsonObject& serverInfo)`、`failed(const QString& reason)`；`using ReplyCallback = std::function<void(const QJsonValue& result, const QJsonObject& error)>`（error 为空对象表示成功）。
+  - `class McpClient : QObject` — 构造 `McpClient(McpTransport* transport, QObject* parent = nullptr)`；方法 `start()`（启动传输，`started` 后自动握手）、`isReady()`、`setRequestTimeout(int ms)`（默认 30000）、`listTools(std::function<void(const QJsonArray&)>, ReplyCallback onErr = nullptr)`、`callTool(QString name, QJsonObject arguments, ReplyCallback onDone, QJsonValue progressToken = {})`（非空时写入 `params._meta.progressToken`）；信号 `ready(const QJsonObject& serverInfo)`、`failed(const QString& reason)`、`notificationReceived(const QString& method, const QJsonValue& params)`、`stderrReceived(const QByteArray& chunk)`；`using ReplyCallback = std::function<void(const QJsonValue& result, const QJsonObject& error)>`（error 为空对象表示成功）。
+  - `McpClient` 构造函数内部 connect `transport->started → beginHandshake`、`transport->stderrChunk → stderrReceived`；上层直接 `client.start()` 即可，**不得再手动 connect `started → client->start`**（会重复握手）。
   - 请求 id 从 1 起自增；超时错误码 `-32000`，传输断开的兜底错误码 `-32001`。
 
 - [ ] **Step 1: 写失败的测试（含 FakeTransport 测试替身）**
@@ -438,6 +439,7 @@ git commit -m "feat: 实现 JSON-RPC 行编解码（响应/错误/通知解析�
 `tests/tst_mcpclient.cpp`：
 
 ```cpp
+#include <QJsonDocument>
 #include <QtTest>
 #include "core/mcp/McpClient.h"
 #include "core/mcp/McpTransport.h"
@@ -446,13 +448,19 @@ git commit -m "feat: 实现 JSON-RPC 行编解码（响应/错误/通知解析�
 class FakeTransport : public McpTransport
 {
 public:
-    void start() override { emit started(); }
+    void start() override
+    {
+        ++startCount;
+        emit started();
+    }
     void sendLine(const QByteArray& line) override { sent.append(line); }
     void stop() override { emit stopped(0); }
 
     QList<QByteArray> sent;
+    int startCount = 0;
 
     void feed(const QByteArray& json) { emit lineReceived(json); }
+    void feedStderr(const QByteArray& chunk) { emit stderrChunk(chunk); }
 };
 
 class McpClientTest : public QObject
@@ -468,6 +476,7 @@ private slots:
 
         client.start();
 
+        QCOMPARE(transport.startCount, 1);
         QCOMPARE(transport.sent.size(), 1);
         QVERIFY(transport.sent.first().contains("initialize"));
         QVERIFY(transport.sent.first().contains("2025-06-18"));
@@ -531,6 +540,57 @@ private slots:
 
         QTRY_VERIFY_WITH_TIMEOUT(done, 2000);
         QCOMPARE(receivedError.value(QStringLiteral("code")).toInt(), -32000);
+    }
+
+    void callToolSendsProgressToken()
+    {
+        FakeTransport transport;
+        McpClient client(&transport);
+
+        client.callTool(QStringLiteral("slow"), QJsonObject{},
+                        [](const QJsonValue&, const QJsonObject&) {},
+                        QStringLiteral("tok-1"));
+
+        const QJsonObject sent = QJsonDocument::fromJson(transport.sent.last()).object();
+        const QJsonObject params = sent.value(QStringLiteral("params")).toObject();
+        QCOMPARE(params.value(QStringLiteral("_meta"))
+                     .toObject()
+                     .value(QStringLiteral("progressToken"))
+                     .toString(),
+                 QStringLiteral("tok-1"));
+    }
+
+    void forwardsNotifications()
+    {
+        FakeTransport transport;
+        McpClient client(&transport);
+
+        QString method;
+        QJsonValue params;
+        connect(&client, &McpClient::notificationReceived, this,
+                [&](const QString& m, const QJsonValue& p) {
+                    method = m;
+                    params = p;
+                });
+
+        transport.feed(R"({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"t","progress":0.5}})");
+
+        QCOMPARE(method, QStringLiteral("notifications/progress"));
+        QCOMPARE(params.toObject().value(QStringLiteral("progress")).toDouble(), 0.5);
+    }
+
+    void forwardsStderr()
+    {
+        FakeTransport transport;
+        McpClient client(&transport);
+
+        QByteArray received;
+        connect(&client, &McpClient::stderrReceived, this,
+                [&](const QByteArray& chunk) { received = chunk; });
+
+        transport.feedStderr("bridge boom\n");
+
+        QCOMPARE(received, QByteArray("bridge boom\n"));
     }
 
     void transportStopFailsPending()
@@ -601,6 +661,7 @@ signals:
 ```cpp
 #pragma once
 
+#include <QByteArray>
 #include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -622,20 +683,24 @@ public:
 
     explicit McpClient(McpTransport* transport, QObject* parent = nullptr);
 
-    void start(); // 发起 initialize 握手；成功后自动发送 notifications/initialized
+    void start(); // 启动传输；transport 的 started 信号会触发 initialize 握手
     bool isReady() const { return m_ready; }
     void setRequestTimeout(int ms) { m_timeoutMs = ms; }
 
     void listTools(std::function<void(const QJsonArray& tools)> onOk,
                    ReplyCallback onErr = nullptr);
     void callTool(const QString& name, const QJsonObject& arguments,
-                  ReplyCallback onDone);
+                  ReplyCallback onDone,
+                  const QJsonValue& progressToken = QJsonValue());
 
 signals:
     void ready(const QJsonObject& serverInfo);
     void failed(const QString& reason);
+    void notificationReceived(const QString& method, const QJsonValue& params);
+    void stderrReceived(const QByteArray& chunk);
 
 private:
+    void beginHandshake();
     qint64 sendRequest(const QString& method, const QJsonObject& params, ReplyCallback cb);
     void onLine(const QByteArray& line);
     void resolve(qint64 id, const QJsonValue& result, const QJsonObject& error);
@@ -662,7 +727,9 @@ private:
 McpClient::McpClient(McpTransport* transport, QObject* parent)
     : QObject(parent), m_transport(transport)
 {
+    connect(m_transport, &McpTransport::started, this, &McpClient::beginHandshake);
     connect(m_transport, &McpTransport::lineReceived, this, &McpClient::onLine);
+    connect(m_transport, &McpTransport::stderrChunk, this, &McpClient::stderrReceived);
     connect(m_transport, &McpTransport::stopped, this, [this](int) {
         m_ready = false;
         failAllPending(QStringLiteral("transport stopped"));
@@ -670,6 +737,11 @@ McpClient::McpClient(McpTransport* transport, QObject* parent)
 }
 
 void McpClient::start()
+{
+    m_transport->start();
+}
+
+void McpClient::beginHandshake()
 {
     const QJsonObject params{
         {QStringLiteral("protocolVersion"), QStringLiteral("2025-06-18")},
@@ -708,9 +780,13 @@ void McpClient::listTools(std::function<void(const QJsonArray&)> onOk, ReplyCall
 }
 
 void McpClient::callTool(const QString& name, const QJsonObject& arguments,
-                         ReplyCallback onDone)
+                         ReplyCallback onDone, const QJsonValue& progressToken)
 {
-    const QJsonObject params{{"name", name}, {"arguments", arguments}};
+    QJsonObject params{{"name", name}, {"arguments", arguments}};
+    if (!progressToken.isUndefined() && !progressToken.isNull()) {
+        params.insert(QStringLiteral("_meta"),
+                      QJsonObject{{QStringLiteral("progressToken"), progressToken}});
+    }
     sendRequest(QStringLiteral("tools/call"), params, std::move(onDone));
 }
 
@@ -741,8 +817,10 @@ void McpClient::onLine(const QByteArray& line)
         emit failed(QStringLiteral("bad line from server: %1").arg(error));
         return;
     }
-    if (msg.kind == JsonRpcLine::Kind::Notification)
-        return; // P1 忽略服务端通知
+    if (msg.kind == JsonRpcLine::Kind::Notification) {
+        emit notificationReceived(msg.method, msg.params);
+        return;
+    }
     resolve(msg.id, msg.result, msg.error);
 }
 
@@ -769,11 +847,14 @@ void McpClient::failAllPending(const QString& reason)
 
 - [ ] **Step 5: 在 CMakeLists.txt 中注册**
 
-修改 `synthforge_core` 的源文件列表，追加一行：
+修改 `synthforge_core` 的源文件列表，追加两行：
 
 ```cmake
     src/core/mcp/McpClient.cpp
+    src/core/mcp/McpTransport.h
 ```
+
+`McpTransport.h` 是带 `Q_OBJECT` 的纯接口头，没有同名 `.cpp`；必须显式列入源列表，否则 AUTOMOC 不会为它生成 moc，链接时会报 `McpTransport::staticMetaObject` 等符号未定义。
 
 在文件末尾追加：
 
@@ -788,7 +869,7 @@ add_test(NAME tst_mcpclient COMMAND tst_mcpclient)
 Run: `cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH=<QT_KIT>`
 Run: `cmake --build build --config Debug`
 Run: `ctest --test-dir build -C Debug --output-on-failure`
-Expected: `tst_mcpclient` 5 个用例全部 Passed（含超时与断开兜底）。
+Expected: `tst_mcpclient` 8 个用例全部 Passed（含超时、断开兜底、progressToken、通知转发、stderr 转发）。
 
 - [ ] **Step 7: Commit**
 
@@ -812,7 +893,7 @@ git commit -m "feat: 实现 MCP 客户端握手、请求匹配与超时处理"
 - Consumes: `McpTransport` 接口（Task 3）。
 - Produces:
   - `struct BridgeCommand { QString program; QStringList args; QProcessEnvironment env; };`（定义在 `StdioTransport.h`）
-  - `StdioTransport(const BridgeCommand& command, QObject* parent = nullptr)` — 实现 `start / sendLine / stop`；stdout 按 `\n` 切分（跨 chunk 拼接，不丢半行）；stderr 原样经 `stderrChunk` 转发；进程退出/启动失败经 `stopped(exitCode)` 通知（启动失败 exitCode = -1）。
+  - `StdioTransport(const BridgeCommand& command, QObject* parent = nullptr)` — 实现 `start / sendLine / stop`；`start()` 幂等（进程已在运行则直接返回）；stdout 按 `\n` 切分（跨 chunk 拼接，不丢半行）；stderr 原样经 `stderrChunk` 转发；进程退出/启动失败经 `stopped(exitCode)` 通知（启动失败 exitCode = -1）。
   - `mock_mcp_server.exe` — 测试用 stdio 服务端，支持 `initialize` / `tools/list`（1 个 echo 工具）/ `tools/call`（回显 text 参数）；未知方法回 `-32601`；通知不回复。
 
 - [ ] **Step 1: 写失败的集成测试**
@@ -838,9 +919,8 @@ private slots:
         McpClient client(&transport);
 
         QSignalSpy readySpy(&client, &McpClient::ready);
-        connect(&transport, &McpTransport::started, &client, &McpClient::start);
 
-        transport.start();
+        client.start();
         QVERIFY2(readySpy.wait(15000), "mock server 未在 15 秒内完成握手");
 
         QJsonArray tools;
@@ -951,6 +1031,8 @@ StdioTransport::StdioTransport(const BridgeCommand& command, QObject* parent)
 
 void StdioTransport::start()
 {
+    if (m_process.state() != QProcess::NotRunning)
+        return; // 幂等：重复 start 不重启已在运行的进程
     m_process.setProcessChannelMode(QProcess::SeparateChannels);
     if (!m_command.env.isEmpty())
         m_process.setProcessEnvironment(m_command.env);
@@ -1283,7 +1365,7 @@ int main(int argc, char* argv[])
     auto* client = new McpClient(transport, &app);
     client->setRequestTimeout(parser.value(QStringLiteral("timeout")).toInt());
 
-    QObject::connect(transport, &McpTransport::stderrChunk, &app,
+    QObject::connect(client, &McpClient::stderrReceived, &app,
                      [&err](const QByteArray& chunk) {
                          err << QString::fromUtf8(chunk);
                          err.flush();
@@ -1334,8 +1416,7 @@ int main(int argc, char* argv[])
         err.flush();
         QCoreApplication::exit(1);
     });
-    QObject::connect(transport, &McpTransport::started, client, &McpClient::start);
-    transport->start();
+    client->start(); // 启动传输；started 后由 McpClient 自动握手
     return app.exec();
 }
 ```
@@ -1398,7 +1479,7 @@ git commit -m "feat: 默认桥接命令表与 MCP 冒烟 CLI（真实 Blender/Un
   - `void setHeartbeatInterval(int ms)` — 心跳周期，默认 30000；`<= 0` 关闭心跳。
   - `void setHeartbeatTimeout(int ms)` — 单次心跳响应超时，默认 5000；超时即判定连接死亡。
   - `void shutdown()` — 主动停止：关心跳、停 transport、不触发自动重连；程序退出使用。
-  - `void prepareRestart()` — `bridge.restart` 用：解除 shutdown、清退避计数（但不起传输）；调用方随后 `transport->start()` 重新握手，启动失败仍能继续自动重连。
+  - `void prepareRestart()` — `bridge.restart` 用：解除 shutdown、清退避计数（但不起传输）；调用方随后 `start()` 重新启动传输并握手，启动失败仍能继续自动重连。
   - 信号 `reconnecting(int attempt)`（attempt 从 1 起）与 `reconnected()`（仅断线后的重新握手成功才发射，首次 ready 不发射）。
   - 重连退避 1s / 2s / 4s / 8s / 16s / 30s 封顶后保持 30s，无限重试；仅对「曾经握手成功」的连接生效（首次启动失败不自动重试，顶栏保持灰灯，发送时由前置检查报 `blender-not-ready` / `unity-not-ready`）。
   - `P7` 的 `conn.status` 由这两个信号驱动：`reconnecting` → 黄灯，`ready`/`reconnected` → 绿灯。
@@ -1424,10 +1505,9 @@ private slots:
                               QProcessEnvironment::systemEnvironment()};
         StdioTransport transport(command);
         McpClient client(&transport);
-        connect(&transport, &McpTransport::started, &client, &McpClient::start);
 
         QSignalSpy readySpy(&client, &McpClient::ready);
-        transport.start();
+        client.start();
         QVERIFY2(readySpy.wait(15000), "首次握手失败");
 
         QSignalSpy reconnectingSpy(&client, &McpClient::reconnecting);
@@ -1461,10 +1541,9 @@ private slots:
         McpClient client(&transport);
         client.setHeartbeatInterval(200);
         client.setHeartbeatTimeout(500);
-        connect(&transport, &McpTransport::started, &client, &McpClient::start);
 
         QSignalSpy readySpy(&client, &McpClient::ready);
-        transport.start();
+        client.start();
         QVERIFY2(readySpy.wait(15000), "首次握手失败");
 
         QSignalSpy reconnectingSpy(&client, &McpClient::reconnecting);
@@ -1491,6 +1570,7 @@ Expected: 编译失败（`setHeartbeatInterval`、`shutdown`、`reconnecting` �
 ```cpp
 #pragma once
 
+#include <QByteArray>
 #include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -1513,9 +1593,9 @@ public:
 
     explicit McpClient(McpTransport* transport, QObject* parent = nullptr);
 
-    void start(); // 发起 initialize 握手；成功后自动发送 notifications/initialized
+    void start(); // 启动传输；started 后自动握手（重连也走这里）
     void shutdown(); // 主动停止：关心跳、停 transport、不触发自动重连
-    void prepareRestart(); // bridge.restart：解除 shutdown 与退避计数，随后由调用方启动传输
+    void prepareRestart(); // bridge.restart：解除 shutdown 与退避计数，随后调用 start()
     bool isReady() const { return m_ready; }
     void setRequestTimeout(int ms) { m_timeoutMs = ms; }
     void setHeartbeatInterval(int ms); // <= 0 关闭心跳；默认 30000
@@ -1524,15 +1604,19 @@ public:
     void listTools(std::function<void(const QJsonArray& tools)> onOk,
                    ReplyCallback onErr = nullptr);
     void callTool(const QString& name, const QJsonObject& arguments,
-                  ReplyCallback onDone);
+                  ReplyCallback onDone,
+                  const QJsonValue& progressToken = QJsonValue());
 
 signals:
     void ready(const QJsonObject& serverInfo);
     void failed(const QString& reason);
     void reconnecting(int attempt); // attempt 从 1 起
     void reconnected();             // 仅断线后的重新握手成功才发射
+    void notificationReceived(const QString& method, const QJsonValue& params);
+    void stderrReceived(const QByteArray& chunk);
 
 private:
+    void beginHandshake();
     qint64 sendRequest(const QString& method, const QJsonObject& params, ReplyCallback cb,
                        int timeoutMs = -1);
     void onLine(const QByteArray& line);
@@ -1569,7 +1653,9 @@ private:
 McpClient::McpClient(McpTransport* transport, QObject* parent)
     : QObject(parent), m_transport(transport)
 {
+    connect(m_transport, &McpTransport::started, this, &McpClient::beginHandshake);
     connect(m_transport, &McpTransport::lineReceived, this, &McpClient::onLine);
+    connect(m_transport, &McpTransport::stderrChunk, this, &McpClient::stderrReceived);
     connect(m_transport, &McpTransport::stopped, this,
             [this](int) { onTransportStopped(); });
     m_heartbeatTimer.setSingleShot(false);
@@ -1583,6 +1669,11 @@ McpClient::McpClient(McpTransport* transport, QObject* parent)
 void McpClient::start()
 {
     m_shutdown = false;
+    m_transport->start();
+}
+
+void McpClient::beginHandshake()
+{
     const QJsonObject params{
         {QStringLiteral("protocolVersion"), QStringLiteral("2025-06-18")},
         {QStringLiteral("clientInfo"),
@@ -1721,7 +1812,7 @@ void McpClient::scheduleReconnect()
         if (m_shutdown || m_ready)
             return; // 已恢复就绪时，陈旧定时器不得再断开健康连接
         m_transport->stop(); // 幂等：NotRunning 时直接返回
-        m_transport->start(); // started → 外部接线的 McpClient::start 自动重新握手
+        m_transport->start(); // started → McpClient 内部 beginHandshake 自动重新握手
     });
 }
 ```
@@ -1735,6 +1826,8 @@ void McpClient::scheduleReconnect()
 ```cpp
 void StdioTransport::start()
 {
+    if (m_process.state() != QProcess::NotRunning)
+        return; // 幂等：重复 start 不重启已在运行的进程
     m_buffer.clear(); // 重连时丢弃上次连接的残留半行
     m_process.setProcessChannelMode(QProcess::SeparateChannels);
     if (!m_command.env.isEmpty())

@@ -55,7 +55,7 @@ tests/tst_orchestrator.cpp                   ← mock MCP + mock LLM 集成
 - Consumes: `McpClient`（P1 Task 3/6）、`McpTransport` / `StdioTransport`（P1 Task 4）、`mock_mcp_server`（P1 Task 4）。
 - Produces:
   - `class McpRuntime : QObject`；构造 `McpRuntime(area, std::unique_ptr<McpTransport>, QObject* parent = nullptr)`，`area ∈ {"blender","unity"}`。
-  - `bool start()`（启动传输并握手）、`bool restart()`（`client->shutdown()` + `transport->start()`，供 `bridge.restart` 使用）、`void stop()`（`client->shutdown()`，供切换工程断链；需要时再 `start()`）。
+  - `bool start()`（`client->start()`：启动传输并握手）、`bool restart()`（`client->shutdown()` + `prepareRestart()` + `client->start()`，供 `bridge.restart` 使用）、`void stop()`（`client->shutdown()`，供切换工程断链；需要时再 `start()`）。
   - `McpClient* client() const`（供 `AgentOrchestrator` 构造与工具调用复用）。
   - `bool isReady() const`、`QJsonArray tools() const`（最近一次 `tools/list` 缓存）、`void refreshTools()`。
   - 信号 `toolsChanged(QJsonArray)`、`statusChanged(area, status, hint)`（status ∈ `off|reconnecting|ready`；P7 直接转发为 `conn.status`）。
@@ -165,7 +165,6 @@ McpRuntime::McpRuntime(const QString& area, std::unique_ptr<McpTransport> transp
     : QObject(parent), m_area(area), m_transport(std::move(transport)),
       m_client(new McpClient(m_transport.get(), this))
 {
-    connect(m_transport.get(), &McpTransport::started, m_client, &McpClient::start);
     connect(m_client, &McpClient::ready, this, [this] {
         refreshTools();
         emit statusChanged(m_area, QStringLiteral("ready"), QString());
@@ -187,7 +186,7 @@ McpRuntime::~McpRuntime() = default;
 
 bool McpRuntime::start()
 {
-    m_transport->start();
+    m_client->start(); // 内部启动传输，started 后自动握手
     return true;
 }
 
@@ -202,7 +201,7 @@ bool McpRuntime::restart()
 {
     m_client->shutdown();       // 主动断开：抑制旧会话的自动重连，不报 bridge-crashed
     m_client->prepareRestart(); // bridge.restart 语义：启动失败仍可退避重试（不被 shutdown 标志卡死）
-    m_transport->start();       // started → McpClient::start 重新握手
+    m_client->start();          // 重新启动传输；started → 自动重新握手
     return true;
 }
 
