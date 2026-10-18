@@ -156,7 +156,8 @@ git commit -m "chore: 初始化 CMake 工程骨架与 Qt Test 冒烟测试"
 **Interfaces:**
 - Consumes: Task 1 的 CMake 骨架。
 - Produces:
-  - `struct JsonRpcLine { enum class Kind { Response, ErrorResponse, Notification }; Kind kind; qint64 id; QJsonValue result; QJsonObject error; QString method; QJsonObject params; };`
+  - `struct JsonRpcLine { enum class Kind { Response, ErrorResponse, Notification }; Kind kind; qint64 id; QJsonValue result; QJsonObject error; QString method; QJsonValue params; };`（`params` 保留原始形态：JSON-RPC 2.0 允许对象或数组）
+  - `parse` 校验入站消息的 `jsonrpc` 必须为 `"2.0"`，否则拒绝并写入 error。
   - `static bool JsonRpcLineCodec::parse(const QByteArray& line, JsonRpcLine* out, QString* error)`
   - `static QByteArray JsonRpcLineCodec::makeRequest(qint64 id, const QString& method, const QJsonObject& params)`（返回值含尾部 `\n`）
   - `static QByteArray JsonRpcLineCodec::makeNotification(const QString& method, const QJsonObject& params)`（返回值含尾部 `\n`）
@@ -207,6 +208,30 @@ private slots:
             &msg, &err));
         QCOMPARE(msg.kind, JsonRpcLine::Kind::Notification);
         QCOMPARE(msg.method, QStringLiteral("notifications/message"));
+        QCOMPARE(msg.params.toObject().value(QStringLiteral("level")).toString(),
+                 QStringLiteral("info"));
+    }
+
+    void parsesNotificationWithArrayParams()
+    {
+        JsonRpcLine msg;
+        QString err;
+        QVERIFY(JsonRpcLineCodec::parse(
+            R"({"jsonrpc":"2.0","method":"notifications/custom","params":[1,"two"]})",
+            &msg, &err));
+        QCOMPARE(msg.kind, JsonRpcLine::Kind::Notification);
+        QVERIFY(msg.params.isArray());
+        QCOMPARE(msg.params.toArray().size(), 2);
+        QCOMPARE(msg.params.toArray().at(0).toInt(), 1);
+    }
+
+    void rejectsWrongJsonrpcVersion()
+    {
+        JsonRpcLine msg;
+        QString err;
+        QVERIFY(!JsonRpcLineCodec::parse(
+            R"({"jsonrpc":"1.0","id":1,"result":{}})", &msg, &err));
+        QVERIFY(!err.isEmpty());
     }
 
     void rejectsMalformedJson()
@@ -270,7 +295,7 @@ struct JsonRpcLine
     QJsonValue result;      // Response
     QJsonObject error;      // ErrorResponse：{code, message, data?}
     QString method;         // Notification
-    QJsonObject params;     // Notification（对象形式的 params）
+    QJsonValue params;      // Notification（对象或数组，保持原始 JSON 形态）
 };
 
 class JsonRpcLineCodec
@@ -304,10 +329,16 @@ bool JsonRpcLineCodec::parse(const QByteArray& line, JsonRpcLine* out, QString* 
     }
 
     const QJsonObject obj = doc.object();
+    if (obj.value(QStringLiteral("jsonrpc")).toString() != QStringLiteral("2.0")) {
+        if (error)
+            *error = QStringLiteral("unsupported jsonrpc version");
+        return false;
+    }
+
     if (obj.value(QStringLiteral("method")).isString()) {
         out->kind = JsonRpcLine::Kind::Notification;
         out->method = obj.value(QStringLiteral("method")).toString();
-        out->params = obj.value(QStringLiteral("params")).toObject();
+        out->params = obj.value(QStringLiteral("params"));
         return true;
     }
 
@@ -375,7 +406,7 @@ add_test(NAME tst_jsonrpc COMMAND tst_jsonrpc)
 Run: `cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH=<QT_KIT>`
 Run: `cmake --build build --config Debug`
 Run: `ctest --test-dir build -C Debug --output-on-failure`
-Expected: `tst_smoke` 与 `tst_jsonrpc` 全部 Passed（6 个用例）。
+Expected: `tst_smoke` 与 `tst_jsonrpc` 全部 Passed（`tst_jsonrpc` 8 个用例：响应/错误/通知/数组 params/错误版本/畸形 JSON/请求序列化/通知无 id）。
 
 - [ ] **Step 6: Commit**
 
