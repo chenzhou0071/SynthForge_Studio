@@ -1205,7 +1205,9 @@ QStringList AgentOrchestrator::collectNewGlbs() const
 }
 ```
 
-`executeToolCalls`（含工具调用钩子与截图回传；`AgentOrchestrator.cpp` 顶部 `#include "core/llm/ToolBridge.h"`）：
+`executeToolCalls`（含工具调用钩子与截图回传；`AgentOrchestrator.cpp` 顶部 `#include "core/llm/ToolBridge.h"`）。
+
+> **不接 `progressToken`**：工具执行期 UI 只用 `toolStep(area, tool, "running" / "done" / "error")` 转圈，不显示百分比。`McpClient::callTool` 的第 4 参保持可选（不传就不写 `params._meta`，服务端不会发 `notifications/progress`）；将来需要细分进度时，在编排层补 `QHash<QString, ToolContext>` 映射即可，传输层不用改。
 
 ```cpp
 void AgentOrchestrator::executeToolCalls(const QJsonArray& calls)
