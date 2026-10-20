@@ -21,6 +21,16 @@ StdioTransport::StdioTransport(const BridgeCommand& command, QObject* parent)
             [this](int exitCode, QProcess::ExitStatus) { emit stopped(exitCode); });
 }
 
+StdioTransport::~StdioTransport()
+{
+    // 析构时进程还活着，说明调用方没走 shutdown/stop 就销毁了传输。
+    // 同步杀掉并短等待，否则 QProcess 析构会打印 Destroyed 警告后强杀。
+    if (m_process.state() != QProcess::NotRunning) {
+        m_process.kill();
+        m_process.waitForFinished(1000);
+    }
+}
+
 void StdioTransport::start()
 {
     if (m_process.state() != QProcess::NotRunning)

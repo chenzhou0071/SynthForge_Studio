@@ -57,3 +57,21 @@ set_tests_properties(tst_bridge_commands PROPERTIES
 
 add_executable(synthforge_cli src/cli/main.cpp)
 target_link_libraries(synthforge_cli PRIVATE synthforge_core)
+
+add_executable(tst_reconnect tests/tst_reconnect.cpp)
+target_link_libraries(tst_reconnect PRIVATE synthforge_core Qt6::Test)
+# 同样不传路径宏：测试用 applicationDirPath() 定位同目录的 mock server
+add_dependencies(tst_reconnect mock_mcp_server)
+add_test(NAME tst_reconnect COMMAND tst_reconnect)
+set_tests_properties(tst_reconnect PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+# 慢测试：默认 30s 心跳节奏下真等两轮，约 65 秒；ctest -LE slow 可跳过
+add_executable(tst_heartbeat_long tests/tst_heartbeat_long.cpp)
+target_link_libraries(tst_heartbeat_long PRIVATE synthforge_core Qt6::Test)
+add_dependencies(tst_heartbeat_long mock_mcp_server)
+add_test(NAME tst_heartbeat_long COMMAND tst_heartbeat_long)
+set_tests_properties(tst_heartbeat_long PROPERTIES
+    LABELS "slow"
+    TIMEOUT 120
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")

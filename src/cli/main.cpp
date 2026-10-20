@@ -70,8 +70,9 @@ int main(int argc, char* argv[])
     auto* client = new McpClient(transport, &app);
     client->setRequestTimeout(timeoutMs);
 
-    // 退出前先优雅停掉桥接（stdio 服务端收到 stdin EOF 后自行退出），
-    // 否则 app 析构时 QProcess 还活着，Qt 会强杀子进程并打印 Destroyed 警告。
+    // 退出前先 shutdown（关心跳 + 停 transport，且不触发自动重连）。
+    // stdio 服务端收到 stdin EOF 后自行退出，否则 app 析构时 QProcess 还活着，
+    // Qt 会强杀子进程并打印 Destroyed 警告。
     bool finishing = false;
     int finishCode = 0;
     // QProcess 的 FailedToStart 在 start() 内部同步发射，此时事件循环还没运行，
@@ -84,7 +85,7 @@ int main(int argc, char* argv[])
             return;
         finishing = true;
         finishCode = code;
-        transport->stop();
+        client->shutdown();
         QTimer::singleShot(4000, &app, [&] { quitNow(finishCode); });
     };
 

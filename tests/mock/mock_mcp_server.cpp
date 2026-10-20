@@ -42,7 +42,13 @@ int main()
             {QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
             {QStringLiteral("id"), request.value(QStringLiteral("id"))}};
 
-        if (method == QStringLiteral("initialize")) {
+        if (method == QStringLiteral("ping")) {
+            if (qEnvironmentVariableIsSet("MOCK_IGNORE_PING"))
+                continue; // 故障注入：收到 ping 却不回复，模拟桥接卡死
+            // 慢测试靠这行日志数心跳次数（走 stderr，不进协议通道）
+            std::cerr << "mock: ping" << '\n' << std::flush;
+            response.insert(QStringLiteral("result"), QJsonObject{});
+        } else if (method == QStringLiteral("initialize")) {
             response.insert(
                 QStringLiteral("result"),
                 QJsonObject{

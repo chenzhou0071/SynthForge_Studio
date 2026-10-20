@@ -1250,7 +1250,7 @@ git commit -m "feat: 实现 QProcess stdio 传输与行缓冲，集成 mock serv
 - Produces:
   - `BridgeCommand defaultBridgeCommand(const QString& area)` — `"blender"` → `uvx --python 3.11 mcp-for-blender` + env `UV_PYTHON_PREFERENCE=only-managed`；`"unity"` → `uvx --from mcpforunityserver mcp-for-unity --transport stdio`；未知 area 返回 `program` 为空的命令。
   - `synthforge_cli.exe` — 参数：`--connect<blender|unity>`（必填）、`--list-tools`、`--call<tool> --args<json>`（默认 `{}`）、`--timeout<ms>`（默认 30000）。工具清单/调用结果以 JSON 打到 stdout；日志与错误打到 stderr；退出码 0=成功、1=运行错误、2=参数错误。
-  - 退出行为三条约束：① `--args`/`--timeout` 在连桥之前校验（参数写错不白跑一次握手）；② 退出前先 `transport->stop()`（stdin EOF），否则 `app` 析构时 QProcess 还在跑，Qt 强杀子进程并打印 `QProcess: Destroyed while process is still running`；③ 所有 `QCoreApplication::exit` 都用 `QTimer::singleShot(0, ...)` 推迟一轮——`QProcess` 的 `FailedToStart` 在 `start()` 内部同步发射，那时事件循环还没运行，直接 `exit()` 会被 Qt 忽略导致进程挂死。
+  - 退出行为三条约束：① `--args`/`--timeout` 在连桥之前校验（参数写错不白跑一次握手）；② 退出前先 `client->shutdown()`（关心跳 + 停 transport + 不触发自动重连，stdio 服务端收到 stdin EOF 后自行退出），否则 `app` 析构时 QProcess 还在跑，Qt 强杀子进程并打印 `QProcess: Destroyed while process is still running`；③ 所有 `QCoreApplication::exit` 都用 `QTimer::singleShot(0, ...)` 推迟一轮——`QProcess` 的 `FailedToStart` 在 `start()` 内部同步发射，那时事件循环还没运行，直接 `exit()` 会被 Qt 忽略导致进程挂死。
 
 - [ ] **Step 1: 写失败的命令映射测试**
 
@@ -1442,8 +1442,9 @@ int main(int argc, char* argv[])
     auto* client = new McpClient(transport, &app);
     client->setRequestTimeout(timeoutMs);
 
-    // 退出前先优雅停掉桥接（stdio 服务端收到 stdin EOF 后自行退出），
-    // 否则 app 析构时 QProcess 还活着，Qt 会强杀子进程并打印 Destroyed 警告。
+    // 退出前先 shutdown（关心跳 + 停 transport，且不触发自动重连）。
+    // stdio 服务端收到 stdin EOF 后自行退出，否则 app 析构时 QProcess 还活着，
+    // Qt 会强杀子进程并打印 Destroyed 警告。
     bool finishing = false;
     int finishCode = 0;
     // QProcess 的 FailedToStart 在 start() 内部同步发射，此时事件循环还没运行，
@@ -1456,7 +1457,7 @@ int main(int argc, char* argv[])
             return;
         finishing = true;
         finishCode = code;
-        transport->stop();
+        client->shutdown();
         QTimer::singleShot(4000, &app, [&] { quitNow(finishCode); });
     };
 
@@ -1576,7 +1577,8 @@ git commit -m "feat: 默认桥接命令表与 MCP 冒烟 CLI（真实 Blender/Un
 - Modify: `src/core/mcp/StdioTransport.cpp`（`start()` 先清空行缓冲）
 - Modify: `tests/mock/mock_mcp_server.cpp`（故障注入：收到 ping 不回复）
 - Create: `tests/tst_reconnect.cpp`
-- Modify: `CMakeLists.txt`（新增 `tst_reconnect` target）
+- Create: `tests/tst_heartbeat_long.cpp`（慢测试：默认 30s 节奏真等两轮，约 60 秒，label=`slow`）
+- Modify: `CMakeLists.txt`（新增 `tst_reconnect` 与 `tst_heartbeat_long` target）
 
 **Interfaces:**
 - Consumes: `McpClient`（Task 3）、`StdioTransport`（Task 4）、`mock_mcp_server`（Task 4）。
@@ -1938,6 +1940,8 @@ void McpClient::scheduleReconnect()
 ```
 
 > 崩溃语义：传输意外退出（含心跳超时触发的 `stop()`）先 `emit failed(...)`（顶栏变灰 + P7 `bridge-crashed` 错误卡），再 `scheduleReconnect()` 进入黄灯重连；重连尝试再次失败时只续退避、不重复 `emit failed`；`shutdown()` 主动断开不报错；首次启动时传输就起不来（`m_everReady == false` 的 `stopped` 分支）不 `emit failed`，而首次握手失败仍会 `emit failed`（但不会自动重试）。`bridge.restart` 用 `shutdown()` + `prepareRestart()` 组合：重启后的启动失败仍会退避重试，不会因 shutdown 标志卡死；重连定时器在 `m_ready` 时直接返回，避免陈旧定时器误断健康连接。
+>
+> 配套修改：`StdioTransport` 新增析构函数，析构时若子进程还在（调用方没走 shutdown/stop 就销毁传输，典型是测试函数返回时的栈对象），同步 `kill()` + `waitForFinished(1000)`，否则 QProcess 析构会打印 `Destroyed while process is still running` 后强杀；冒烟 CLI 的 `finish()` 也改用 `client->shutdown()`（而非 `transport->stop()`），否则正常退出会被当成崩溃、触发一次 `failed` 与重连调度。
 
 - [ ] **Step 4: StdioTransport 支持重启**
 
@@ -1964,6 +1968,8 @@ void StdioTransport::start()
         if (method == QStringLiteral("ping")) {
             if (qEnvironmentVariableIsSet("MOCK_IGNORE_PING"))
                 continue; // 故障注入：收到 ping 却不回复，模拟桥接卡死
+            // 慢测试靠这行日志数心跳次数（走 stderr，不进协议通道）
+            std::cerr << "mock: ping" << '\n' << std::flush;
             response.insert(QStringLiteral("result"), QJsonObject{});
         } else if (method == QStringLiteral("initialize")) {
 ```
@@ -1980,6 +1986,16 @@ add_dependencies(tst_reconnect mock_mcp_server)
 add_test(NAME tst_reconnect COMMAND tst_reconnect)
 set_tests_properties(tst_reconnect PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+# 慢测试：默认 30s 心跳节奏下真等两轮，约 65 秒；ctest -LE slow 可跳过
+add_executable(tst_heartbeat_long tests/tst_heartbeat_long.cpp)
+target_link_libraries(tst_heartbeat_long PRIVATE synthforge_core Qt6::Test)
+add_dependencies(tst_heartbeat_long mock_mcp_server)
+add_test(NAME tst_heartbeat_long COMMAND tst_heartbeat_long)
+set_tests_properties(tst_heartbeat_long PROPERTIES
+    LABELS "slow"
+    TIMEOUT 120
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 ```
 
 Run: `cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH=<QT_KIT>`
@@ -1987,10 +2003,12 @@ Run: `cmake --build build --config Debug`
 Run: `ctest --test-dir build -C Debug -R tst_reconnect --output-on-failure`
 Expected: 2 个用例 Passed（崩溃后 1s 重启并重新握手、卡死后 5s 内由心跳判定断线）。
 
+慢测试源码 `tests/tst_heartbeat_long.cpp`：不改心跳参数（默认 30000/5000），监听 `stderrReceived` 累计 `"mock: ping"` 出现次数，`QTRY_VERIFY_WITH_TIMEOUT(count >= 2, 75000)` 真等两轮；同时用 `QSignalSpy reconnectingSpy` 断言正常心跳不触发重连。实测 ctest 耗时 60.30 秒。
+
 - [ ] **Step 7: Commit**
 
 ```bash
-git add CMakeLists.txt src/core/mcp/McpClient.h src/core/mcp/McpClient.cpp src/core/mcp/StdioTransport.cpp tests/mock/mock_mcp_server.cpp tests/tst_reconnect.cpp
+git add CMakeLists.txt src/cli/main.cpp src/core/mcp/McpClient.h src/core/mcp/McpClient.cpp src/core/mcp/StdioTransport.h src/core/mcp/StdioTransport.cpp tests/mock/mock_mcp_server.cpp tests/tst_reconnect.cpp tests/tst_heartbeat_long.cpp
 git commit -m "feat: MCP 心跳检测与桥接崩溃自动重连（指数退避 + reconnect 信号）"
 ```
 
@@ -1998,10 +2016,10 @@ git commit -m "feat: MCP 心跳检测与桥接崩溃自动重连（指数退避 
 
 ## P1 完成标准（Definition of Done）
 
-- [ ] `ctest --test-dir build -C Debug` 全绿：`tst_smoke`、`tst_jsonrpc`、`tst_mcpclient`、`tst_stdio_transport`、`tst_bridge_commands`、`tst_reconnect`
+- [ ] `ctest --test-dir build -C Debug` 全绿：`tst_smoke`、`tst_jsonrpc`、`tst_mcpclient`、`tst_stdio_transport`、`tst_bridge_commands`、`tst_reconnect`、`tst_heartbeat_long`（后者 label=`slow`，全量约 63 秒；`ctest -LE slow` 只跑快测试约 3 秒）
 - [ ] 心跳超时与桥接崩溃均能自动重连并恢复工具调用（`tst_reconnect` 2 用例）
-- [ ] 真实 Blender 链路：`--connect blender --list-tools` 返回工具清单（约 9 个）
-- [ ] 真实 Unity 链路：`--connect unity --list-tools` 返回工具清单（约 48 个）
+- [ ] 真实 Blender 链路：`--connect blender --list-tools` 返回工具清单（实测 11 个）
+- [ ] 真实 Unity 链路：`--connect unity --list-tools` 返回工具清单（实测 68 个）
 - [ ] 真实工具调用：`--call get_scene_info` 返回场景 JSON
 - [ ] 失败路径优雅：桥接缺失时非零退出码、无挂起、无崩溃
 - [ ] stdout 仅协议/结果数据，日志与错误全部在 stderr

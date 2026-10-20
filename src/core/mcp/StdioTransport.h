@@ -20,6 +20,7 @@ class StdioTransport : public McpTransport
 
 public:
     explicit StdioTransport(const BridgeCommand& command, QObject* parent = nullptr);
+    ~StdioTransport() override; // 析构时进程还活着则同步杀掉，避免 QProcess 警告后强杀
 
     void start() override;
     void sendLine(const QByteArray& line) override;
