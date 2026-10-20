@@ -12,6 +12,7 @@ add_library(synthforge_core STATIC
     src/core/mcp/McpClient.cpp
     src/core/mcp/McpTransport.h
     src/core/mcp/StdioTransport.cpp
+    src/core/mcp/BridgeCommands.cpp
 )
 target_include_directories(synthforge_core PUBLIC src)
 target_link_libraries(synthforge_core PUBLIC Qt6::Core)
@@ -47,3 +48,12 @@ add_dependencies(tst_stdio_transport mock_mcp_server)
 add_test(NAME tst_stdio_transport COMMAND tst_stdio_transport)
 set_tests_properties(tst_stdio_transport PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_bridge_commands tests/tst_bridge_commands.cpp)
+target_link_libraries(tst_bridge_commands PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_bridge_commands COMMAND tst_bridge_commands)
+set_tests_properties(tst_bridge_commands PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(synthforge_cli src/cli/main.cpp)
+target_link_libraries(synthforge_cli PRIVATE synthforge_core)

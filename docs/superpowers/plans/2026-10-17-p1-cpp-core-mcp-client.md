@@ -1250,6 +1250,7 @@ git commit -m "feat: 实现 QProcess stdio 传输与行缓冲，集成 mock serv
 - Produces:
   - `BridgeCommand defaultBridgeCommand(const QString& area)` — `"blender"` → `uvx --python 3.11 mcp-for-blender` + env `UV_PYTHON_PREFERENCE=only-managed`；`"unity"` → `uvx --from mcpforunityserver mcp-for-unity --transport stdio`；未知 area 返回 `program` 为空的命令。
   - `synthforge_cli.exe` — 参数：`--connect<blender|unity>`（必填）、`--list-tools`、`--call<tool> --args<json>`（默认 `{}`）、`--timeout<ms>`（默认 30000）。工具清单/调用结果以 JSON 打到 stdout；日志与错误打到 stderr；退出码 0=成功、1=运行错误、2=参数错误。
+  - 退出行为三条约束：① `--args`/`--timeout` 在连桥之前校验（参数写错不白跑一次握手）；② 退出前先 `transport->stop()`（stdin EOF），否则 `app` 析构时 QProcess 还在跑，Qt 强杀子进程并打印 `QProcess: Destroyed while process is still running`；③ 所有 `QCoreApplication::exit` 都用 `QTimer::singleShot(0, ...)` 推迟一轮——`QProcess` 的 `FailedToStart` 在 `start()` 内部同步发射，那时事件循环还没运行，直接 `exit()` 会被 Qt 忽略导致进程挂死。
 
 - [ ] **Step 1: 写失败的命令映射测试**
 
@@ -1355,6 +1356,8 @@ BridgeCommand defaultBridgeCommand(const QString& area)
 add_executable(tst_bridge_commands tests/tst_bridge_commands.cpp)
 target_link_libraries(tst_bridge_commands PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_bridge_commands COMMAND tst_bridge_commands)
+set_tests_properties(tst_bridge_commands PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 ```
 
 Run: `cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH=<QT_KIT>`
@@ -1373,6 +1376,9 @@ Expected: `tst_bridge_commands` 3 个用例 Passed。
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTextStream>
+#include <QTimer>
+
+#include <cstdio>
 
 #include "core/mcp/BridgeCommands.h"
 #include "core/mcp/McpClient.h"
@@ -1406,22 +1412,64 @@ int main(int argc, char* argv[])
     const BridgeCommand command = defaultBridgeCommand(parser.value(QStringLiteral("connect")));
     if (command.program.isEmpty()) {
         err << "error: --connect 必须为 blender 或 unity\n";
+        err.flush();
+        return 2;
+    }
+
+    // 参数在连接前校验完，避免连上桥接后才因为 JSON 写错而白跑一次握手
+    QJsonObject arguments;
+    if (parser.isSet(QStringLiteral("call"))) {
+        QJsonParseError parseError;
+        const QJsonDocument argsDoc =
+            QJsonDocument::fromJson(parser.value(QStringLiteral("args")).toUtf8(), &parseError);
+        if (parseError.error != QJsonParseError::NoError || !argsDoc.isObject()) {
+            err << "error: --args 必须是 JSON 对象：" << parseError.errorString() << '\n';
+            err.flush();
+            return 2;
+        }
+        arguments = argsDoc.object();
+    }
+
+    bool timeoutOk = false;
+    const int timeoutMs = parser.value(QStringLiteral("timeout")).toInt(&timeoutOk);
+    if (!timeoutOk || timeoutMs <= 0) {
+        err << "error: --timeout 必须是正整数毫秒\n";
+        err.flush();
         return 2;
     }
 
     auto* transport = new StdioTransport(command, &app);
     auto* client = new McpClient(transport, &app);
-    client->setRequestTimeout(parser.value(QStringLiteral("timeout")).toInt());
+    client->setRequestTimeout(timeoutMs);
 
-    QObject::connect(client, &McpClient::stderrReceived, &app,
-                     [&err](const QByteArray& chunk) {
-                         err << QString::fromUtf8(chunk);
-                         err.flush();
-                     });
-    QObject::connect(client, &McpClient::failed, &app, [&err](const QString& reason) {
+    // 退出前先优雅停掉桥接（stdio 服务端收到 stdin EOF 后自行退出），
+    // 否则 app 析构时 QProcess 还活着，Qt 会强杀子进程并打印 Destroyed 警告。
+    bool finishing = false;
+    int finishCode = 0;
+    // QProcess 的 FailedToStart 在 start() 内部同步发射，此时事件循环还没运行，
+    // 直接 exit() 会被 Qt 忽略导致挂死；统一推迟到下一轮事件循环再退。
+    const auto quitNow = [&](int code) {
+        QTimer::singleShot(0, &app, [&app, code] { QCoreApplication::exit(code); });
+    };
+    const auto finish = [&](int code) {
+        if (finishing)
+            return;
+        finishing = true;
+        finishCode = code;
+        transport->stop();
+        QTimer::singleShot(4000, &app, [&] { quitNow(finishCode); });
+    };
+
+    QObject::connect(client, &McpClient::stderrReceived, &app, [](const QByteArray& chunk) {
+        // 按原字节透传：Python 桥接日志在 Windows 管道里是 GBK，
+        // 先 fromUtf8 再写控制台会把中文变成乱码
+        fwrite(chunk.constData(), 1, static_cast<size_t>(chunk.size()), stderr);
+        fflush(stderr);
+    });
+    QObject::connect(client, &McpClient::failed, &app, [&](const QString& reason) {
         err << "error: " << reason << '\n';
         err.flush();
-        QCoreApplication::exit(1);
+        finish(1);
     });
     QObject::connect(client, &McpClient::ready, &app, [&](const QJsonObject& serverInfo) {
         err << "connected: " << serverInfo.value(QStringLiteral("name")).toString() << ' '
@@ -1429,9 +1477,6 @@ int main(int argc, char* argv[])
         err.flush();
 
         if (parser.isSet(QStringLiteral("call"))) {
-            const QJsonObject arguments =
-                QJsonDocument::fromJson(parser.value(QStringLiteral("args")).toUtf8())
-                    .object();
             client->callTool(parser.value(QStringLiteral("call")), arguments,
                              [&](const QJsonValue& result, const QJsonObject& error) {
                                  if (!error.isEmpty()) {
@@ -1439,30 +1484,37 @@ int main(int argc, char* argv[])
                                          << QJsonDocument(error).toJson(QJsonDocument::Compact)
                                          << '\n';
                                      err.flush();
-                                     QCoreApplication::exit(1);
+                                     finish(1);
                                      return;
                                  }
-                                 if (result.isObject())
+                                 if (result.isObject()) {
                                      out << QJsonDocument(result.toObject())
                                                 .toJson(QJsonDocument::Indented);
-                                 else if (result.isArray())
+                                 } else if (result.isArray()) {
                                      out << QJsonDocument(result.toArray())
                                                 .toJson(QJsonDocument::Indented);
+                                 } else {
+                                     out << "\"" << result.toString() << "\"\n";
+                                 }
                                  out.flush();
-                                 QCoreApplication::exit(0);
+                                 finish(0);
                              });
         } else {
             client->listTools([&](const QJsonArray& tools) {
                 out << QJsonDocument(tools).toJson(QJsonDocument::Indented);
                 out.flush();
-                QCoreApplication::exit(0);
+                finish(0);
             });
         }
     });
     QObject::connect(transport, &McpTransport::stopped, &app, [&](int exitCode) {
+        if (finishing) {
+            quitNow(finishCode); // 主动退出：用调用方指定的退出码
+            return;
+        }
         err << "bridge exited with code " << exitCode << '\n';
         err.flush();
-        QCoreApplication::exit(1);
+        quitNow(1);
     });
     client->start(); // 启动传输；started 后由 McpClient 自动握手
     return app.exec();
@@ -1484,23 +1536,28 @@ Expected: 产出 `build/Debug/synthforge_cli.exe`，全部测试仍绿。
 
 - [ ] **Step 7: 真实链路手工验收**
 
-前置：Blender 已打开且 MCP 插件在运行；Unity 编辑器已打开含 MCP for Unity 包的工程。
+前置：`--list-tools` 不要求编辑器开着（桥接进程本身可独立启动，连不上编辑器只会打警告）；只有工具调用才需要 Blender 已打开且 MCP 插件在运行（或 Unity 编辑器已打开含 MCP for Unity 包的工程）。若 Blender 桥接提示 "addon on disk is outdated"，先跑 `uvx mcp-for-blender install-addon` 再在 Blender 里禁用/重启用插件。
 
 1. Blender 列工具：
    Run: `build\Debug\synthforge_cli.exe --connect blender --list-tools`
-   Expected: stderr 出现 `connected: ...`；stdout 输出 JSON 数组，含 `execute_blender_code`、`look` 等约 9 个工具；退出码 0。
+   Expected: stderr 出现 `connected: MCP for Blender ...`；stdout 输出 JSON 数组，含 `get_addon_status`、`get_scene_info`、`execute_blender_code`、`import_asset` 等 11 个工具；退出码 0（实测首次约 5 秒，uvx 下载后约 1 秒）。
 2. Unity 列工具：
    Run: `build\Debug\synthforge_cli.exe --connect unity --list-tools`
-   Expected: stdout 数组约 48 个工具；退出码 0。
-3. Blender 工具调用（PowerShell 引号安全写法——外壳用单引号包裹 JSON）：
+   Expected: stdout 数组 68 个工具；退出码 0（实测首次约 20 秒，含 uvx 下载 `mcpforunityserver`）。
+3. Blender 工具调用（PowerShell 传参注意：内层双引号必须用 `\"` 转义；只在外层包单引号会被 PowerShell 剥掉双引号，变成非法 JSON）：
    Run: `build\Debug\synthforge_cli.exe --connect blender --call get_scene_info --args '{}'`
-   Expected: stdout 输出场景信息 JSON。
-4. 失败路径（关闭 Blender 或插件后执行）：
+   Expected: stdout 输出场景信息 JSON（`content[0].text` 为场景摘要）；退出码 0。
+   Unity 工具调用：
+   Run: `build\Debug\synthforge_cli.exe --connect unity --call manage_scene --args '{\"action\":\"get_active\"}'`
+   Expected: `structuredContent.data` 为当前打开的场景（name/path/buildIndex/rootCount）；退出码 0。
+4. 失败路径（把 uvx 从 PATH 中移除，模拟桥接起不来）：
    Run: `build\Debug\synthforge_cli.exe --connect blender --list-tools`
-   Expected: 不挂起；stderr 出现桥接错误日志；退出码 1。
+   Expected: 不挂起（实测 0.1 秒）；stderr 出现 `Process failed to start: ...` 与 `bridge exited with code -1`；退出码 1。
 5. 参数错误：
    Run: `build\Debug\synthforge_cli.exe --connect photoshop --list-tools`
    Expected: stderr `error: --connect 必须为 blender 或 unity`；退出码 2。
+   Run: `build\Debug\synthforge_cli.exe --connect blender --call foo --args "{"`
+   Expected: stderr `error: --args 必须是 JSON 对象：...`；退出码 2（未建立任何连接）。
 
 - [ ] **Step 8: Commit**
 
