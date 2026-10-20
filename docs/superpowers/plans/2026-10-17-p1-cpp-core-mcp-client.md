@@ -893,18 +893,36 @@ git commit -m "feat: 实现 MCP 客户端握手、请求匹配与超时处理"
 - Consumes: `McpTransport` 接口（Task 3）。
 - Produces:
   - `struct BridgeCommand { QString program; QStringList args; QProcessEnvironment env; };`（定义在 `StdioTransport.h`）
-  - `StdioTransport(const BridgeCommand& command, QObject* parent = nullptr)` — 实现 `start / sendLine / stop`；`start()` 幂等（进程已在运行则直接返回）；stdout 按 `\n` 切分（跨 chunk 拼接，不丢半行）；stderr 原样经 `stderrChunk` 转发；进程退出/启动失败经 `stopped(exitCode)` 通知（启动失败 exitCode = -1）。
-  - `mock_mcp_server.exe` — 测试用 stdio 服务端，支持 `initialize` / `tools/list`（1 个 echo 工具）/ `tools/call`（回显 text 参数）；未知方法回 `-32601`；通知不回复。
+  - `StdioTransport(const BridgeCommand& command, QObject* parent = nullptr)` — 实现 `start / sendLine / stop`；`start()` 幂等（进程已在运行则直接返回，并清空残留半行缓冲）；stdout 按 `\n` 切分（跨 chunk 拼接，不丢半行）；stderr 原样经 `stderrChunk` 转发；进程退出/启动失败经 `stopped(exitCode)` 通知（启动失败 exitCode = -1）。`stop()` **不阻塞主线程**：先 `closeWriteChannel()` 触发 stdin EOF（stdio 服务端的标准退出信号），3 秒内未退出再 `kill()`；因为 Windows 的 `terminate()`（WM_CLOSE）对没有消息循环的 console 子进程无效，`waitForFinished` 会白等 3 秒并冻结 UI。
+  - `mock_mcp_server.exe` — 测试用 stdio 服务端，支持 `initialize` / `tools/list`（1 个 echo 工具）/ `tools/call`（回显 text 参数）；未知方法回 `-32601`；通知不回复；**每个响应故意拆成两次 write（中间 sleep 20ms）**，用来验证客户端确实做了跨 chunk 行缓冲。
 
 - [ ] **Step 1: 写失败的集成测试**
 
 `tests/tst_stdio_transport.cpp`：
 
 ```cpp
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QProcessEnvironment>
 #include <QtTest>
 
 #include "core/mcp/McpClient.h"
 #include "core/mcp/StdioTransport.h"
+
+namespace {
+
+// mock server 与测试 exe 同目录；不用 CMake 宏传路径，
+// 因为 Windows 反斜杠会被 C++ 当成 \p、\b 等转义序列。
+QString mockServerProgram()
+{
+#ifdef Q_OS_WIN
+    return QCoreApplication::applicationDirPath() + QStringLiteral("/mock_mcp_server.exe");
+#else
+    return QCoreApplication::applicationDirPath() + QStringLiteral("/mock_mcp_server");
+#endif
+}
+
+} // namespace
 
 class StdioTransportTest : public QObject
 {
@@ -913,7 +931,9 @@ class StdioTransportTest : public QObject
 private slots:
     void endToEndThroughMockServer()
     {
-        BridgeCommand command{QString::fromLocal8Bit(MOCK_SERVER_PATH), {},
+        // mock server 把每个响应拆成两次 write（中间 sleep），
+        // 因此这个用例同时验证跨 chunk 的半行拼接。
+        BridgeCommand command{mockServerProgram(), {},
                               QProcessEnvironment::systemEnvironment()};
         StdioTransport transport(command);
         McpClient client(&transport);
@@ -953,7 +973,9 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(called, 15000);
         QCOMPARE(echoed, QStringLiteral("hello synthforge"));
 
+        QSignalSpy stoppedSpy(&transport, &McpTransport::stopped);
         transport.stop();
+        QVERIFY2(stoppedSpy.wait(5000), "mock server 未在 5 秒内退出");
     }
 };
 
@@ -1021,7 +1043,10 @@ StdioTransport::StdioTransport(const BridgeCommand& command, QObject* parent)
             &StdioTransport::onReadyReadStdout);
     connect(&m_process, &QProcess::readyReadStandardError, this,
             &StdioTransport::onReadyReadStderr);
-    connect(&m_process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+    connect(&m_process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+        // CrashExit 由 finished 上报；这里只处理进程压根没起来的情况，避免 stopped 发两次
+        if (error != QProcess::FailedToStart)
+            return;
         emit stderrChunk(m_process.errorString().toUtf8() + '\n');
         emit stopped(-1);
     });
@@ -1048,11 +1073,16 @@ void StdioTransport::stop()
 {
     if (m_process.state() == QProcess::NotRunning)
         return;
-    m_process.terminate();
-    if (!m_process.waitForFinished(3000)) {
-        m_process.kill();
-        m_process.waitForFinished(1000);
-    }
+    // stdio 服务端的标准退出信号是 stdin EOF：先关写通道让它自行收尾。
+    // Windows 下 terminate（WM_CLOSE）对没有消息循环的 console 子进程无效，
+    // 所以 3 秒兜底强杀；全程不在主线程 waitForFinished，避免冻结 UI。
+    const qint64 pid = m_process.processId();
+    m_process.closeWriteChannel();
+    QTimer::singleShot(3000, this, [this, pid] {
+        // pid 校验：3 秒内若已重连出新进程，不能误杀
+        if (m_process.state() != QProcess::NotRunning && m_process.processId() == pid)
+            m_process.kill();
+    });
 }
 
 void StdioTransport::onReadyReadStdout()
@@ -1078,20 +1108,41 @@ void StdioTransport::onReadyReadStderr()
 `tests/mock/mock_mcp_server.cpp`：
 
 ```cpp
+#include <chrono>
 #include <iostream>
 #include <string>
+#include <thread>
 
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 
 // 测试用 MCP stdio mock server：initialize / tools/list / tools/call(echo)。
+// 每个响应故意拆成两次 write（中间 sleep），迫使客户端做跨 chunk 行缓冲才能解析。
+namespace {
+
+void writeSplit(const QJsonObject& response)
+{
+    const QByteArray out = QJsonDocument(response).toJson(QJsonDocument::Compact) + '\n';
+    const int half = static_cast<int>(out.size()) / 2;
+    std::cout.write(out.constData(), half);
+    std::cout.flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::cout.write(out.constData() + half, out.size() - half);
+    std::cout.flush();
+}
+
+} // namespace
+
 int main()
 {
     std::string line;
     while (std::getline(std::cin, line)) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back(); // Windows 管道可能留下 CR
         if (line.empty())
             continue;
+
         const QJsonObject request =
             QJsonDocument::fromJson(QByteArray::fromStdString(line)).object();
         const QString method = request.value(QStringLiteral("method")).toString();
@@ -1112,18 +1163,15 @@ int main()
                      QJsonObject{{QStringLiteral("name"), QStringLiteral("mock")},
                                  {QStringLiteral("version"), QStringLiteral("0.0.1")}}}});
         } else if (method == QStringLiteral("tools/list")) {
-            response.insert(
-                QStringLiteral("result"),
-                QJsonObject{
-                    {QStringLiteral("tools"),
-                     QJsonArray{QJsonObject{
-                         {QStringLiteral("name"), QStringLiteral("echo")},
-                         {QStringLiteral("description"),
-                          QStringLiteral("echo back the text argument")},
-                         {QStringLiteral("inputSchema"),
-                          QJsonObject{{"type", "object"},
-                                      {"properties",
-                                       QJsonObject{{"text", QJsonObject{{"type", "string"}}}}}}}}}}}});
+            const QJsonObject inputSchema{
+                {"type", "object"},
+                {"properties", QJsonObject{{"text", QJsonObject{{"type", "string"}}}}}};
+            const QJsonObject echoTool{
+                {QStringLiteral("name"), QStringLiteral("echo")},
+                {QStringLiteral("description"), QStringLiteral("echo back the text argument")},
+                {QStringLiteral("inputSchema"), inputSchema}};
+            response.insert(QStringLiteral("result"),
+                            QJsonObject{{QStringLiteral("tools"), QJsonArray{echoTool}}});
         } else if (method == QStringLiteral("tools/call")) {
             const QJsonObject arguments = request.value(QStringLiteral("params"))
                                               .toObject()
@@ -1139,14 +1187,12 @@ int main()
             if (isNotification)
                 continue;
             response.insert(QStringLiteral("error"),
-                            QJsonObject{{"code", -32601},
-                                        {"message", "method not found"}});
+                            QJsonObject{{"code", -32601}, {"message", "method not found"}});
         }
 
         if (isNotification)
             continue; // notifications/initialized 等不回复
-        std::cout << QJsonDocument(response).toJson(QJsonDocument::Compact).toStdString()
-                  << std::endl;
+        writeSplit(response);
     }
     return 0;
 }
@@ -1168,10 +1214,12 @@ target_link_libraries(mock_mcp_server PRIVATE Qt6::Core)
 
 add_executable(tst_stdio_transport tests/tst_stdio_transport.cpp)
 target_link_libraries(tst_stdio_transport PRIVATE synthforge_core Qt6::Test)
-target_compile_definitions(tst_stdio_transport PRIVATE
-    MOCK_SERVER_PATH="$<TARGET_FILE:mock_mcp_server>")
+# 不传路径宏：Windows 反斜杠在 C++ 字符串字面量里会被当成 \p、\b 等转义序列，
+# 测试改用 QCoreApplication::applicationDirPath() 定位同目录的 mock server
 add_dependencies(tst_stdio_transport mock_mcp_server)
 add_test(NAME tst_stdio_transport COMMAND tst_stdio_transport)
+set_tests_properties(tst_stdio_transport PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 ```
 
 Run: `cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH=<QT_KIT>`
@@ -1494,6 +1542,21 @@ git commit -m "feat: 默认桥接命令表与 MCP 冒烟 CLI（真实 Blender/Un
 #include "core/mcp/McpClient.h"
 #include "core/mcp/StdioTransport.h"
 
+namespace {
+
+// mock server 与测试 exe 同目录；不用 CMake 宏传路径，
+// 因为 Windows 反斜杠会被 C++ 当成 \p、\b 等转义序列。
+QString mockServerProgram()
+{
+#ifdef Q_OS_WIN
+    return QCoreApplication::applicationDirPath() + QStringLiteral("/mock_mcp_server.exe");
+#else
+    return QCoreApplication::applicationDirPath() + QStringLiteral("/mock_mcp_server");
+#endif
+}
+
+} // namespace
+
 class ReconnectTest : public QObject
 {
     Q_OBJECT
@@ -1501,7 +1564,7 @@ class ReconnectTest : public QObject
 private slots:
     void crashedBridgeIsRestartedAndRehandshaked()
     {
-        BridgeCommand command{QString::fromLocal8Bit(MOCK_SERVER_PATH), {},
+        BridgeCommand command{mockServerProgram(), {},
                               QProcessEnvironment::systemEnvironment()};
         StdioTransport transport(command);
         McpClient client(&transport);
@@ -1535,7 +1598,7 @@ private slots:
     void stalledBridgeIsDetectedByHeartbeat()
     {
         qputenv("MOCK_IGNORE_PING", "1"); // mock 收到 ping 不回复
-        BridgeCommand command{QString::fromLocal8Bit(MOCK_SERVER_PATH), {},
+        BridgeCommand command{mockServerProgram(), {},
                               QProcessEnvironment::systemEnvironment()};
         StdioTransport transport(command);
         McpClient client(&transport);
@@ -1855,10 +1918,11 @@ void StdioTransport::start()
 ```cmake
 add_executable(tst_reconnect tests/tst_reconnect.cpp)
 target_link_libraries(tst_reconnect PRIVATE synthforge_core Qt6::Test)
-target_compile_definitions(tst_reconnect PRIVATE
-    MOCK_SERVER_PATH="$<TARGET_FILE:mock_mcp_server>")
+# 同样不传路径宏：测试用 applicationDirPath() 定位同目录的 mock server
 add_dependencies(tst_reconnect mock_mcp_server)
 add_test(NAME tst_reconnect COMMAND tst_reconnect)
+set_tests_properties(tst_reconnect PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 ```
 
 Run: `cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH=<QT_KIT>`
