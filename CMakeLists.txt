@@ -13,6 +13,7 @@ add_library(synthforge_core STATIC
     src/core/mcp/McpTransport.h
     src/core/mcp/StdioTransport.cpp
     src/core/mcp/BridgeCommands.cpp
+    src/core/settings/SettingsStore.cpp
 )
 target_include_directories(synthforge_core PUBLIC src)
 target_link_libraries(synthforge_core PUBLIC Qt6::Core)
@@ -74,4 +75,10 @@ add_test(NAME tst_heartbeat_long COMMAND tst_heartbeat_long)
 set_tests_properties(tst_heartbeat_long PROPERTIES
     LABELS "slow"
     TIMEOUT 120
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_settings_store tests/tst_settings_store.cpp)
+target_link_libraries(tst_settings_store PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_settings_store COMMAND tst_settings_store)
+set_tests_properties(tst_settings_store PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
