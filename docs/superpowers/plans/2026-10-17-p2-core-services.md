@@ -20,6 +20,7 @@
 - 密钥明文仅存本机，`settings.get` 返回时不做脱敏（本机环回 + token 保护），`预览配置` 的脱敏由前端处理。
 - 所有 handler 抛 `std::runtime_error` 统一转错误帧，不得让异常穿透到 Qt 事件循环。
 - 任务取消为协作式：`TaskManager::isCancelled(taskId)` 轮询；取消必须发 `finished(cancelled=true)`。
+- LLM 上下文只带本区最近 20 条纯文本消息（`messagePage(area, 20)`，只取 role/content，不带 id/ts），超预算从最旧截断；绝不整表加载（规格 8.4 / 4.6）。
 
 ## File Structure
 
@@ -225,7 +226,8 @@ git commit -m "feat: settings.json 持久化与服务商默认值表"
 **Files:** Create `src/core/store/SessionStore.h/.cpp`、`tests/tst_session_store.cpp`；Modify `CMakeLists.txt`（追加 `Qt6::Sql`）。
 
 **Interfaces:**
-- `class SessionStore { explicit SessionStore(QString dbPath); bool open(); void appendMessage(area, role, content); QJsonArray messages(area) const; void saveDraft(area, content); QString draft(area) const; }`
+- `class SessionStore { explicit SessionStore(QString dbPath); bool open(); void appendMessage(area, role, content); QJsonArray messages(area) const /*全量，仅测试/迁移用*/; MessagePage messagePage(area, limit=20, beforeId=0) const; void saveDraft(area, content); QString draft(area) const; }`
+- `struct MessagePage { QJsonArray messages /*旧→新，含 id/role/content/ts*/; bool hasMore; qint64 nextCursor; }`；`limit<=0` 用默认 20，上限 100；`beforeId<=0` 取最新一页。
 - 表：`messages(id INTEGER PK AUTOINCREMENT, area TEXT, role TEXT, content TEXT, ts INTEGER)`；`drafts(area TEXT PRIMARY KEY, content TEXT, updated INTEGER)`。
 
 - [ ] **Step 1: 写失败测试**
@@ -371,7 +373,11 @@ QString SessionStore::draft(const QString& area) const
 - [ ] **Step 3: CMake + 测试**
 
 `find_package(Qt6 6.5 REQUIRED COMPONENTS Core Test Sql)`；core 源文件追加 `SessionStore.cpp`，链接追加 `Qt6::Sql`；加 `tst_session_store` target 同 Task 1 模板。
-Run 预期：2 用例 Passed。
+Run 预期：7 用例 Passed。
+
+第三个用例 `walModePersistedInFileHeader`：析构关闭连接后读 `sessions.db` 前 100 字节，断言偏移 18/19 均为 `2`（SQLite 文件头：2 = WAL，1 = 回滚日志）。已验证一次 RED-GREEN：注释掉 `PRAGMA journal_mode=WAL` 时 Actual=1、Expected=2 失败，恢复后 Passed。
+
+分页用例（4 个）：`pageReturnsLatestPageAscending`（45+5 条两区穿插，limit 20 只取本区最新 20 条、升序、nextCursor=本页最早 id）、`pageWalksBackwardsWithoutGaps`（连翻三页 20/20/5，拼回 m1..m45 无重复无缺口）、`pageClampsLimit`（limit=0→20，limit=1000→100 且 hasMore）、`emptyAreaReturnsEmptyPage`（空区 hasMore=false、nextCursor=0）。分页实现要点：`SELECT id,role,content,ts ... ORDER BY id DESC LIMIT ?`（取 `limit+1` 条探测 hasMore，多的一条丢弃），结果倒序反转成旧→新；`open()` 追加 `CREATE INDEX IF NOT EXISTS idx_messages_area_id ON messages(area, id)`。
 
 - [ ] **Step 4: Commit**（`feat: SQLite 会话存储（消息/草稿，WAL 模式）`）
 
@@ -983,6 +989,7 @@ Expected: `tst_sse_parser` 2 用例、`tst_tool_bridge` 2 用例，全部 Passed
 - `struct CoreOptions { QString dataDir; bool headless = false; }`
 - `class CoreApp : QObject { explicit CoreApp(CoreOptions, QObject* parent=nullptr); bool start(); WsServer* ws() const; }`
 - 注册 handler：`settings.get` / `settings.save` / `session.load` / `chat.send`（P2 版：落库 user 消息 → 发 `chat.message` 事件 → 若已配置 Agent 模型则经 LlmGateway 流式回 `chat.delta`，`[DONE]` 后落库 assistant 消息；未配置则 `error.card` 事件 `{"reason":"agent-not-configured"}`）。
+- `session.load` 参数 `{area, limit?, beforeId?}` → `result {messages:[{id,role,content,ts}...], hasMore, nextCursor}`，内部走 `SessionStore::messagePage`，默认 20 条/页；前端滚到顶部时带 `beforeId=nextCursor` 再拉一页。
 - CLI：`synthforge_cli --headless` → 以 `defaultDataDir()` 启动 CoreApp，stderr 打印 `READY ws=ws://127.0.0.1:<port>/?token=<token>`，进入事件循环。
 
 - [ ] **Step 1: 写失败的集成测试**
@@ -1044,7 +1051,11 @@ private slots:
         const QJsonObject sent = request("chat.send", {{"area", "blender"}, {"text", "hello"}});
         QVERIFY(sent.value("result").toObject().contains("accepted"));
         const QJsonObject loaded = request("session.load", {{"area", "blender"}});
-        QCOMPARE(loaded.value("result").toArray().size(), 1);
+        const QJsonObject page = loaded.value("result").toObject();
+        QCOMPARE(page.value("messages").toArray().size(), 1);
+        QCOMPARE(page.value("messages").toArray().first().toObject().value("role").toString(),
+                 QStringLiteral("user"));
+        QCOMPARE(page.value("hasMore").toBool(), false);
 
         const QJsonObject unknown = request("no.such.method", {});
         QVERIFY(unknown.contains("error"));
@@ -1119,7 +1130,13 @@ bool CoreApp::start()
         return QJsonValue(QJsonObject{{"ok", true}});
     });
     m_router->registerHandler("session.load", [this](const QJsonObject& params) {
-        return QJsonValue(m_sessions->messages(params.value("area").toString()));
+        const QString area = params.value("area").toString();
+        const int limit = params.value("limit").toInt(); // 0 → 默认 20
+        const qint64 beforeId = static_cast<qint64>(params.value("beforeId").toDouble());
+        const MessagePage page = m_sessions->messagePage(area, limit, beforeId);
+        return QJsonValue(QJsonObject{{"messages", page.messages},
+                                      {"hasMore", page.hasMore},
+                                      {"nextCursor", page.nextCursor}});
     });
     m_router->registerHandler("chat.send", [this](const QJsonObject& params) {
         const QString area = params.value("area").toString();
@@ -1140,7 +1157,13 @@ bool CoreApp::start()
         LlmConfig cfg{primary.value("baseUrl").toString(),
                       primary.value("apiKey").toString(),
                       primary.value("model").toString()};
-        const QJsonArray history = m_sessions->messages(area);
+        // 规格 8.4：只带本区最近 20 条纯文本历史（含刚落库的本次 user 消息）
+        QJsonArray history;
+        for (const QJsonValue& value : m_sessions->messagePage(area, 20).messages) {
+            const QJsonObject m = value.toObject();
+            history.append(QJsonObject{{"role", m.value("role")},
+                                       {"content", m.value("content")}});
+        }
 
         m_tasks->enqueue(Task{QStringLiteral("chat-%1").arg(++m_seq), area, QString(),
                               [=](const QString& taskId, TaskManager* tm) {
@@ -1209,15 +1232,15 @@ Expected: 全部测试 Passed（含 settings/session 往返、未知 method 错�
 ### Task 7: 会话持久化扩展与协议补全（chat.clear / chat.retry / bridge.restart）
 
 **Files:**
-- Modify: `src/core/store/SessionStore.h/.cpp`（补 tasks / assets 表、recentMessages、clearMessages）
-- Modify: `src/core/coreapp/CoreApp.h/.cpp`（新增 3 个 handler、历史裁剪、每任务独立流缓冲）
-- Modify: `tests/tst_session_store.cpp`（追加 3 用例）
+- Modify: `src/core/store/SessionStore.h/.cpp`（补 tasks / assets 表、clearMessages；上下文复用已有 messagePage，不再新增 recentMessages）
+- Modify: `src/core/coreapp/CoreApp.h/.cpp`（新增 3 个 handler、20 条上下文组装、每任务独立流缓冲）
+- Modify: `tests/tst_session_store.cpp`（追加 2 用例）
 - Modify: `tests/tst_headless_ws.cpp`（追加 retry/clear 用例）
 
 **Interfaces:**
 - Consumes: `SessionStore`（Task 2）、`TaskManager`（Task 3）、`CoreApp`（Task 6）。
 - Produces:
-  - `SessionStore::recentMessages(area, limit)` — 最近 N 条（时间升序），供 LLM 上下文组装（规格 4.6）。
+  - LLM 上下文复用 Task 2 的 `messagePage(area, 20)`（取 `.messages` 后只保留 role/content），不再单独新增 `recentMessages`；分页与上下文裁剪共用同一查询。
   - `SessionStore::clearMessages(area)`、`SessionStore::upsertTask / tasks / upsertAsset / assets` — 对应规格 7.2 的「任务记录、资产卡引用」。
   - `CoreApp::registerBridge(area, std::function<bool()> restartFn)` — 由 P4（blender）/ P6（unity）注入桥接重启回调；未注册时 `bridge.restart` 返回 `bridge-not-registered`。
   - 协议：`chat.cancel {area}`（只取消本区运行中/排队任务，保留消息与重试缓存；实现为 `TaskManager::cancelArea`）、`chat.clear {area}`（取消本区任务 + 清空本区消息 + 清掉重试缓存）、`chat.retry {area}`（重走最近一次 `chat.send` 参数，不重复落库 user 消息）。
@@ -1228,22 +1251,6 @@ Expected: 全部测试 Passed（含 settings/session 往返、未知 method 错�
 在 `tests/tst_session_store.cpp` 的 `private slots:` 中追加：
 
 ```cpp
-    void recentMessagesCapsAtLimit()
-    {
-        QTemporaryDir dir;
-        SessionStore store(dir.path() + "/sessions.db");
-        QVERIFY(store.open());
-        for (int i = 0; i < 30; ++i)
-            store.appendMessage("blender", "user", QStringLiteral("m%1").arg(i));
-
-        const QJsonArray recent = store.recentMessages("blender", 20);
-        QCOMPARE(recent.size(), 20);
-        QCOMPARE(recent.first().toObject().value("content").toString(),
-                 QStringLiteral("m10"));
-        QCOMPARE(recent.last().toObject().value("content").toString(),
-                 QStringLiteral("m29"));
-    }
-
     void clearMessagesKeepsOtherArea()
     {
         QTemporaryDir dir;
@@ -1292,14 +1299,26 @@ Expected: 全部测试 Passed（含 settings/session 往返、未知 method 错�
 #include <QSqlDatabase>
 #include <QString>
 
+struct MessagePage
+{
+    QJsonArray messages;   // 旧→新，每项含 id / role / content / ts
+    bool hasMore = false;
+    qint64 nextCursor = 0;
+};
+
 class SessionStore
 {
 public:
     explicit SessionStore(QString dbPath);
+    ~SessionStore();
+
+    SessionStore(const SessionStore&) = delete;
+    SessionStore& operator=(const SessionStore&) = delete;
+
     bool open(); // 建表 + PRAGMA journal_mode=WAL
     void appendMessage(const QString& area, const QString& role, const QString& content);
-    QJsonArray messages(const QString& area) const;
-    QJsonArray recentMessages(const QString& area, int limit) const; // 最近 N 条，时间升序
+    QJsonArray messages(const QString& area) const; // 全量，仅测试/迁移用
+    MessagePage messagePage(const QString& area, int limit = 20, qint64 beforeId = 0) const;
     void clearMessages(const QString& area);
     void saveDraft(const QString& area, const QString& content);
     QString draft(const QString& area) const;
@@ -1313,6 +1332,7 @@ public:
 
 private:
     QString m_path;
+    QString m_connectionName;
     QSqlDatabase m_db;
 };
 ```
@@ -1332,20 +1352,6 @@ private:
 文件末尾追加方法实现（新增 `#include <QJsonDocument>`）：
 
 ```cpp
-QJsonArray SessionStore::recentMessages(const QString& area, int limit) const
-{
-    QJsonArray out;
-    QSqlQuery q(m_db);
-    q.prepare("SELECT role, content FROM messages WHERE area=? ORDER BY id DESC LIMIT ?");
-    q.addBindValue(area);
-    q.addBindValue(limit);
-    q.exec();
-    while (q.next())
-        out.prepend(QJsonObject{{"role", q.value(0).toString()},
-                                {"content", q.value(1).toString()}});
-    return out;
-}
-
 void SessionStore::clearMessages(const QString& area)
 {
     QSqlQuery q(m_db);
@@ -1516,7 +1522,13 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
     LlmConfig cfg{primary.value("baseUrl").toString(),
                   primary.value("apiKey").toString(),
                   primary.value("model").toString()};
-    const QJsonArray history = m_sessions->recentMessages(area, 20); // 规格 4.6
+    // 规格 8.4：只带本区最近 20 条纯文本历史（含刚落库的本次 user 消息）
+    QJsonArray history;
+    for (const QJsonValue& value : m_sessions->messagePage(area, 20).messages) {
+        const QJsonObject m = value.toObject();
+        history.append(QJsonObject{{"role", m.value("role")},
+                                   {"content", m.value("content")}});
+    }
     const QString taskId = QStringLiteral("chat-%1").arg(++m_seq);
 
     m_tasks->enqueue(Task{taskId, area, QString(),
@@ -1613,7 +1625,7 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         QVERIFY(retried.value("result").toObject().value("accepted").toBool());
         QVERIFY(retried.value("result").toObject().value("taskId").toString() != firstTask);
         QCOMPARE(request("session.load", {{"area", "blender"}})
-                     .value("result").toArray().size(),
+                     .value("result").toObject().value("messages").toArray().size(),
                  1);
 
         // 清空：本区消息归零，且原始任务被取消
@@ -1621,7 +1633,7 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
                      .value("result").toObject().value("ok").toBool(),
                  true);
         QCOMPARE(request("session.load", {{"area", "blender"}})
-                     .value("result").toArray().size(),
+                     .value("result").toObject().value("messages").toArray().size(),
                  0);
 
         socket.close();
@@ -1634,7 +1646,7 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
 
 Run: `cmake --build build --config Debug`
 Run: `ctest --test-dir build -C Debug --output-on-failure`
-Expected: `tst_session_store` 5 用例 + `tst_headless_ws` 2 用例全部 Passed。
+Expected: `tst_session_store` 全部用例（含分页）+ `tst_headless_ws` 2 用例全部 Passed。
 
 - [ ] **Step 6: Commit**
 
@@ -1650,6 +1662,8 @@ git commit -m "feat: 会话持久化补全（历史裁剪/清空/任务与资产
 - [ ] `qa` 全绿：新增 5 个测试可执行全部通过
 - [ ] `synthforge_cli --headless` 启动后输出 `READY ws=...`，浏览器可用 wscat/DevTools 完成 settings.save → settings.get 往返
 - [ ] `sessions.db` 生成于数据目录且为 WAL 模式；重启后消息仍在
+- [ ] `session.load` 支持游标分页：默认 20 条/页，返回 `{messages,hasMore,nextCursor}`；`beforeId` 连续翻页无重复无缺口（`tst_session_store` 4 个分页用例覆盖）
+- [ ] `chat.send` 组装 LLM 上下文只取本区最近 20 条纯文本（role/content），不整表加载、不带 id/ts；长对话不会随时间无限膨胀（规格 8.4）
 - [ ] 未配置 Agent 密钥时 `chat.send` 触发 `error.card`（不崩溃、不调用 LLM）
 - [ ] `chat.cancel` / `chat.clear` 取消任务后 `finished(cancelled=true)` 事件可观测（消息不被清空的是 `chat.cancel`）
 - [ ] `chat.clear` 清空本区消息且不影响另一区；`chat.retry` 在无目标时返回 `no-task-to-retry`，有目标时以相同参数重新提交且不重复落库 user 消息

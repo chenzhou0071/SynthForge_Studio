@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Test)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Test Sql)
 
 add_library(synthforge_core STATIC
     src/core/mcp/JsonRpcLineCodec.cpp
@@ -14,9 +14,10 @@ add_library(synthforge_core STATIC
     src/core/mcp/StdioTransport.cpp
     src/core/mcp/BridgeCommands.cpp
     src/core/settings/SettingsStore.cpp
+    src/core/store/SessionStore.cpp
 )
 target_include_directories(synthforge_core PUBLIC src)
-target_link_libraries(synthforge_core PUBLIC Qt6::Core)
+target_link_libraries(synthforge_core PUBLIC Qt6::Core Qt6::Sql)
 
 enable_testing()
 
@@ -81,4 +82,10 @@ add_executable(tst_settings_store tests/tst_settings_store.cpp)
 target_link_libraries(tst_settings_store PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_settings_store COMMAND tst_settings_store)
 set_tests_properties(tst_settings_store PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_session_store tests/tst_session_store.cpp)
+target_link_libraries(tst_session_store PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_session_store COMMAND tst_session_store)
+set_tests_properties(tst_session_store PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")

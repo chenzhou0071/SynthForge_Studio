@@ -1,0 +1,35 @@
+#pragma once
+
+#include <QJsonArray>
+#include <QSqlDatabase>
+#include <QString>
+
+struct MessagePage
+{
+    QJsonArray messages;   // 旧→新，每项含 id / role / content / ts
+    bool hasMore = false;  // 是否还有更早的
+    qint64 nextCursor = 0; // 本页最早一条的 id，下一页 beforeId 传它
+};
+
+class SessionStore
+{
+public:
+    explicit SessionStore(QString dbPath);
+    ~SessionStore();
+
+    SessionStore(const SessionStore&) = delete;
+    SessionStore& operator=(const SessionStore&) = delete;
+
+    bool open(); // 建表 + PRAGMA journal_mode=WAL
+    void appendMessage(const QString& area, const QString& role, const QString& content);
+    QJsonArray messages(const QString& area) const; // 全量，仅测试/迁移用
+    // 游标分页：beforeId <= 0 取最新一页；limit <= 0 用默认 20，上限 100
+    MessagePage messagePage(const QString& area, int limit = 20, qint64 beforeId = 0) const;
+    void saveDraft(const QString& area, const QString& content);
+    QString draft(const QString& area) const;
+
+private:
+    QString m_path;
+    QString m_connectionName; // 每个实例独立连接名，避免同进程多实例互相顶掉
+    QSqlDatabase m_db;
+};
