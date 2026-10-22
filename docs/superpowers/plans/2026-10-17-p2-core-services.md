@@ -461,25 +461,26 @@ QTEST_MAIN(TaskManagerTest)
 #include <QHash>
 #include <QObject>
 #include <QQueue>
-#include <QString>
-#include <QStringList>
 #include <QSet>
+#include <QString>
 #include <functional>
-#include <memory>
+
+class TaskManager;
+
+// 顶层结构：测试与 CoreApp 直接写 Task{...}，不必带 TaskManager:: 前缀
+struct Task
+{
+    QString id;
+    QString area;      // "blender" | "unity"
+    QString projectId; // unity 区绑定工程，可空
+    std::function<void(const QString& taskId, TaskManager*)> run;
+};
 
 class TaskManager : public QObject
 {
     Q_OBJECT
 
 public:
-    struct Task
-    {
-        QString id;
-        QString area;      // "blender" | "unity"
-        QString projectId; // unity 区绑定工程，可空
-        std::function<void(const QString& taskId, TaskManager*)> run;
-    };
-
     void enqueue(Task task);
     void finish(const QString& taskId);
     void cancelArea(const QString& area);
@@ -529,13 +530,17 @@ void TaskManager::pump(const QString& area)
 
 void TaskManager::finish(const QString& taskId)
 {
-    const Task task = m_tasks.take(taskId);
+    auto it = m_tasks.find(taskId);
+    if (it == m_tasks.end())
+        return; // 重复 finish / 未知 id：忽略，避免重复信号
+    const Task task = it.value();
+    m_tasks.erase(it);
+
     const bool cancelled = m_cancelled.remove(taskId);
-    const QString area = task.area;
-    if (m_running.value(area) == taskId)
-        m_running.remove(area);
+    if (m_running.value(task.area) == taskId)
+        m_running.remove(task.area);
     emit finished(taskId, cancelled);
-    pump(area);
+    pump(task.area);
 }
 
 void TaskManager::cancelArea(const QString& area)
@@ -568,8 +573,10 @@ void TaskManager::cancelProject(const QString& projectId)
 ```
 
 > 注：`m_cancelled` 存 taskId，`cancelArea` 只标记当前运行中任务并直接结束排队任务；同区后续新任务不会被历史取消误伤。`cancelProject` 先收集 area 再逐个取消，避免遍历 `m_tasks` 时被 `remove` 导致迭代器失效。
+>
+> 实际测试 5 个用例（在计划 3 个之外补了两个边界）：`cancellingRunningTaskReportsCancelledOnFinish`（取消运行中任务后，迟到的 `finish` 必须以 `cancelled=true` 上报）、`duplicateFinishIsIgnored`（重复/未知 `finish` 不再发信号，靠 `finish()` 里的 `m_tasks.find` 保护）。
 
-- [ ] **Step 3: CMake + 测试**（target 模板同前；预期 3 用例 Passed）
+- [ ] **Step 3: CMake + 测试**（target 模板同前；预期 5 用例 Passed）
 
 - [ ] **Step 4: Commit**（`feat: 每区串行任务管理器与协作式取消`）
 

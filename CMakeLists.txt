@@ -15,6 +15,7 @@ add_library(synthforge_core STATIC
     src/core/mcp/BridgeCommands.cpp
     src/core/settings/SettingsStore.cpp
     src/core/store/SessionStore.cpp
+    src/core/tasks/TaskManager.cpp
 )
 target_include_directories(synthforge_core PUBLIC src)
 target_link_libraries(synthforge_core PUBLIC Qt6::Core Qt6::Sql)
@@ -88,4 +89,10 @@ add_executable(tst_session_store tests/tst_session_store.cpp)
 target_link_libraries(tst_session_store PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_session_store COMMAND tst_session_store)
 set_tests_properties(tst_session_store PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_task_manager tests/tst_task_manager.cpp)
+target_link_libraries(tst_task_manager PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_task_manager COMMAND tst_task_manager)
+set_tests_properties(tst_task_manager PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
