@@ -584,19 +584,21 @@ void TaskManager::cancelProject(const QString& projectId)
 
 ### Task 4: ProtocolRouter + WsServer
 
-**Files:** Create `src/core/ws/ProtocolRouter.h/.cpp`、`src/core/ws/WsServer.h/.cpp`；Modify `CMakeLists.txt`（追加 `Qt6::WebSockets`）。
+**Files:** Create `src/core/ws/ProtocolRouter.h/.cpp`、`src/core/ws/WsServer.h/.cpp`、`tests/tst_protocol_router.cpp`；Modify `CMakeLists.txt`（追加 `Qt6::WebSockets`）。
 
 **Interfaces:**
-- `class ProtocolRouter { using Handler = std::function<QJsonObject(const QJsonObject&)>; void registerHandler(method, Handler); QJsonValue dispatch(method, params) /*返回 result；抛 std::runtime_error 转错误帧*/ }`（`QJsonValue` 以便返回数组）
+- `class ProtocolRouter { using Handler = std::function<QJsonValue(const QJsonObject&)>; void registerHandler(method, Handler); QJsonValue dispatch(method, params) /*返回 result；抛 std::runtime_error 转错误帧*/ }`（`QJsonValue` 以便返回数组）
 - `class WsServer : QObject { bool listen(quint16 port = 0); quint16 port() const; QString token() const; void broadcastEvent(event, data) const; }`
 
-- [ ] **Step 1: 实现（本任务以集成测试 Task 6 覆盖，不单独写单测；ws 帧逻辑抽纯函数便于 P3 前端对拍）**
+- [ ] **Step 1: ProtocolRouter 先写 3 个单测（注册/分发、未知方法抛异常、返回数组），WsServer 的握手与帧逻辑由 Task 6 集成测试覆盖**
 
 `WsServer.h`：
 
 ```cpp
 #pragma once
 
+#include <QJsonObject>
+#include <QJsonValue>
 #include <QList>
 #include <QObject>
 #include <QString>
@@ -619,6 +621,8 @@ public:
 private:
     void onNewConnection();
     void onTextMessage(QWebSocket* socket, const QString& text);
+    void sendError(QWebSocket* socket, const QJsonValue& id, int code,
+                   const QString& message) const;
 
     QWebSocketServer m_server;
     ProtocolRouter* m_router;
@@ -649,7 +653,10 @@ bool WsServer::listen(quint16 port)
 void WsServer::onNewConnection()
 {
     while (QWebSocket* socket = m_server.nextPendingConnection()) {
-        if (socket->requestUrl().query(QUrl::FullyEncoded) != "token=" + m_token) {
+        socket->setParent(this);
+        const QString presented = QUrlQuery(socket->requestUrl()).queryItemValue(
+            QStringLiteral("token"), QUrl::FullyDecoded);
+        if (presented != m_token) {
             socket->close(QWebSocketProtocol::CloseCodePolicyViolated,
                           QStringLiteral("bad token"));
             socket->deleteLater();
@@ -667,7 +674,14 @@ void WsServer::onNewConnection()
 
 void WsServer::onTextMessage(QWebSocket* socket, const QString& text)
 {
-    const QJsonObject frame = QJsonDocument::fromJson(text.toUtf8()).object();
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(text.toUtf8(), &parseError);
+    if (!doc.isObject()) {
+        sendError(socket, QJsonValue(), -32700, QStringLiteral("parse error"));
+        return;
+    }
+
+    const QJsonObject frame = doc.object();
     const QJsonValue id = frame.value("id");
     const QString method = frame.value("method").toString();
     try {
@@ -676,12 +690,18 @@ void WsServer::onTextMessage(QWebSocket* socket, const QString& text)
             QJsonDocument(QJsonObject{{"id", id}, {"result", result}})
                 .toJson(QJsonDocument::Compact)));
     } catch (const std::exception& e) {
-        socket->sendTextMessage(QString::fromUtf8(
-            QJsonDocument(QJsonObject{{"id", id},
-                                      {"error", QJsonObject{{"code", -32000},
-                                                            {"message", QString::fromUtf8(e.what())}}}})
-                .toJson(QJsonDocument::Compact)));
+        sendError(socket, id, -32000, QString::fromUtf8(e.what()));
     }
+}
+
+void WsServer::sendError(QWebSocket* socket, const QJsonValue& id, int code,
+                         const QString& message) const
+{
+    socket->sendTextMessage(QString::fromUtf8(
+        QJsonDocument(QJsonObject{{"id", id},
+                                  {"error", QJsonObject{{"code", code},
+                                                        {"message", message}}}})
+            .toJson(QJsonDocument::Compact)));
 }
 
 void WsServer::broadcastEvent(const QString& event, const QJsonObject& data) const
@@ -696,10 +716,12 @@ void WsServer::broadcastEvent(const QString& event, const QJsonObject& data) con
 
 `ProtocolRouter` 实现（10 行）：查找 handler；未注册抛 `std::runtime_error("unknown method: ...")`。
 
-- [ ] **Step 2: 构建（无独立测试，Task 6 覆盖）**
+> 实现差异：token 用 `QUrlQuery(requestUrl()).queryItemValue("token")` 读取，比计划里直接拼 `"token=" + token` 更能容忍额外 query 参数；非法 JSON 回 `-32700`，业务异常回 `-32000`；错误帧统一走 `sendError()` 辅助函数。
 
-Run: `cmake --build build --config Debug`
-Expected: 编译通过。
+- [ ] **Step 2: 构建 + ProtocolRouter 单测**
+
+Run: `cmake --build build --config Debug; ctest --test-dir build -C Debug -R tst_protocol_router --output-on-failure`
+Expected: 编译通过，3 用例 Passed（WsServer 由 Task 6 集成测试覆盖）。
 
 - [ ] **Step 3: Commit**（`feat: WebSocket 服务端（token 握手 + 请求分发 + 事件广播）`）
 
