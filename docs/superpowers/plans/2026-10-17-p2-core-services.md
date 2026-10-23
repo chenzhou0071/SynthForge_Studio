@@ -987,20 +987,30 @@ void LlmGateway::chatStream(const LlmConfig& cfg, const QJsonArray& messages,
 }
 ```
 
-> 实现注意：`QHash<int, QJsonObject>` 迭代顺序无保证，tool_calls 元素需带 `index` 字段供上游排序；上述代码在 `slot.insert("index", idx)` 时补充。若服务端未返回 `id`，用 `call_<index>` 兜底，保证 assistant / tool 消息的 `tool_call_id` 可配对；`arguments` 解析失败按空对象处理，避免整轮任务失败。`abort()` 即 `m_reply->abort()`。
+> 实现注意：`QHash<int, QJsonObject>` 迭代顺序无保证，tool_calls 元素需带 `index` 字段供上游排序（实际实现按 index 升序输出）；若服务端未返回 `id`，用 `call_<index>` 兜底，保证 assistant / tool 消息的 `tool_call_id` 可配对；`arguments` 解析失败按空对象处理，避免整轮任务失败。
+>
+> 实际实现与计划代码的差异（均已验证编译+单测）：
+> - 并发流：用 `QSet<QNetworkReply*> m_replies` 替代单个 `m_reply`，两区同时对话互不覆盖；`abort()` 中止全部在途流，每个流走 `onError`。
+> - 尾帧兜底：`finished` 时若未收到 `[DONE]`，先 `feed("\n\n")` 冲出最后一个半帧，再 `finishStream()` 调 `onDone`，避免任务永久卡在运行中。
+> - 只上报一次失败：`finished` 里若 `done` 已置位（[DONE] 已到），不再因后续网络错误调 `onError`。
+> - 空 `choices` 的 usage 尾帧跳过；`[DONE]` 只触发一次 `onDone`。
 
 - [ ] **Step 3: CMake + 测试**
 
-core 源文件追加 `src/core/llm/SseParser.cpp`、`src/core/llm/LlmGateway.cpp`、`src/core/llm/ToolBridge.cpp`；追加两个 target：
+core 源文件追加 `src/core/llm/SseParser.cpp`、`src/core/llm/LlmGateway.cpp`、`src/core/llm/ToolBridge.cpp`；`find_package` 与 `synthforge_core` 追加 `Qt6::Network`；追加两个 target（沿用 PATH 注入，否则直接运行 exe 会缺 Qt DLL）：
 
 ```cmake
 add_executable(tst_sse_parser tests/tst_sse_parser.cpp)
 target_link_libraries(tst_sse_parser PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_sse_parser COMMAND tst_sse_parser)
+set_tests_properties(tst_sse_parser PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
 add_executable(tst_tool_bridge tests/tst_tool_bridge.cpp)
 target_link_libraries(tst_tool_bridge PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_tool_bridge COMMAND tst_tool_bridge)
+set_tests_properties(tst_tool_bridge PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 ```
 
 Run: `ctest --test-dir build -C Debug -R "tst_sse_parser|tst_tool_bridge" --output-on-failure`

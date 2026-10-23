@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Test Sql WebSockets)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Test Sql WebSockets Network)
 
 add_library(synthforge_core STATIC
     src/core/mcp/JsonRpcLineCodec.cpp
@@ -18,9 +18,12 @@ add_library(synthforge_core STATIC
     src/core/tasks/TaskManager.cpp
     src/core/ws/ProtocolRouter.cpp
     src/core/ws/WsServer.cpp
+    src/core/llm/SseParser.cpp
+    src/core/llm/ToolBridge.cpp
+    src/core/llm/LlmGateway.cpp
 )
 target_include_directories(synthforge_core PUBLIC src)
-target_link_libraries(synthforge_core PUBLIC Qt6::Core Qt6::Sql Qt6::WebSockets)
+target_link_libraries(synthforge_core PUBLIC Qt6::Core Qt6::Sql Qt6::WebSockets Qt6::Network)
 
 enable_testing()
 
@@ -103,4 +106,16 @@ add_executable(tst_protocol_router tests/tst_protocol_router.cpp)
 target_link_libraries(tst_protocol_router PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_protocol_router COMMAND tst_protocol_router)
 set_tests_properties(tst_protocol_router PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_sse_parser tests/tst_sse_parser.cpp)
+target_link_libraries(tst_sse_parser PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_sse_parser COMMAND tst_sse_parser)
+set_tests_properties(tst_sse_parser PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_tool_bridge tests/tst_tool_bridge.cpp)
+target_link_libraries(tst_tool_bridge PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_tool_bridge COMMAND tst_tool_bridge)
+set_tests_properties(tst_tool_bridge PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
