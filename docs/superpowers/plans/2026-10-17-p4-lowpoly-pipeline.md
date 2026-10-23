@@ -20,6 +20,7 @@
 - 落盘后 GLB 与 .blend 一并保留；命名遵循草稿中的英文命名清单。
 - **低模新资产走 Planner→Executor**：草稿发送后先规划、计划确认后才选存放位置并执行；解析失败降级默认四分组，不阻塞。修改已有资产不经过规划。
 - 步数预算按计划动态计算：`maxSteps = min(8 × 组数 + 10, 60)`。
+- **LLM 测试必须走真实 HTTP + SSE**：禁止 `class Xxx : public LlmGateway` 重写 `chatStream` 来造 mock，也不允许把 `chatStream` 改成可注入回调来绕过网络。所有 LLM 相关测试一律让真实 `chatStream` 发出 `POST /chat/completions`，由 `MockLlmServer`（`QTcpServer` 假服务端）在 TCP 上回真实的 chunked SSE 字节。判据：删掉 `LlmGateway.cpp` 里 `readyRead` / `finished` 任一分支，测试必须变红；若仍绿，说明断言盯错了对象。
 
 ## File Structure
 
@@ -37,10 +38,12 @@ web/src/components/ChatPanel.vue             ← Modify：draft/plan 消息卡 +
 web/src/components/FolderPicker.vue          ← 存放位置确认弹窗
 web/src/components/PreviewPane.vue           ← three.js GLB 预览（升级 Task 5）
 tests/tst_preflight.cpp
+tests/mock/MockLlmServer.h/.cpp              ← 本地假 LLM 服务端（HTTP/1.1 chunked SSE，Task 1B）
+tests/tst_llm_gateway.cpp                    ← 流式专项：delta 顺序/工具分片/尾帧/错误/并发/abort（Task 1B）
 tests/tst_mcp_runtime.cpp                    ← mock server 握手/工具缓存/重启
 tests/tst_blender_gate.cpp                   ← 门禁获取/拒绝抢占/非 owner 释放无效
 tests/tst_asset_library.cpp                  ← 资产库文件操作与越界校验
-tests/tst_orchestrator.cpp                   ← mock MCP + mock LLM 集成
+tests/tst_orchestrator.cpp                   ← mock MCP + 本地假 LLM（真实 HTTP+SSE）集成
 ```
 
 ---
@@ -409,6 +412,465 @@ if (mode == "lowpoly" || mode == "cloud3d" || mode == "modify") {
 
 ---
 
+### Task 1B: LlmGateway 流式专项测试（真实 HTTP + SSE）
+
+> **为何单独成任务**：P2 Task 6 的 `tst_headless_ws` 只验证「门开了、话能通、库能写」，`chat.send` 走的是未配置分支，从未触达 `LlmGateway` 的网络与聚合代码；P2 Task 5 只测了 `SseParser` 的拆帧。本任务把流式那 150 行真正跑起来，并把 `MockLlmServer` 做成后续 Task 2 / Task 3 共用的测试基础设施。
+>
+> **硬约束（不可协商）**：
+> - **禁止** `class Xxx : public LlmGateway` 重写 `chatStream` 造 mock；也**禁止**把 `chatStream` 改成可注入回调 / 模板参数来绕过网络。测试必须让真实的 `chatStream` 发出 `POST /chat/completions`，由 `MockLlmServer` 在 TCP 上回 chunked SSE 字节。
+> - 有效性的唯一判据：**删掉 `LlmGateway.cpp` 的 `readyRead` 或 `finished` 分支，本文件的用例必须变红**。若删了还绿，说明断言测的是假对象，重写用例。
+> - 用例断言的是**客户端行为**（回调次数/顺序/内容），不锁死错误文案、不依赖真实 API Key、不访问外网。
+
+**Files:**
+- Create: `tests/mock/MockLlmServer.h/.cpp`（`QTcpServer` 假 LLM 服务端，不是 `LlmGateway` 子类）
+- Create: `tests/tst_llm_gateway.cpp`
+- Modify: `CMakeLists.txt`（新增 `tst_llm_gateway` target，`tests` 加入 include 目录）
+- Modify: `src/core/llm/LlmGateway.h`（删掉 `chatStream` 的 `virtual`，让子类 mock 在编译期就不可能）
+
+**Interfaces:**
+
+```cpp
+namespace MockLlm {
+// 构造 OpenAI 流式 wire format 的 SSE 帧（只造字节，不参与解析）
+QByteArray textChunk(const QString& text);        // choices[0].delta.content
+QByteArray toolCallStartChunk(int index, const QString& id,
+                              const QString& name, const QString& argsFragment);
+QByteArray toolArgsChunk(int index, const QString& argsFragment); // 只带 index + arguments 续片
+QByteArray toolCallChunk(const QString& name, const QString& args = "{}"); // 单帧完整调用
+QByteArray doneChunk();                           // "data: [DONE]\n\n"
+} // namespace MockLlm
+
+class MockLlmServer : public QObject
+{
+    Q_OBJECT
+public:
+    struct Turn
+    {
+        QList<QByteArray> frames;      // 每个元素是一整帧（可带也可不带结尾空行）
+        int splitEvery = 3;            // 每帧再切成 N 字节一片经 TCP 发送；0 = 整帧
+        int frameDelayMs = 2;          // 片与片之间延迟，确保 readyRead 分多次到达
+        int status = 200;              // != 200：回错误 JSON，不发 SSE
+        QByteArray errorBody = R"({"error":{"message":"mock error"}})";
+        bool stallAfterFrames = false; // 发完 frames 保持连接（abort 用例）
+    };
+
+    explicit MockLlmServer(QList<Turn> script, QObject* parent = nullptr);
+    bool listen();                     // 127.0.0.1，端口 0 由系统分配
+    QString baseUrl() const;           // "http://127.0.0.1:<port>/v1"（不带尾斜杠）
+    LlmConfig config(const QString& model = "test-model") const;
+                                       // {baseUrl(), "test-key", model}，直接喂 setModelConfig
+    int requestCount() const;
+    QString pathAt(int index) const;              // 断言 "/v1/chat/completions"
+    QByteArray authorizationAt(int index) const;  // 断言 "Bearer test-key"
+    QString requestAt(int index) const;           // compact JSON 文本（.contains 断注入内容）
+    QJsonObject requestObjectAt(int index) const; // 需要按字段断言时用
+};
+```
+
+- Consumes：P2 `LlmGateway`（`chatStream` / `StreamHandlers` / `LlmConfig`）、`SseParser`。
+- Produces：`MockLlmServer` + `textChunk` / `toolCallChunk` 等构造器，供 Task 2（草稿流）与 Task 3（规划/执行状态机）复用。
+
+**用例清单（7 个，全部写在 `tst_llm_gateway.cpp`）**
+
+| # | 用例 | 假服务端造的场景 | 断言（盯的是生产代码哪一段） |
+|---|---|---|---|
+| 1 | `emitsDeltasInOrderThenDone` | 两帧文本 + `[DONE]`，每帧再切 5 字节一片 | `onDelta` 恰好两次且顺序为 好→的；`onDone` 恰好 1；`onError` 0；请求体 `stream==true`、`model`、`Authorization`、路径全对（`LlmGateway` 71-129） |
+| 2 | `mergesToolCallFragmentsByIndex` | 两个 tool_call，index 1 先到、index 0 后到；`arguments` 各拆两段 | `onToolCalls` 只回调 1 次、2 个调用、按 index 升序、`arguments` 已解析成对象、`id` 保留；`onDelta` 为空（108-123 聚合 + 33-52 收口） |
+| 3 | `completesWhenFinalFrameHasNoBlankLine` | 最后一帧不带 `\n\n`，随后 chunked 正常结束 | delta 收到、`onDone` 1；覆盖 `finished` 里补 `feed("\n\n")` 的兜底（136-140），否则任务会永远卡在运行中 |
+| 4 | `reportsErrorOnceOnHttpError` | 401 + JSON 错误体，不发任何 SSE | `onError` 1、`onDone` 0、`onDelta` 0；只发 1 次请求（不自动重试）（133-135） |
+| 5 | `reportsErrorWhenConnectionRefused` | 先 `listen` 拿端口再 `close`，保证端口无人监听 | `onError` 1、`onDone` 0；不锁错误文案（`QNetworkReply` 错误分支） |
+| 6 | `keepsConcurrentStreamsSeparate` | 两个服务端用不同 `frameDelayMs` 交替到帧，共用一个 gateway | 两条流各自 delta 不串字、顺序不乱，各自 `onDone` 1（`m_replies` 与 per-reply `StreamState`） |
+| 7 | `abortEndsInFlightStreamsOnce` | 发一帧后 `stallAfterFrames` 挂住不结束 | `abort()` 后该流 `onError` 1、`onDone` 0；重复 `abort()` 不再回调（145-150，`chat.cancel` 依赖此语义） |
+
+- [ ] **Step 1: 写失败测试（红）**
+
+```cpp
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QTcpServer>
+#include <QtTest>
+
+#include "core/llm/LlmGateway.h"
+#include "mock/MockLlmServer.h"
+
+using namespace MockLlm;
+
+// 约束：本文件禁止出现 `class Xxx : public LlmGateway`，也不允许回调注入绕过网络。
+// 每个用例都必须让真实 chatStream 发出 POST /v1/chat/completions，
+// 由 MockLlmServer 在 TCP 上回 chunked SSE。
+// 有效性判据：删掉 LlmGateway.cpp 的 readyRead/finished 任一分支，这里必须变红。
+class LlmGatewayTest : public QObject
+{
+    Q_OBJECT
+
+private:
+    struct Recorder
+    {
+        QStringList deltas;
+        QJsonArray toolCalls;
+        QStringList errors;
+        int done = 0;
+
+        LlmGateway::StreamHandlers handlers()
+        {
+            return {.onDelta = [this](const QString& d) { deltas << d; },
+                    .onToolCalls = [this](const QJsonArray& calls) { toolCalls = calls; },
+                    .onError = [this](const QString& e) { errors << e; },
+                    .onDone = [this]() { ++done; }};
+        }
+    };
+
+    static QJsonArray userMessages(const QString& text)
+    {
+        return QJsonArray{QJsonObject{{"role", "user"}, {"content", text}}};
+    }
+
+private slots:
+    void emitsDeltasInOrderThenDone()
+    {
+        MockLlmServer server({Turn{.frames = {textChunk("好"), textChunk("的"), doneChunk()},
+                                   .splitEvery = 5}}); // 切点故意落在 data:/JSON/UTF-8 中间
+        QVERIFY(server.listen());
+
+        LlmGateway gateway;
+        Recorder rec;
+        gateway.chatStream(server.config(), userMessages("你好"), {}, rec.handlers());
+
+        QTRY_VERIFY_WITH_TIMEOUT(rec.done == 1, 5000);
+        QCOMPARE(rec.deltas, (QStringList{"好", "的"})); // 不能少、不能并成一次、不能反序
+        QVERIFY(rec.errors.isEmpty());
+        QCOMPARE(server.pathAt(0), QStringLiteral("/v1/chat/completions")); // baseUrl 尾斜杠已裁掉
+        QCOMPARE(server.authorizationAt(0), QByteArray("Bearer test-key"));
+        const QJsonObject body = server.requestObjectAt(0);
+        QCOMPARE(body.value("stream").toBool(), true);
+        QCOMPARE(body.value("model").toString(), QStringLiteral("test-model"));
+    }
+
+    void mergesToolCallFragmentsByIndex()
+    {
+        MockLlmServer server({Turn{.frames = {
+            toolCallStartChunk(1, "call_b", "execute_blender_code", R"({"code":"bpy.ops.mesh.)"),
+            toolCallStartChunk(0, "call_a", "execute_blender_code", R"({"code":"import bpy")"),
+            toolArgsChunk(1, R"(primitive_cube_add()})"),
+            toolArgsChunk(0, R"(;bpy.ops.object.select_all()})"),
+            doneChunk()}, .splitEvery = 4}});
+        QVERIFY(server.listen());
+
+        LlmGateway gateway;
+        Recorder rec;
+        gateway.chatStream(server.config(), userMessages("建个盒子"), {}, rec.handlers());
+
+        QTRY_VERIFY_WITH_TIMEOUT(rec.done == 1, 5000);
+        QCOMPARE(rec.toolCalls.size(), 2);                  // 两个 index 各一次，不重复上报
+        QVERIFY(rec.deltas.isEmpty());                      // tool-only 回合不产生文本增量
+        const QJsonObject first = rec.toolCalls.at(0).toObject();
+        const QJsonObject second = rec.toolCalls.at(1).toObject();
+        QCOMPARE(first.value("id").toString(), QStringLiteral("call_a"));  // 按 index 升序还原
+        QCOMPARE(second.value("id").toString(), QStringLiteral("call_b"));
+        QCOMPARE(second.value("arguments").toObject().value("code").toString(),
+                 QStringLiteral("bpy.ops.mesh.primitive_cube_add()"));     // 分片拼完整并解析
+    }
+
+    void completesWhenFinalFrameHasNoBlankLine()
+    {
+        MockLlmServer server({Turn{
+            .frames = {R"(data: {"choices":[{"delta":{"content":"尾"}}]})"}, // 无结尾 \n\n
+            .splitEvery = 4}});
+        QVERIFY(server.listen());
+
+        LlmGateway gateway;
+        Recorder rec;
+        gateway.chatStream(server.config(), userMessages("hi"), {}, rec.handlers());
+
+        QTRY_VERIFY_WITH_TIMEOUT(rec.done == 1, 5000);
+        QCOMPARE(rec.deltas, QStringList{"尾"});            // 靠 finished 里补 "\n\n" 冲出来
+        QVERIFY(rec.errors.isEmpty());
+    }
+
+    void reportsErrorOnceOnHttpError()
+    {
+        MockLlmServer server({Turn{.status = 401}});
+        QVERIFY(server.listen());
+
+        LlmGateway gateway;
+        Recorder rec;
+        gateway.chatStream(server.config(), userMessages("hi"), {}, rec.handlers());
+
+        QTRY_VERIFY_WITH_TIMEOUT(rec.errors.size() == 1, 5000);
+        QCOMPARE(rec.done, 0);
+        QVERIFY(rec.deltas.isEmpty());
+        QCOMPARE(server.requestCount(), 1);                 // 不自动重试
+    }
+
+    void reportsErrorWhenConnectionRefused()
+    {
+        quint16 deadPort = 0;
+        {
+            QTcpServer probe;
+            QVERIFY(probe.listen(QHostAddress::LocalHost, 0));
+            deadPort = probe.serverPort();
+        }                                                   // 作用域结束即关闭，端口无人监听
+
+        LlmGateway gateway;
+        Recorder rec;
+        gateway.chatStream(LlmConfig{QStringLiteral("http://127.0.0.1:%1/v1").arg(deadPort),
+                                     QStringLiteral("test-key"), QStringLiteral("test-model")},
+                           userMessages("hi"), {}, rec.handlers());
+
+        QTRY_VERIFY_WITH_TIMEOUT(rec.errors.size() == 1, 5000);
+        QCOMPARE(rec.done, 0);                              // 连接失败绝不能走 onDone
+    }
+
+    void keepsConcurrentStreamsSeparate()
+    {
+        MockLlmServer alpha({Turn{.frames = {textChunk("alpha1"), textChunk("alpha2"), doneChunk()},
+                                  .splitEvery = 5, .frameDelayMs = 15}});
+        MockLlmServer beta({Turn{.frames = {textChunk("beta1"), textChunk("beta2"), doneChunk()},
+                                 .splitEvery = 7, .frameDelayMs = 25}});
+        QVERIFY(alpha.listen());
+        QVERIFY(beta.listen());
+
+        LlmGateway gateway;                                 // 同一个 gateway 上两条流同时在途
+        Recorder a;
+        Recorder b;
+        gateway.chatStream(alpha.config(), userMessages("a"), {}, a.handlers());
+        gateway.chatStream(beta.config(), userMessages("b"), {}, b.handlers());
+
+        QTRY_VERIFY_WITH_TIMEOUT(a.done + b.done == 2, 8000);
+        QCOMPARE(a.deltas, (QStringList{"alpha1", "alpha2"}));
+        QCOMPARE(b.deltas, (QStringList{"beta1", "beta2"}));
+    }
+
+    void abortEndsInFlightStreamsOnce()
+    {
+        MockLlmServer server({Turn{.frames = {textChunk("半句")}, .stallAfterFrames = true}});
+        QVERIFY(server.listen());
+
+        LlmGateway gateway;
+        Recorder rec;
+        gateway.chatStream(server.config(), userMessages("hi"), {}, rec.handlers());
+
+        QTRY_VERIFY_WITH_TIMEOUT(rec.deltas.size() == 1, 5000); // 首帧已到，连接仍开着
+        gateway.abort();
+        QTRY_VERIFY_WITH_TIMEOUT(rec.errors.size() == 1, 5000);
+        QCOMPARE(rec.done, 0);                              // 中止不算正常完成
+        gateway.abort();                                    // 重复 abort 不应再报错
+        QTest::qWait(50);
+        QCOMPARE(rec.errors.size(), 1);
+    }
+};
+
+QTEST_MAIN(LlmGatewayTest)
+#include "tst_llm_gateway.moc"
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cmake --build build --config Debug --target tst_llm_gateway`
+Expected: 编译失败 `fatal error C1083: 无法打开包括文件: "mock/MockLlmServer.h"`（测试先于实现存在）。
+
+- [ ] **Step 3: 实现 `MockLlmServer`（真实 HTTP 服务端）**
+
+```cpp
+// tests/mock/MockLlmServer.h
+#pragma once
+
+#include "core/llm/LlmGateway.h"
+
+#include <QByteArray>
+#include <QJsonObject>
+#include <QList>
+#include <QObject>
+#include <QString>
+#include <QTcpServer>
+
+class QTcpSocket;
+
+namespace MockLlm {
+QByteArray textChunk(const QString& text);
+QByteArray toolCallStartChunk(int index, const QString& id, const QString& name,
+                              const QString& argsFragment);
+QByteArray toolArgsChunk(int index, const QString& argsFragment);
+QByteArray toolCallChunk(const QString& name, const QString& args = QStringLiteral("{}"));
+QByteArray doneChunk();
+} // namespace MockLlm
+
+class MockLlmServer : public QObject
+{
+    Q_OBJECT
+public:
+    struct Turn
+    {
+        QList<QByteArray> frames;
+        int splitEvery = 3;
+        int frameDelayMs = 2;
+        int status = 200;
+        QByteArray errorBody = R"({"error":{"message":"mock error"}})";
+        bool stallAfterFrames = false;
+    };
+
+    explicit MockLlmServer(QList<Turn> script, QObject* parent = nullptr);
+    bool listen();
+    QString baseUrl() const;
+    LlmConfig config(const QString& model = QStringLiteral("test-model")) const;
+    int requestCount() const { return int(m_requests.size()); }
+    QString pathAt(int index) const { return m_paths.value(index); }
+    QByteArray authorizationAt(int index) const { return m_authorizations.value(index); }
+    QString requestAt(int index) const { return m_requests.value(index); }
+    QJsonObject requestObjectAt(int index) const;
+
+private:
+    void onNewConnection();
+    void handleRequest(QTcpSocket* socket, const QByteArray& body);
+    void respond(QTcpSocket* socket, const Turn& turn);
+    Turn takeTurn();
+
+    QTcpServer m_server;
+    QList<Turn> m_script;
+    int m_next = 0;
+    QList<QString> m_requests;          // compact JSON 文本
+    QList<QString> m_paths;
+    QList<QByteArray> m_authorizations;
+};
+```
+
+```cpp
+// tests/mock/MockLlmServer.cpp（关键部分；完整实现按此展开）
+MockLlmServer::MockLlmServer(QList<Turn> script, QObject* parent)
+    : QObject(parent)
+    , m_script(std::move(script))
+{
+    connect(&m_server, &QTcpServer::newConnection, this, &MockLlmServer::onNewConnection);
+}
+
+QJsonObject MockLlmServer::requestObjectAt(int index) const
+{
+    return QJsonDocument::fromJson(requestAt(index).toUtf8()).object();
+}
+
+bool MockLlmServer::listen()
+{
+    return m_server.listen(QHostAddress::LocalHost, 0);
+}
+
+QString MockLlmServer::baseUrl() const
+{
+    return QStringLiteral("http://127.0.0.1:%1/v1").arg(m_server.serverPort());
+}
+
+void MockLlmServer::onNewConnection()
+{
+    while (QTcpSocket* socket = m_server.nextPendingConnection()) {
+        socket->setParent(this);
+        auto buffer = std::make_shared<QByteArray>();
+        connect(socket, &QTcpSocket::readyRead, this, [this, socket, buffer]() {
+            buffer->append(socket->readAll());
+            const int headerEnd = buffer->indexOf("\r\n\r\n");
+            if (headerEnd < 0)
+                return;                                  // 头还没收齐
+            const QByteArray head = buffer->left(headerEnd);
+            int contentLength = 0;
+            for (const QByteArray& line : head.split('\n')) {
+                if (line.toLower().startsWith("content-length:"))
+                    contentLength = line.mid(15).trimmed().toInt();
+            }
+            const QByteArray body = buffer->mid(headerEnd + 4);
+            if (body.size() < contentLength)
+                return;                                  // body 还没收齐，继续等
+            socket->disconnect(socket, &QTcpSocket::readyRead, this, nullptr);
+
+            m_paths << QString::fromUtf8(head.split(' ').value(1));
+            m_authorizations << [&head]() {
+                for (const QByteArray& line : head.split('\n'))
+                    if (line.toLower().startsWith("authorization:"))
+                        return line.mid(14).trimmed();
+                return QByteArray{};
+            }();
+            m_requests << QString::fromUtf8(body.left(contentLength));
+            respond(socket, takeTurn());
+        });
+    }
+}
+```
+
+```cpp
+void MockLlmServer::respond(QTcpSocket* socket, const Turn& turn)
+{
+    if (turn.status != 200) {                            // 错误分支：不发 SSE
+        socket->write("HTTP/1.1 " + QByteArray::number(turn.status) + " Error\r\n"
+                      "Content-Type: application/json\r\nConnection: close\r\n"
+                      "Content-Length: " + QByteArray::number(turn.errorBody.size())
+                          + "\r\n\r\n" + turn.errorBody);
+        socket->disconnectFromHost();
+        return;
+    }
+
+    socket->write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                  "Cache-Control: no-cache\r\nConnection: close\r\n"
+                  "Transfer-Encoding: chunked\r\n\r\n");
+
+    // 先拼成一整条字节流再切片：切点自然会落在 "data:"、JSON、甚至 UTF-8 多字节中间
+    auto slices = std::make_shared<QList<QByteArray>>();
+    const int step = qMax(1, turn.splitEvery);
+    for (const QByteArray& frame : turn.frames)
+        for (int i = 0; i < frame.size(); i += step)
+            slices->append(frame.mid(i, step));
+
+    auto index = std::make_shared<int>(0);
+    auto pump = std::make_shared<std::function<void()>>();
+    *pump = [socket, slices, index, pump, turn]() {
+        if (*index >= slices->size()) {
+            if (!turn.stallAfterFrames) {
+                socket->write("0\r\n\r\n");               // chunked 结束
+                socket->flush();
+                socket->disconnectFromHost();
+            }
+            return;
+        }
+        const QByteArray slice = slices->at((*index)++);
+        socket->write(QByteArray::number(slice.size(), 16) + "\r\n");
+        socket->write(slice);
+        socket->write("\r\n");
+        socket->flush();                                  // 不 flush 会被 Qt 攒包，测不到分片
+        QTimer::singleShot(turn.frameDelayMs, socket, [pump]() { (*pump)(); });
+    };
+    (*pump)();
+}
+
+MockLlmServer::Turn MockLlmServer::takeTurn()
+{
+    if (m_next < m_script.size())
+        return m_script.at(m_next++);
+    Turn exhausted;                                       // 脚本用超：500，避免测试挂死
+    exhausted.status = 500;
+    return exhausted;
+}
+```
+
+`textChunk` / `toolCallStartChunk` / `toolArgsChunk` / `toolCallChunk` / `doneChunk` 统一构造 `choices[0].delta` 的 wire format 帧，末尾统一补 `\n\n`。
+
+- [ ] **Step 4: CMake + 跑测试**
+
+```cmake
+add_executable(tst_llm_gateway tests/tst_llm_gateway.cpp tests/mock/MockLlmServer.cpp)
+target_include_directories(tst_llm_gateway PRIVATE tests)
+target_link_libraries(tst_llm_gateway PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_llm_gateway COMMAND tst_llm_gateway)
+set_tests_properties(tst_llm_gateway PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+```
+
+Run: `ctest --test-dir build -C Debug -R tst_llm_gateway --output-on-failure`
+Expected: 7 用例 Passed。若用例 7（abort）红，改 `LlmGateway::abort` 的实现使其只上报一次，**不要放宽断言**。
+
+- [ ] **Step 5: 去掉 `virtual`，编译期封死子类 mock**
+
+`src/core/llm/LlmGateway.h` 中 `virtual void chatStream(...)` → `void chatStream(...)`，全量构建确认无子类（`rg "public LlmGateway"` 应无输出）。Task 2 / Task 3 的测试改为「真实 `LlmGateway` + `MockLlmServer`」（见 Task 3 片段）。
+
+- [ ] **Step 6: Commit**（`test: LlmGateway 流式专项测试（真实 HTTP+SSE，禁止子类 mock）`）
+
+---
+
 ### Task 2: SummarizerAgent（草稿流）
 
 **Files:** Create `src/core/agent/SummarizerAgent.h/.cpp`、`src/resources/prompts/summarizer.md`（内容以规格附录参考提示词为骨架，把「雨夜便利店」替换为 `{{user_request}}` 与 `{{mode}}` 模板变量）；Modify `CoreApp`（`chat.send` lowpoly 分支 → 调用；新增 `draft.send`、`draft.cancel` handler；**不引入 `draft.save`**）。
@@ -538,7 +1000,7 @@ const text = ref(props.prompt);
 
 `ChatPanel.vue` 新增订阅 `draft.created` → 追加草稿卡并 `busy.value = false`（后端已停止，等待用户编辑）；草稿卡 `send` → `busy.value = true` 后 `client.request("draft.send", {area, prompt, mode})`（规划中可点「停止」→ `chat.cancel`）；`cancel` → `client.request("draft.cancel", {area, taskId})` 并移除卡片。
 
-- [ ] **Step 3: 单测以集成覆盖（Task 3 的 mock LLM 测试同时覆盖草稿流）；提交**（`feat: 总结 agent 草稿生成与持久化`）
+- [ ] **Step 3: 单测以集成覆盖（Task 1B 的 `MockLlmServer` + 真实 `LlmGateway` 跑 HTTP+SSE；Task 3 的执行链用例顺带覆盖草稿流）；提交**（`feat: 总结 agent 草稿生成与持久化`）
 
 ---
 
@@ -652,7 +1114,7 @@ Commit（`feat: BlenderGate 会话互斥租约`）。
 
 ### Task 3: AgentOrchestrator（Planner + Executor 两阶段）
 
-**Files:** Create `src/core/agent/AgentOrchestrator.h/.cpp`、`web/src/components/PlanCard.vue`、`tests/tst_orchestrator.cpp`；Modify `CoreApp`（draft.send → 启动规划；plan.confirm / plan.cancel 在 Task 4 接线）。
+**Files:** Create `src/core/agent/AgentOrchestrator.h/.cpp`、`web/src/components/PlanCard.vue`、`tests/tst_orchestrator.cpp`；Modify `CoreApp`（draft.send → 启动规划；plan.confirm / plan.cancel 在 Task 4 接线）。测试里的 LLM 一律复用 Task 1B 的 `tests/mock/MockLlmServer.h/.cpp` + 真实 `LlmGateway`，不新建任何 `LlmGateway` 子类。
 
 **Interfaces:**
 - 计划结构：
@@ -774,10 +1236,12 @@ private:
 ```cpp
 void plannerParsesGroups()
 {
-    MockLlmServer llm({textChunk(R"({"groups":[
+    MockLlmServer server({textChunk(R"({"groups":[
         {"title":"底座与环境","items":["底座","井盖"],"acceptance":"俯视截图：底座完整"},
         {"title":"建筑外观","items":["墙体","招牌"],"acceptance":"街角截图：主体齐全"}]})")});
+    LlmGateway llm;                              // 真实网关，禁止子类重写 chatStream
     AgentOrchestrator orch(&llm, nullptr, nullptr);
+    orch.setModelConfig(server.config());        // baseUrl 指向本地假服务端
     QSignalSpy ready(&orch, &AgentOrchestrator::planReady);
 
     orch.plan("t1", nullptr, "做一个雨夜便利店", "blender");
@@ -790,8 +1254,10 @@ void plannerParsesGroups()
 
 void plannerFallsBackToDefaults()
 {
-    MockLlmServer llm({textChunk("抱歉，我无法输出 JSON。"), textChunk("仍然无法输出。")});
+    MockLlmServer server({textChunk("抱歉，我无法输出 JSON。"), textChunk("仍然无法输出。")});
+    LlmGateway llm;
     AgentOrchestrator orch(&llm, nullptr, nullptr);
+    orch.setModelConfig(server.config());
     QSignalSpy ready(&orch, &AgentOrchestrator::planReady);
 
     orch.plan("t1", nullptr, "做一个雨夜便利店", "blender");
@@ -800,9 +1266,11 @@ void plannerFallsBackToDefaults()
     const QJsonObject plan = ready.first().at(2).toJsonObject();
     QCOMPARE(plan.value("groups").toArray().size(), 4);   // 默认四分组
     QCOMPARE(plan.value("totalSteps").toInt(), 42);
-    QCOMPARE(llm.requestCount(), 2);                     // 重试 1 次
+    QCOMPARE(server.requestCount(), 2);                    // 重试 1 次
 }
 ```
+
+> 文件顶部 `using namespace MockLlm;`（`textChunk` / `toolCallChunk` 来自 Task 1B 的 `tests/mock/MockLlmServer.h`）。测试里的 `LlmGateway` 必须是真实对象，`MockLlmServer` 只当 HTTP 服务端，不得继承 `LlmGateway`。
 
 - [ ] **Step 2: 规划实现（绿）**
 
@@ -923,12 +1391,14 @@ static QJsonArray openAiTools()
 
 void executorBuildThenSelfChecks()
 {
-    MockLlmServer llm({toolCallChunk("execute_blender_code"),
-                       textChunk("本组建造完成"),
-                       textChunk("自检通过"),
-                       textChunk("已导出 glb/fbx/blend")});
+    MockLlmServer server({toolCallChunk("execute_blender_code"),
+                          textChunk("本组建造完成"),
+                          textChunk("自检通过"),
+                          textChunk("已导出 glb/fbx/blend")});
+    LlmGateway llm;                              // 真实网关，脚本走真实 HTTP+SSE
     MockMcpHarness mcp;
     AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+    orch.setModelConfig(server.config());
     BuildPlan plan;
     plan.groups = {{"底座与环境", {"底座"}, "俯视截图检查底座完整"}};
     plan.maxSteps = 18;
@@ -938,20 +1408,22 @@ void executorBuildThenSelfChecks()
                  "做一个雨夜便利店", "/tmp/out", "blender");
 
     QTRY_COMPARE(finalSpy.count(), 1);
-    QCOMPARE(llm.requestCount(), 4);                    // 建造 → 自检 → 导出 → 收尾
-    QVERIFY(llm.requestAt(1).contains("验收标准"));      // 自检指令已注入
-    QVERIFY(llm.requestAt(3).contains("export_scene")); // 导出指令已注入
+    QCOMPARE(server.requestCount(), 4);                  // 建造 → 自检 → 导出 → 收尾
+    QVERIFY(server.requestAt(1).contains("验收标准"));    // 自检指令已注入
+    QVERIFY(server.requestAt(3).contains("export_scene")); // 导出指令已注入
 }
 
 void executorAdvancesGroups()
 {
-    MockLlmServer llm({toolCallChunk("execute_blender_code"), textChunk("组1建造完成"),
-                       textChunk("组1自检通过"),
-                       toolCallChunk("execute_blender_code"), textChunk("组2建造完成"),
-                       textChunk("组2自检通过"),
-                       textChunk("已导出 glb/fbx/blend")});
+    MockLlmServer server({toolCallChunk("execute_blender_code"), textChunk("组1建造完成"),
+                          textChunk("组1自检通过"),
+                          toolCallChunk("execute_blender_code"), textChunk("组2建造完成"),
+                          textChunk("组2自检通过"),
+                          textChunk("已导出 glb/fbx/blend")});
+    LlmGateway llm;
     MockMcpHarness mcp;
     AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+    orch.setModelConfig(server.config());
     BuildPlan plan;
     plan.groups = {{"底座与环境", {}, "检查底座"}, {"建筑外观", {}, "检查建筑"}};
     QSignalSpy progress(&orch, &AgentOrchestrator::groupProgress);
@@ -967,8 +1439,10 @@ void executorAdvancesGroups()
 // 文件顶部追加：#include "core/mcp/BlenderGate.h"
 void executorRefusesWhenBlenderGateBusy()
 {
-    MockLlmServer llm({});                 // 不应发出任何请求
+    MockLlmServer server({});               // 不应发出任何请求
+    LlmGateway llm;
     AgentOrchestrator orch(&llm, nullptr, nullptr);
+    orch.setModelConfig(server.config());
     BlenderGate gate;
     QVERIFY(gate.tryAcquire(QStringLiteral("unity-convert")));
     orch.setBlenderGate(&gate);
@@ -980,17 +1454,19 @@ void executorRefusesWhenBlenderGateBusy()
 
     QCOMPARE(failed.count(), 1);
     QCOMPARE(failed.first().at(1).toString(), QStringLiteral("blender-busy"));
-    QCOMPARE(llm.requestCount(), 0);                         // 门禁失败不碰 LLM / MCP
+    QCOMPARE(server.requestCount(), 0);                      // 门禁失败不碰 LLM / MCP
     QCOMPARE(gate.owner(), QStringLiteral("unity-convert")); // 不释放他人租约
 }
 
 void executorReleasesGateOnFinish()
 {
-    MockLlmServer llm({toolCallChunk("execute_blender_code"),
-                       textChunk("本组建造完成"), textChunk("自检通过"),
-                       textChunk("已导出 glb/fbx/blend")});
+    MockLlmServer server({toolCallChunk("execute_blender_code"),
+                          textChunk("本组建造完成"), textChunk("自检通过"),
+                          textChunk("已导出 glb/fbx/blend")});
+    LlmGateway llm;
     MockMcpHarness mcp;
     AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+    orch.setModelConfig(server.config());
     BlenderGate gate;
     orch.setBlenderGate(&gate);
     BuildPlan plan;
@@ -1005,7 +1481,7 @@ void executorReleasesGateOnFinish()
 }
 ```
 
-`MockLlmServer`（`tests/mock/mock_llm_server.h`）：继承 `LlmGateway` 并重写 `chatStream`，按请求顺序逐轮把脚本转成 **真实 OpenAI SSE 分片**喂给与生产相同的聚合逻辑；`requestCount()` 与 `requestAt(i)` 返回该轮原始请求体（用于断言注入消息）。`toolCallChunk/textChunk` 为脚本包装小工具。`toolCallChunk(name, args = "{}")` 必须生成 **OpenAI 流式 wire format** 的 SSE 分片（`choices[0].delta.tool_calls[{index,id,function:{name,arguments}}]`，arguments 为 JSON 字符串），确保测试覆盖真实的 function calling 解析路径，而不是用内部结构左手对右手。
+`MockLlmServer`（`tests/mock/MockLlmServer.h`，Task 1B 建立）：**不是 `LlmGateway` 的子类**，而是一个 `QTcpServer` 假服务端——解析请求行 / 头 / `Content-Length` body，回 `HTTP/1.1 200` + `Transfer-Encoding: chunked`，把脚本帧按 `splitEvery` 切片、按 `frameDelayMs` 逐片写出，让真实 `LlmGateway::chatStream` 走完整 HTTP + SSE 路径。`requestCount()` 与 `requestAt(i)`（compact JSON 文本）用于断言注入消息与请求体。`toolCallChunk/textChunk` 为脚本包装小工具；`toolCallChunk(name, args = "{}")` 必须生成 **OpenAI 流式 wire format** 的 SSE 分片（`choices[0].delta.tool_calls[{index,id,function:{name,arguments}}]`，arguments 为 JSON 字符串），确保测试覆盖真实的 function calling 解析路径，而不是用内部结构左手对右手。
 
 - [ ] **Step 4: 执行状态机实现（绿）**
 
@@ -1450,7 +1926,7 @@ function cancel() {
 
 `ChatPanel.vue` 新增订阅 `plan.created` → 追加计划卡并 `busy.value = false`（等待用户决策）；计划卡 `start` 等待 `plan.confirm` 返回，`ok:false` 时保持 pending 并显示错误（`blender-busy` 时计划卡保留，可稍后再点）；`cancel` → `client.request("plan.cancel", {area, taskId})`；收到 `folderPick.open`（Task 4）后弹存放位置。
 
-- [ ] **Step 6: CMake + 跑测试 + Commit**（`tst_orchestrator` 6 用例：规划解析 / 降级 / 单组执行 / 多组推进 / 门禁忙拒绝 / 成功释放门禁；`feat: Planner→Executor 两阶段主循环（计划卡/分组自检）`）
+- [ ] **Step 6: CMake + 跑测试 + Commit**（`tst_orchestrator` 6 用例：规划解析 / 降级 / 单组执行 / 多组推进 / 门禁忙拒绝 / 成功释放门禁；target 写成 `add_executable(tst_orchestrator tests/tst_orchestrator.cpp tests/mock/MockLlmServer.cpp)` + `target_include_directories(tst_orchestrator PRIVATE tests)`，脚本经真实 HTTP+SSE 由 `MockLlmServer` 喂入；`feat: Planner→Executor 两阶段主循环（计划卡/分组自检）`）
 
 ---
 
@@ -2151,6 +2627,6 @@ async function send() {
 - [ ] `plan.confirm` 在门禁忙时返回 `blender-busy` 且**不消费** `m_pendingPlans`（计划卡保留，可稍后再点开始）
 - [ ] 截图压缩后回喂（长边 ≤1024、JPEG q80），且同一截图以 `chat.image` 事件在对话区渲染为图片卡
 - [ ] 取消任务后 MCP 调用在工具边界停止，任务事件 `finished(cancelled=true)`；草稿/规划/计划/执行四个可等待阶段的「停止」均生效（规划丢弃迟到结果不弹卡）
-- [ ] `tst_preflight`、`tst_mcp_runtime`、`tst_blender_gate`、`tst_asset_library`、`tst_orchestrator` 全绿（`tst_orchestrator` 6 用例，含门禁忙拒绝与成功释放）
+- [ ] `tst_preflight`、`tst_mcp_runtime`、`tst_blender_gate`、`tst_asset_library`、`tst_orchestrator`、`tst_llm_gateway` 全绿（`tst_orchestrator` 6 用例，含门禁忙拒绝与成功释放；`tst_llm_gateway` 7 用例走真实 HTTP+SSE，删掉 `LlmGateway` 的 `readyRead`/`finished` 分支必须变红）
 - [ ] `fs.operate` 五项操作全部可用（mkdir/rename/delete/reveal/refresh），越界路径返回 `invalid-path`；`folderPick.mkdir` 可在弹窗内新建文件夹
 - [ ] `file.read` 支持文本/图片/GLB 三类；`asset.created` 后预览区自动加载新资产；未选中时显示概览卡

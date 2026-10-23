@@ -733,8 +733,8 @@ Expected: 编译通过，3 用例 Passed（WsServer 由 Task 6 集成测试覆�
 
 **Interfaces:**
 - `class SseParser { QList<Event> feed(const QByteArray& chunk); /* Event { QString event; QByteArray data; } */ }`
-- `class LlmGateway : QObject { struct StreamHandlers { std::function<void(QString delta)> onDelta; std::function<void(QJsonArray toolCalls)> onToolCalls; std::function<void(QString error)> onError; std::function<void()> onDone; }; virtual void chatStream(LlmConfig, QJsonArray messages, QJsonArray tools, StreamHandlers); void abort(); }`
-  - `chatStream` 声明为 `virtual`，仅供 P4 的 `MockLlmServer` 继承重写（按脚本喂真实 SSE 分片）；生产路径只有这一个实现。
+- `class LlmGateway : QObject { struct StreamHandlers { std::function<void(QString delta)> onDelta; std::function<void(QJsonArray toolCalls)> onToolCalls; std::function<void(QString error)> onError; std::function<void()> onDone; }; void chatStream(LlmConfig, QJsonArray messages, QJsonArray tools, StreamHandlers); void abort(); }`
+  - `chatStream` 在 P2 实现中一度声明为 `virtual`（原计划让 P4 用子类 mock 重写，**该做法已废弃**）：P4 Task 1B 会删掉 `virtual`；LLM 测试一律用 `tests/mock/MockLlmServer`（`QTcpServer` 假服务端）走真实 HTTP + SSE，禁止子类替换、禁止回调注入绕过网络。
 - `struct LlmConfig { QString baseUrl; QString apiKey; QString model; }`
 - `namespace ToolBridge`（纯函数，无 Qt 网络/状态依赖）：
   - `QJsonArray mcpToolsToOpenAi(const QJsonArray& mcpTools)`：MCP `{name, description, inputSchema}` → OpenAI `{type:"function", function:{name, description, parameters}}`；`inputSchema` 改名为 `parameters`，缺省时用 `{"type":"object","properties":{}}`。
@@ -1014,7 +1014,7 @@ set_tests_properties(tst_tool_bridge PROPERTIES
 ```
 
 Run: `ctest --test-dir build -C Debug -R "tst_sse_parser|tst_tool_bridge" --output-on-failure`
-Expected: `tst_sse_parser` 2 用例、`tst_tool_bridge` 2 用例，全部 Passed；LlmGateway 编译通过，网络行为在 P4 用 mock LLM 验证。
+Expected: `tst_sse_parser` 2 用例、`tst_tool_bridge` 2 用例，全部 Passed；LlmGateway 编译通过，网络行为在 P4 Task 1B 用本地真实 HTTP + SSE 服务端验证（`tst_llm_gateway`，禁止子类 mock）。
 
 - [ ] **Step 4: Commit**（`feat: SSE 解析、OpenAI 流式网关与 MCP→Function Calling 工具桥接`）
 
@@ -1034,6 +1034,7 @@ Expected: `tst_sse_parser` 2 用例、`tst_tool_bridge` 2 用例，全部 Passed
 - [ ] **Step 1: 写失败的集成测试**
 
 ```cpp
+#include <QElapsedTimer>
 #include <QWebSocket>
 #include <QTemporaryDir>
 #include <QtTest>
@@ -1061,18 +1062,24 @@ private slots:
         auto request = [&](const QString& method, const QJsonObject& params) {
             QJsonObject frame{{"id", nextId}, {"method", method}, {"params", params}};
             const int expected = nextId++;
-            QJsonObject received;
-            auto conn = connect(&socket, &QWebSocket::textMessageReceived, this,
-                                [&](const QString& text) {
-                                    const QJsonObject obj =
-                                        QJsonDocument::fromJson(text.toUtf8()).object();
-                                    if (obj.value("id").toInt() == expected)
-                                        received = obj;
-                                });
+            QSignalSpy spy(&socket, &QWebSocket::textMessageReceived);
             socket.sendTextMessage(QString::fromUtf8(
                 QJsonDocument(frame).toJson(QJsonDocument::Compact)));
-            QTRY_VERIFY(!received.isEmpty());
-            disconnect(conn);
+
+            QJsonObject received;
+            QElapsedTimer timer;
+            timer.start();
+            while (received.isEmpty() && timer.elapsed() < 5000) {
+                if (spy.isEmpty())
+                    spy.wait(20);
+                while (!spy.isEmpty()) {
+                    const QList<QVariant> args = spy.takeFirst();
+                    const QJsonObject obj =
+                        QJsonDocument::fromJson(args.at(0).toString().toUtf8()).object();
+                    if (obj.value("id").toInt() == expected)
+                        received = obj;
+                }
+            }
             return received;
         };
 
@@ -1116,6 +1123,8 @@ QTEST_MAIN(HeadlessWsTest)
 #include <QObject>
 #include <QString>
 
+#include <memory>
+
 class SettingsStore;
 class SessionStore;
 class TaskManager;
@@ -1134,19 +1143,20 @@ class CoreApp : public QObject
     Q_OBJECT
 public:
     explicit CoreApp(const CoreOptions& options, QObject* parent = nullptr);
+    ~CoreApp() override;
     bool start();
-    WsServer* ws() const { return m_ws; }
+    WsServer* ws() const { return m_ws.get(); }
 
 private:
     void registerHandlers();
 
     CoreOptions m_options;
-    SettingsStore* m_settings;
-    SessionStore* m_sessions;
-    TaskManager* m_tasks;
-    ProtocolRouter* m_router;
-    WsServer* m_ws;
-    LlmGateway* m_llm;
+    std::unique_ptr<SettingsStore> m_settings;
+    std::unique_ptr<SessionStore> m_sessions;
+    std::unique_ptr<TaskManager> m_tasks;
+    std::unique_ptr<ProtocolRouter> m_router;
+    std::unique_ptr<WsServer> m_ws;
+    std::unique_ptr<LlmGateway> m_llm;
 };
 ```
 
@@ -1184,16 +1194,19 @@ bool CoreApp::start()
         m_ws->broadcastEvent("chat.message",
                              {{"area", area}, {"role", "user"}, {"content", text}});
 
+        const QJsonObject data = m_settings->data();
         const QJsonObject primary =
-            m_settings->data().value("agent").toObject().value("primary").toObject();
-        if (primary.value("apiKey").toString().isEmpty()
+            data.value("agent").toObject().value("primary").toObject();
+        const QString baseUrl = resolveBaseUrl(primary, data); // 预置家查 providerBaseUrls
+        if (baseUrl.isEmpty() || primary.value("apiKey").toString().isEmpty()
             || primary.value("model").toString().isEmpty()) {
             m_ws->broadcastEvent("error.card",
                                  {{"area", area}, {"reason", "agent-not-configured"}});
-            return QJsonValue(QJsonObject{{"ok", false}});
+            return QJsonValue(QJsonObject{{"accepted", false},
+                                          {"reason", "agent-not-configured"}});
         }
 
-        LlmConfig cfg{primary.value("baseUrl").toString(),
+        LlmConfig cfg{baseUrl,
                       primary.value("apiKey").toString(),
                       primary.value("model").toString()};
         // 规格 8.4：只带本区最近 20 条纯文本历史（含刚落库的本次 user 消息）
@@ -1204,29 +1217,32 @@ bool CoreApp::start()
                                        {"content", m.value("content")}});
         }
 
-        m_tasks->enqueue(Task{QStringLiteral("chat-%1").arg(++m_seq), area, QString(),
-                              [=](const QString& taskId, TaskManager* tm) {
+        const QString taskId = QStringLiteral("chat-%1").arg(++m_seq);
+        m_tasks->enqueue(Task{taskId, area, QString(),
+                              [this, area, cfg, history](const QString& tid, TaskManager* tm) {
+                                  auto buffer = std::make_shared<QString>(); // 每任务独立缓冲
                                   LlmGateway::StreamHandlers h;
-                                  h.onDelta = [this, area](const QString& delta) {
+                                  h.onDelta = [this, area, buffer](const QString& delta) {
+                                      buffer->append(delta);
                                       m_ws->broadcastEvent("chat.delta",
                                                            {{"area", area}, {"text", delta}});
                                   };
-                                  h.onDone = [=]() {
-                                      m_sessions->appendMessage(area, "assistant", m_streamBuf);
+                                  h.onDone = [this, area, tid, tm, buffer]() {
+                                      m_sessions->appendMessage(area, "assistant", *buffer);
                                       m_ws->broadcastEvent("chat.message",
                                                            {{"area", area},
                                                             {"role", "assistant"},
-                                                            {"content", m_streamBuf}});
-                                      tm->finish(taskId);
+                                                            {"content", *buffer}});
+                                      tm->finish(tid);
                                   };
-                                  h.onError = [=](const QString& err) {
+                                  h.onError = [this, area, tid, tm](const QString& err) {
                                       m_ws->broadcastEvent("error.card",
                                                            {{"area", area}, {"reason", err}});
-                                      tm->finish(taskId);
+                                      tm->finish(tid);
                                   };
                                   m_llm->chatStream(cfg, history, {}, h);
                               }});
-        return QJsonValue(QJsonObject{{"ok", true}});
+        return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
     });
 
     if (!m_ws->listen())
@@ -1240,17 +1256,26 @@ bool CoreApp::start()
 }
 ```
 
-> `m_streamBuf` 为 CoreApp 成员 `QString`，在 onDelta 中累加（实现时补充 `m_streamBuf.clear()` 于入队前）。`m_seq` 为 `qint64` 自增。
+> 实现差异（已验证）：
+> - `chat.send` 返回 `{"accepted":true,"taskId":...}` / `{"accepted":false,"reason":"agent-not-configured"}`，与规格 8.3 及 Task 7 一致；不再用 `{"ok":...}`。
+> - `resolveBaseUrl(primary, settings)`：`baseUrl` 为空时按 `provider` 从 `providerBaseUrls` 表取（预置五家只填 model + key）；仍为空按未配置处理。
+> - 每个任务用 `std::make_shared<QString>()` 独立流缓冲，两区并行不串字；不再有 `m_streamBuf` 成员。
+> - CoreApp 成员用 `std::unique_ptr` 持有（header 前向声明 + 显式析构），避免裸指针泄漏；`m_seq` 为 `qint64` 自增。
+> - 集成测试的 `request` lambda 不能用 `QTRY_VERIFY`（宏内含 `return;`，与返回 `QJsonObject` 冲突），改用 `QSignalSpy` 轮询指定 id 的响应帧。
 
 CLI 增量（`src/cli/main.cpp` 顶部）：
 
 ```cpp
 if (QCoreApplication::arguments().contains("--headless")) {
-    QCoreApplication::setOrganizationName("SynthForge");
+    // 不设置 organizationName：否则 Qt 的 AppDataLocation 会多一层 org 目录，
+    // 规格要求数据目录固定为 %APPDATA%/SynthForgeStudio
     QCoreApplication::setApplicationName("SynthForgeStudio");
     CoreApp app({defaultDataDir(), true});
-    if (!app.start())
+    if (!app.start()) {
+        fprintf(stderr, "error: core start failed (data dir: %s)\n",
+                defaultDataDir().toUtf8().constData());
         return 1;
+    }
     return QCoreApplication::exec();
 }
 ```
@@ -1534,7 +1559,7 @@ void CoreApp::registerBridge(const QString& area, RestartFn fn)
 }
 ```
 
-`CoreApp.cpp` 末尾追加 `handleChatSend` 完整实现（替换 Task 6 中 lambda 里的原逻辑），重点变化：历史裁剪到 20 条（规格 4.6）、流式缓冲改为每任务独立 `shared_ptr<QString>`（两区可并行，不再共享 `m_streamBuf`）、任务状态落库：
+`CoreApp.cpp` 末尾追加 `handleChatSend` 完整实现（`chat.send` lambda 里的逻辑抽出来复用），重点变化：历史裁剪到 20 条（规格 4.6）、任务状态落库；每任务独立 `shared_ptr<QString>` 缓冲沿用 Task 6 的实现，不再改动：
 
 ```cpp
 QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
@@ -1551,14 +1576,16 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
 
     const QJsonObject primary =
         m_settings->data().value("agent").toObject().value("primary").toObject();
-    if (primary.value("apiKey").toString().isEmpty()
+    const QString baseUrl = resolveBaseUrl(primary, m_settings->data());
+    if (baseUrl.isEmpty() || primary.value("apiKey").toString().isEmpty()
         || primary.value("model").toString().isEmpty()) {
         m_ws->broadcastEvent("error.card",
                              {{"area", area}, {"reason", "agent-not-configured"}});
-        return QJsonValue(QJsonObject{{"accepted", false}});
+        return QJsonValue(QJsonObject{{"accepted", false},
+                                      {"reason", "agent-not-configured"}});
     }
 
-    LlmConfig cfg{primary.value("baseUrl").toString(),
+    LlmConfig cfg{baseUrl,
                   primary.value("apiKey").toString(),
                   primary.value("model").toString()};
     // 规格 8.4：只带本区最近 20 条纯文本历史（含刚落库的本次 user 消息）
@@ -1603,7 +1630,7 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
 }
 ```
 
-> 注：`chat.send` 返回的键从 `{"ok",true}` 变为 `{"accepted",true,"taskId"}`，与规格 8.3 示例一致；P2 集成测试需同步断言 `accepted`。
+> 注：Task 6 的 `chat.send` 已按规格返回 `{"accepted":true,"taskId"}`，Task 7 保持不变。
 
 - [ ] **Step 4: 追加集成测试**
 
@@ -1626,18 +1653,24 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         auto request = [&](const QString& method, const QJsonObject& params) {
             QJsonObject frame{{"id", nextId}, {"method", method}, {"params", params}};
             const int expected = nextId++;
-            QJsonObject received;
-            auto conn = connect(&socket, &QWebSocket::textMessageReceived, this,
-                                [&](const QString& text) {
-                                    const QJsonObject obj =
-                                        QJsonDocument::fromJson(text.toUtf8()).object();
-                                    if (obj.value("id").toInt() == expected)
-                                        received = obj;
-                                });
+            QSignalSpy spy(&socket, &QWebSocket::textMessageReceived);
             socket.sendTextMessage(QString::fromUtf8(
                 QJsonDocument(frame).toJson(QJsonDocument::Compact)));
-            QTRY_VERIFY(!received.isEmpty());
-            disconnect(conn);
+
+            QJsonObject received;
+            QElapsedTimer timer;
+            timer.start();
+            while (received.isEmpty() && timer.elapsed() < 5000) {
+                if (spy.isEmpty())
+                    spy.wait(20);
+                while (!spy.isEmpty()) {
+                    const QList<QVariant> args = spy.takeFirst();
+                    const QJsonObject obj =
+                        QJsonDocument::fromJson(args.at(0).toString().toUtf8()).object();
+                    if (obj.value("id").toInt() == expected)
+                        received = obj;
+                }
+            }
             return received;
         };
 
@@ -1698,7 +1731,7 @@ git commit -m "feat: 会话持久化补全（历史裁剪/清空/任务与资产
 
 ## P2 完成标准
 
-- [ ] `qa` 全绿：新增 5 个测试可执行全部通过
+- [ ] `qa` 全绿：新增 7 个测试可执行全部通过（settings_store / session_store / task_manager / protocol_router / sse_parser / tool_bridge / headless_ws）
 - [ ] `synthforge_cli --headless` 启动后输出 `READY ws=...`，浏览器可用 wscat/DevTools 完成 settings.save → settings.get 往返
 - [ ] `sessions.db` 生成于数据目录且为 WAL 模式；重启后消息仍在
 - [ ] `session.load` 支持游标分页：默认 20 条/页，返回 `{messages,hasMore,nextCursor}`；`beforeId` 连续翻页无重复无缺口（`tst_session_store` 4 个分页用例覆盖）

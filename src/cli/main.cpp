@@ -8,13 +8,31 @@
 
 #include <cstdio>
 
+#include "core/coreapp/CoreApp.h"
 #include "core/mcp/BridgeCommands.h"
 #include "core/mcp/McpClient.h"
 #include "core/mcp/StdioTransport.h"
+#include "core/settings/SettingsStore.h"
 
 int main(int argc, char* argv[])
 {
     QCoreApplication app(argc, argv);
+    // 不设置 organizationName：Qt 会把 org 拼进 AppDataLocation，
+    // 规格要求数据目录固定为 %APPDATA%/SynthForgeStudio
+    QCoreApplication::setApplicationName(QStringLiteral("SynthForgeStudio"));
+
+    // headless 核心服务：起 WebSocket，向 stderr 输出带 token 的地址后进入事件循环
+    if (QCoreApplication::arguments().contains(QStringLiteral("--headless"))) {
+        CoreApp core({defaultDataDir(), true});
+        if (!core.start()) {
+            std::fprintf(stderr, "error: core start failed (data dir: %s)\n",
+                         defaultDataDir().toUtf8().constData());
+            std::fflush(stderr);
+            return 1;
+        }
+        return QCoreApplication::exec();
+    }
+
     QCoreApplication::setApplicationName(QStringLiteral("synthforge-cli"));
 
     QCommandLineParser parser;

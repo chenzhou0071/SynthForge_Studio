@@ -21,6 +21,7 @@ add_library(synthforge_core STATIC
     src/core/llm/SseParser.cpp
     src/core/llm/ToolBridge.cpp
     src/core/llm/LlmGateway.cpp
+    src/core/coreapp/CoreApp.cpp
 )
 target_include_directories(synthforge_core PUBLIC src)
 target_link_libraries(synthforge_core PUBLIC Qt6::Core Qt6::Sql Qt6::WebSockets Qt6::Network)
@@ -118,4 +119,10 @@ add_executable(tst_tool_bridge tests/tst_tool_bridge.cpp)
 target_link_libraries(tst_tool_bridge PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_tool_bridge COMMAND tst_tool_bridge)
 set_tests_properties(tst_tool_bridge PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_headless_ws tests/tst_headless_ws.cpp)
+target_link_libraries(tst_headless_ws PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_headless_ws COMMAND tst_headless_ws)
+set_tests_properties(tst_headless_ws PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
