@@ -269,13 +269,6 @@ button {
   align-self: flex-start;
 }
 
-.bubble-role {
-  display: block;
-  margin-bottom: 4px;
-  color: var(--muted);
-  font-size: 11px;
-}
-
 .bubble p {
   margin: 0;
 }

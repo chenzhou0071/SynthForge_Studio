@@ -104,12 +104,10 @@ function onKeydown(event: KeyboardEvent) {
       </p>
 
       <div v-for="(message, index) in messages" :key="index" class="bubble" :class="message.role">
-        <span class="bubble-role">{{ message.role === "user" ? "你" : "AI" }}</span>
         <p>{{ message.content }}</p>
       </div>
 
       <div v-if="streaming" class="bubble assistant streaming">
-        <span class="bubble-role">AI</span>
         <p>{{ streaming }}<i class="caret" /></p>
       </div>
 
