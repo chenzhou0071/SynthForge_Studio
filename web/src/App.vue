@@ -67,7 +67,7 @@ onMounted(async () => {
       />
       <div class="content">
         <FileTree :area="active" />
-        <PreviewPane v-if="active === 'blender'" />
+        <PreviewPane />
         <ChatPanel v-show="active === 'blender'" area="blender" :client="client" />
         <ChatPanel v-show="active === 'unity'" area="unity" :client="client" />
       </div>
