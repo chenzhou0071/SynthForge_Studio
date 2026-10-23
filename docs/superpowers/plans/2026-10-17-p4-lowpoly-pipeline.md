@@ -482,6 +482,8 @@ public:
 | 6 | `keepsConcurrentStreamsSeparate` | 两个服务端用不同 `frameDelayMs` 交替到帧，共用一个 gateway | 两条流各自 delta 不串字、顺序不乱，各自 `onDone` 1（`m_replies` 与 per-reply `StreamState`） |
 | 7 | `abortEndsInFlightStreamsOnce` | 发一帧后 `stallAfterFrames` 挂住不结束 | `abort()` 后该流 `onError` 1、`onDone` 0；重复 `abort()` 不再回调（145-150，`chat.cancel` 依赖此语义） |
 
+> P2 Task 7 已实现按区中止：`chatStream(..., tag=area)` + `abortTag(area)`（每条流登记 reply→tag，只掐匹配项）。标签隔离由 `tst_headless_ws::cancelEndsOnlyTargetArea` 覆盖（把 `abortTag` 换成全局 `abort()`，该用例会红在"另一区仍连接"）；本表用例 7 继续验证全局 `abort()` 的"只回调一次"兜底语义。P4 编排器按区取消必须用 `abortTag(area)`，禁止 `abort()`。
+
 - [ ] **Step 1: 写失败测试（红）**
 
 ```cpp

@@ -1,5 +1,6 @@
 #include <QFile>
 #include <QJsonArray>
+#include <QJsonObject>
 #include <QStringList>
 #include <QTemporaryDir>
 #include <QtTest>
@@ -153,6 +154,78 @@ private slots:
         QCOMPARE(page.messages.size(), 0);
         QVERIFY(!page.hasMore);
         QCOMPARE(page.nextCursor, qint64(0));
+    }
+
+    void clearMessagesKeepsOtherArea()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        SessionStore store(dir.path() + QStringLiteral("/sessions.db"));
+        QVERIFY(store.open());
+        store.appendMessage(QStringLiteral("blender"), QStringLiteral("user"),
+                            QStringLiteral("做便利店"));
+        store.appendMessage(QStringLiteral("blender"), QStringLiteral("assistant"),
+                            QStringLiteral("好的"));
+        store.appendMessage(QStringLiteral("unity"), QStringLiteral("user"),
+                            QStringLiteral("建地面"));
+
+        store.clearMessages(QStringLiteral("blender"));
+
+        QCOMPARE(store.messages(QStringLiteral("blender")).size(), 0);
+        QCOMPARE(store.messages(QStringLiteral("unity")).size(), 1);
+    }
+
+    void tasksAndAssetsRoundTrip()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        SessionStore store(dir.path() + QStringLiteral("/sessions.db"));
+        QVERIFY(store.open());
+
+        // 同一 id 二次 upsert：覆盖 state/result，不产生第二行
+        store.upsertTask(QStringLiteral("t1"), QStringLiteral("blender"), QStringLiteral("chat"),
+                         QStringLiteral("running"), QJsonObject{{"text", "hi"}});
+        store.upsertTask(QStringLiteral("t1"), QStringLiteral("blender"), QStringLiteral("chat"),
+                         QStringLiteral("done"), QJsonObject{{"text", "hi"}},
+                         QJsonObject{{"reply", "ok"}});
+        store.upsertTask(QStringLiteral("t2"), QStringLiteral("unity"), QStringLiteral("build"),
+                         QStringLiteral("failed"), QJsonObject{{"prompt", "x"}},
+                         QJsonObject{{"error", "boom"}});
+
+        const QJsonArray blenderTasks = store.tasks(QStringLiteral("blender"));
+        QCOMPARE(blenderTasks.size(), 1);
+        const QJsonObject task = blenderTasks.first().toObject();
+        QCOMPARE(task.value(QStringLiteral("state")).toString(), QStringLiteral("done"));
+        QCOMPARE(task.value(QStringLiteral("payload"))
+                     .toObject()
+                     .value(QStringLiteral("text"))
+                     .toString(),
+                 QStringLiteral("hi"));
+        QCOMPARE(task.value(QStringLiteral("result"))
+                     .toObject()
+                     .value(QStringLiteral("reply"))
+                     .toString(),
+                 QStringLiteral("ok"));
+        QCOMPARE(store.tasks(QStringLiteral("unity")).size(), 1);
+        QCOMPARE(store.tasks(QStringLiteral("unity"))
+                     .first()
+                     .toObject()
+                     .value(QStringLiteral("state"))
+                     .toString(),
+                 QStringLiteral("failed"));
+
+        store.upsertAsset(QStringLiteral("a1"), QStringLiteral("blender"),
+                          QStringLiteral("/tmp/shop.glb"),
+                          QJsonObject{{"name", "便利店"}, {"kind", "model"}});
+        const QJsonArray assets = store.assets(QStringLiteral("blender"));
+        QCOMPARE(assets.size(), 1);
+        QCOMPARE(assets.first().toObject().value(QStringLiteral("path")).toString(),
+                 QStringLiteral("/tmp/shop.glb"));
+        QCOMPARE(assets.first().toObject().value(QStringLiteral("card")).toObject()
+                     .value(QStringLiteral("name"))
+                     .toString(),
+                 QStringLiteral("便利店"));
+        QCOMPARE(store.assets(QStringLiteral("unity")).size(), 0);
     }
 };
 

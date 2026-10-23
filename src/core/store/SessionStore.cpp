@@ -3,6 +3,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
+#include <QJsonDocument>
 #include <QJsonObject>
 #include <QSqlQuery>
 
@@ -44,6 +45,13 @@ bool SessionStore::open()
     // 分页查询走 (area, id)：定位到某个区、某条 id 之前，不扫其他区
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_area_id "
                           "ON messages(area, id)"));
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS tasks("
+                          "id TEXT PRIMARY KEY, area TEXT NOT NULL, kind TEXT NOT NULL,"
+                          "state TEXT NOT NULL, payload TEXT NOT NULL,"
+                          "result TEXT NOT NULL DEFAULT '{}', updated INTEGER NOT NULL)"));
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS assets("
+                          "id TEXT PRIMARY KEY, area TEXT NOT NULL, path TEXT NOT NULL,"
+                          "card TEXT NOT NULL, updated INTEGER NOT NULL)"));
     return true;
 }
 
@@ -131,4 +139,83 @@ QString SessionStore::draft(const QString& area) const
     q.addBindValue(area);
     q.exec();
     return q.next() ? q.value(0).toString() : QString();
+}
+
+void SessionStore::clearMessages(const QString& area)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM messages WHERE area=?"));
+    q.addBindValue(area);
+    q.exec();
+}
+
+void SessionStore::upsertTask(const QString& id, const QString& area, const QString& kind,
+                              const QString& state, const QJsonObject& payload,
+                              const QJsonObject& result)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("INSERT INTO tasks(id, area, kind, state, payload, result, updated)"
+                             " VALUES(?,?,?,?,?,?,?)"
+                             " ON CONFLICT(id) DO UPDATE SET state=excluded.state,"
+                             " result=excluded.result, updated=excluded.updated"));
+    q.addBindValue(id);
+    q.addBindValue(area);
+    q.addBindValue(kind);
+    q.addBindValue(state);
+    q.addBindValue(QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+    q.addBindValue(QString::fromUtf8(QJsonDocument(result).toJson(QJsonDocument::Compact)));
+    q.addBindValue(QDateTime::currentMSecsSinceEpoch());
+    q.exec();
+}
+
+QJsonArray SessionStore::tasks(const QString& area) const
+{
+    QJsonArray out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT id, kind, state, payload, result FROM tasks WHERE area=?"
+                             " ORDER BY updated DESC LIMIT 50"));
+    q.addBindValue(area);
+    q.exec();
+    while (q.next()) {
+        out.append(QJsonObject{
+            {"id", q.value(0).toString()},
+            {"kind", q.value(1).toString()},
+            {"state", q.value(2).toString()},
+            {"payload", QJsonDocument::fromJson(q.value(3).toString().toUtf8()).object()},
+            {"result", QJsonDocument::fromJson(q.value(4).toString().toUtf8()).object()}});
+    }
+    return out;
+}
+
+void SessionStore::upsertAsset(const QString& id, const QString& area, const QString& path,
+                               const QJsonObject& card)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("INSERT INTO assets(id, area, path, card, updated)"
+                             " VALUES(?,?,?,?,?)"
+                             " ON CONFLICT(id) DO UPDATE SET path=excluded.path,"
+                             " card=excluded.card, updated=excluded.updated"));
+    q.addBindValue(id);
+    q.addBindValue(area);
+    q.addBindValue(path);
+    q.addBindValue(QString::fromUtf8(QJsonDocument(card).toJson(QJsonDocument::Compact)));
+    q.addBindValue(QDateTime::currentMSecsSinceEpoch());
+    q.exec();
+}
+
+QJsonArray SessionStore::assets(const QString& area) const
+{
+    QJsonArray out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT id, path, card FROM assets WHERE area=?"
+                             " ORDER BY updated DESC"));
+    q.addBindValue(area);
+    q.exec();
+    while (q.next()) {
+        out.append(QJsonObject{
+            {"id", q.value(0).toString()},
+            {"path", q.value(1).toString()},
+            {"card", QJsonDocument::fromJson(q.value(2).toString().toUtf8()).object()}});
+    }
+    return out;
 }

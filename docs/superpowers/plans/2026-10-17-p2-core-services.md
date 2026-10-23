@@ -733,7 +733,7 @@ Expected: 编译通过，3 用例 Passed（WsServer 由 Task 6 集成测试覆�
 
 **Interfaces:**
 - `class SseParser { QList<Event> feed(const QByteArray& chunk); /* Event { QString event; QByteArray data; } */ }`
-- `class LlmGateway : QObject { struct StreamHandlers { std::function<void(QString delta)> onDelta; std::function<void(QJsonArray toolCalls)> onToolCalls; std::function<void(QString error)> onError; std::function<void()> onDone; }; void chatStream(LlmConfig, QJsonArray messages, QJsonArray tools, StreamHandlers); void abort(); }`
+- `class LlmGateway : QObject { struct StreamHandlers { std::function<void(QString delta)> onDelta; std::function<void(QJsonArray toolCalls)> onToolCalls; std::function<void(QString error)> onError; std::function<void()> onDone; }; void chatStream(LlmConfig, QJsonArray messages, QJsonArray tools, StreamHandlers, QString tag = {}); void abort(); void abortTag(QString tag); }`
   - `chatStream` 在 P2 实现中一度声明为 `virtual`（原计划让 P4 用子类 mock 重写，**该做法已废弃**）：P4 Task 1B 会删掉 `virtual`；LLM 测试一律用 `tests/mock/MockLlmServer`（`QTcpServer` 假服务端）走真实 HTTP + SSE，禁止子类替换、禁止回调注入绕过网络。
 - `struct LlmConfig { QString baseUrl; QString apiKey; QString model; }`
 - `namespace ToolBridge`（纯函数，无 Qt 网络/状态依赖）：
@@ -1297,9 +1297,10 @@ Expected: 全部测试 Passed（含 settings/session 往返、未知 method 错�
 
 **Files:**
 - Modify: `src/core/store/SessionStore.h/.cpp`（补 tasks / assets 表、clearMessages；上下文复用已有 messagePage，不再新增 recentMessages）
-- Modify: `src/core/coreapp/CoreApp.h/.cpp`（新增 3 个 handler、20 条上下文组装、每任务独立流缓冲）
+- Modify: `src/core/llm/LlmGateway.h/.cpp`（`chatStream` 增 `tag` 参数、新增 `abortTag(tag)`；`abort()` 仍保留给退出场景）
+- Modify: `src/core/coreapp/CoreApp.h/.cpp`（新增 4 个 handler、20 条上下文组装、每任务独立流缓冲、取消闸门）
 - Modify: `tests/tst_session_store.cpp`（追加 2 用例）
-- Modify: `tests/tst_headless_ws.cpp`（追加 retry/clear 用例）
+- Modify: `tests/tst_headless_ws.cpp`（追加 retry/clear/cancel/隔离 4 用例 + 迟到 SSE 桩）
 
 **Interfaces:**
 - Consumes: `SessionStore`（Task 2）、`TaskManager`（Task 3）、`CoreApp`（Task 6）。
@@ -1307,7 +1308,9 @@ Expected: 全部测试 Passed（含 settings/session 往返、未知 method 错�
   - LLM 上下文复用 Task 2 的 `messagePage(area, 20)`（取 `.messages` 后只保留 role/content），不再单独新增 `recentMessages`；分页与上下文裁剪共用同一查询。
   - `SessionStore::clearMessages(area)`、`SessionStore::upsertTask / tasks / upsertAsset / assets` — 对应规格 7.2 的「任务记录、资产卡引用」。
   - `CoreApp::registerBridge(area, std::function<bool()> restartFn)` — 由 P4（blender）/ P6（unity）注入桥接重启回调；未注册时 `bridge.restart` 返回 `bridge-not-registered`。
-  - 协议：`chat.cancel {area}`（只取消本区运行中/排队任务，保留消息与重试缓存；实现为 `TaskManager::cancelArea`）、`chat.clear {area}`（取消本区任务 + 清空本区消息 + 清掉重试缓存）、`chat.retry {area}`（重走最近一次 `chat.send` 参数，不重复落库 user 消息）。
+  - 协议：`chat.cancel {area}`（取消本区运行中/排队任务并**真正中断本区在途 HTTP 流**，保留消息与重试缓存）、`chat.clear {area}`（取消本区任务 + 中断本区流 + 清空本区消息 + 清掉重试缓存）、`chat.retry {area}`（重走最近一次 `chat.send` 参数，不重复落库 user 消息）。
+  - 取消的两层保障：`TaskManager::cancelArea` 只打标记，必须再调 `LlmGateway::abortTag(area)` 断网络（否则 UI 停了、token 还在烧）；反过来，`onDone` / `onError` 必须先查 `tm->isCancelled(tid)`，取消后迟到的回复只落 `state=cancelled`，不写 messages、不广播（否则 `chat.clear` 后消息会"复活"）。顺序固定：**先 cancelArea 再 abortTag**，这样 abort 同步触发 onError 时标记已就位。
+  - `LlmGateway::abortTag(area)` 依赖 `chatStream(..., tag=area)`：每条流登记 `reply -> tag`，只 abort 匹配项；`abort()` 仍是全量兜底（退出时用），**禁止**在按区取消里使用。
   - `chat.retry` 语义：重新提交整个任务（低模会重新规划；云任务由 P5 的 `Cloud3dService` 判断是否复用上次作业）。无重试目标时返回 `accepted=false, error=no-task-to-retry`。
 
 - [ ] **Step 1: 写 SessionStore 扩展的失败测试**
@@ -1496,7 +1499,7 @@ QJsonArray SessionStore::assets(const QString& area) const
 
 Run: `cmake --build build --config Debug --target tst_session_store`
 Run: `ctest --test-dir build -C Debug -R tst_session_store --output-on-failure`
-Expected: 5 用例 Passed。
+Expected: 全部用例 Passed（现有 7 个草稿/分页用例 + 新增 2 个，共 9 个；QtTest Totals 含 init/cleanup 显示 11 passed）。
 
 - [ ] **Step 3: 重写 CoreApp 的 chat handler**
 
@@ -1530,12 +1533,15 @@ private:
     });
     m_router->registerHandler("chat.cancel", [this](const QJsonObject& params) {
         const QString area = params.value("area").toString();
-        m_tasks->cancelArea(area); // 运行中任务在工具/回合边界停止，排队任务立即 finished(cancelled)
+        // 先打标记再断网络：abort 触发的 onError 必须能查到 cancelled
+        m_tasks->cancelArea(area);
+        m_llm->abortTag(area); // 只掐本区在途流，另一区的对话不受影响
         return QJsonValue(QJsonObject{{"ok", true}});
     });
     m_router->registerHandler("chat.clear", [this](const QJsonObject& params) {
         const QString area = params.value("area").toString();
         m_tasks->cancelArea(area); // 正在跑的任务放弃回写
+        m_llm->abortTag(area);
         m_sessions->clearMessages(area);
         m_lastSend.remove(area);
         return QJsonValue(QJsonObject{{"ok", true}});
@@ -1607,6 +1613,12 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
                                                        {{"area", area}, {"text", delta}});
                               };
                               h.onDone = [=]() {
+                                  // 取消/清空后迟到的 [DONE]：只记终态，不写库、不广播
+                                  if (tm->isCancelled(tid)) {
+                                      m_sessions->upsertTask(tid, area, "chat", "cancelled", params);
+                                      tm->finish(tid);
+                                      return;
+                                  }
                                   m_sessions->appendMessage(area, "assistant", *buf);
                                   m_sessions->upsertTask(tid, area, "chat", "done", params,
                                                          {{"reply", *buf}});
@@ -1617,6 +1629,12 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
                                   tm->finish(tid);
                               };
                               h.onError = [=](const QString& err) {
+                                  // abort 触发的 "Operation canceled" 不是错误：用户主动停的
+                                  if (tm->isCancelled(tid)) {
+                                      m_sessions->upsertTask(tid, area, "chat", "cancelled", params);
+                                      tm->finish(tid);
+                                      return;
+                                  }
                                   m_sessions->upsertTask(tid, area, "chat", "failed", params,
                                                          {{"error", err}});
                                   m_ws->broadcastEvent("error.card",
@@ -1624,7 +1642,7 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
                                   tm->finish(tid);
                               };
                               m_sessions->upsertTask(tid, area, "chat", "running", params);
-                              m_llm->chatStream(cfg, history, {}, h);
+                              m_llm->chatStream(cfg, history, {}, h, area); // tag=区名，供 abortTag 定点中止
                           }});
     return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
 }
@@ -1714,11 +1732,31 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
 
 > 如果 Task 6 的 `settingsAndSessionRoundTrip` 中的 `request` 辅助是函数内 lambda，不允许跨用例复用；此用例自带一份完整 lambda（上面已给出），无需重构原用例。
 
+- [ ] **Step 4b: 补"迟到回复"与"按区隔离"用例（取消真正生效）**
+
+实现时把 `request` 抽成 `WsClient`（内含事件流水 `m_log`，`eventsSince(mark)` 用来判断清空后有没有迟到广播），并加一个 400ms 后才回 SSE 的桩：
+
+```cpp
+// accept 后挂 400ms，再一次性回完整响应（Content-Length，不必 chunked）；写完不断开，
+// 这样"连接已断"只可能由 abortTag 造成。一个桩可接多条连接，用下标区分两个区。
+class DelayedSseServer : public QObject { /* m_sockets[i] / m_disconnected[i] */ };
+```
+
+三个用例的断言：
+
+| 用例 | 关键步骤 | 断言（修复前会怎样红） |
+|---|---|---|
+| `cancelKeepsMessagesAndStopsStream` | send → 等 accept → cancel → 等 700ms | 服务器 socket 断开（没 abortTag 则不会）；消息数仍为 1（方案 A 丢弃半截）；`tasks[0].state=="cancelled"`；`mark` 之后没有 `chat.message` / `error.card`（cancelArea 只打标记时，abort 的报错会漏成错误卡） |
+| `clearDropsLateReply` | send → 等 accept → clear → 等 700ms | 消息数为 0（没有 `isCancelled` 闸门时，迟到的 onDone 会把 assistant 写回来 → 1）；`state=="cancelled"`；无迟到广播；socket 已断开 |
+| `cancelEndsOnlyTargetArea` | blender 与 unity 各起一条流 → cancel blender | blender socket 断开、`!disconnectedAt(1)`（把 `abortTag` 换成全局 `abort()` 时正好红在这里，已做突变验证）→ clear unity 后第二条才断开 |
+
+另补 `sendsOnlyRecentTwentyMessagesAsContext`：预置 25 条旧消息后发一句，断言请求体里 `"role":` 恰好出现 20 次、含 m6 不含 m5、不含 `"ts":`；把 `messagePage(area, 20)` 改成 100 会红（已做突变验证）。
+
 - [ ] **Step 5: 构建并跑测试**
 
 Run: `cmake --build build --config Debug`
 Run: `ctest --test-dir build -C Debug --output-on-failure`
-Expected: `tst_session_store` 全部用例（含分页）+ `tst_headless_ws` 2 用例全部 Passed。
+Expected: `tst_session_store` 全绿（11 passed，含 9 用例）、`tst_headless_ws` 全绿（9 passed，含 7 用例）、全套 14/14。
 
 - [ ] **Step 6: Commit**
 
@@ -1735,8 +1773,8 @@ git commit -m "feat: 会话持久化补全（历史裁剪/清空/任务与资产
 - [ ] `synthforge_cli --headless` 启动后输出 `READY ws=...`，浏览器可用 wscat/DevTools 完成 settings.save → settings.get 往返
 - [ ] `sessions.db` 生成于数据目录且为 WAL 模式；重启后消息仍在
 - [ ] `session.load` 支持游标分页：默认 20 条/页，返回 `{messages,hasMore,nextCursor}`；`beforeId` 连续翻页无重复无缺口（`tst_session_store` 4 个分页用例覆盖）
-- [ ] `chat.send` 组装 LLM 上下文只取本区最近 20 条纯文本（role/content），不整表加载、不带 id/ts；长对话不会随时间无限膨胀（规格 8.4）
-- [ ] 未配置 Agent 密钥时 `chat.send` 触发 `error.card`（不崩溃、不调用 LLM）
-- [ ] `chat.cancel` / `chat.clear` 取消任务后 `finished(cancelled=true)` 事件可观测（消息不被清空的是 `chat.cancel`）
-- [ ] `chat.clear` 清空本区消息且不影响另一区；`chat.retry` 在无目标时返回 `no-task-to-retry`，有目标时以相同参数重新提交且不重复落库 user 消息
+- [ ] `chat.send` 组装 LLM 上下文只取本区最近 20 条纯文本（role/content），不整表加载、不带 id/ts；长对话不会随时间无限膨胀（规格 8.4；`tst_headless_ws::sendsOnlyRecentTwentyMessagesAsContext` 覆盖）
+- [ ] 未配置 Agent 密钥时 `chat.send` 触发 `error.card`（不崩溃、不调用 LLM；断言 `accepted=false` + `reason=agent-not-configured` + 事件流里有 `error.card`）
+- [ ] `chat.cancel` / `chat.clear` 取消任务后 `finished(cancelled=true)` 事件可观测（消息不被清空的是 `chat.cancel`）；且**本区在途 HTTP 流被真正中断**（另一个区的流不受影响，`tst_headless_ws::cancelEndsOnlyTargetArea` 覆盖）
+- [ ] `chat.clear` 清空本区消息且不影响另一区；**清空后迟到的 assistant 回复不落库、不广播**（`tasks` 终态 `cancelled`，`tst_headless_ws::clearDropsLateReply` 覆盖）；`chat.retry` 在无目标时返回 `no-task-to-retry`，有目标时以相同参数重新提交且不重复落库 user 消息
 - [ ] `bridge.restart` 在桥接未注册时返回 `bridge-not-registered`；P4 / P6 注入重启回调后由 P7 错误卡调用

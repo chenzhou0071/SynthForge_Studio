@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QJsonArray>
+#include <QJsonObject>
 #include <QSqlDatabase>
 #include <QString>
 
@@ -27,6 +28,17 @@ public:
     MessagePage messagePage(const QString& area, int limit = 20, qint64 beforeId = 0) const;
     void saveDraft(const QString& area, const QString& content);
     QString draft(const QString& area) const;
+
+    void clearMessages(const QString& area);
+    // 任务落库：同 id 幂等覆盖；payload/result 以 JSON 列存储
+    void upsertTask(const QString& id, const QString& area, const QString& kind,
+                    const QString& state, const QJsonObject& payload,
+                    const QJsonObject& result = QJsonObject{});
+    QJsonArray tasks(const QString& area) const; // 最近 50 条，updated 降序
+    // 资产落库：同 id 幂等覆盖；card 为资产卡片 JSON
+    void upsertAsset(const QString& id, const QString& area, const QString& path,
+                     const QJsonObject& card);
+    QJsonArray assets(const QString& area) const; // 旧→新
 
 private:
     QString m_path;

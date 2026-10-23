@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QHash>
 #include <QJsonArray>
 #include <QObject>
 #include <QSet>
@@ -31,12 +32,15 @@ public:
 
     explicit LlmGateway(QObject* parent = nullptr);
 
-    // 虚函数：P4 的 MockLlmServer 继承重写，按脚本喂真实 SSE 分片；生产只有这一实现
+    // 注：virtual 为 P2 遗留，P4 Task 1B 会移除；禁止子类 mock（测试一律走真实 HTTP + SSE）
     virtual void chatStream(const LlmConfig& cfg, const QJsonArray& messages,
-                            const QJsonArray& tools, StreamHandlers handlers);
-    void abort(); // 中止所有在途流（取消任务时用），每个流会走 onError
+                            const QJsonArray& tools, StreamHandlers handlers,
+                            const QString& tag = QString());
+    void abort();               // 中止所有在途流（退出时用），每个流会走 onError
+    void abortTag(const QString& tag); // 只中止该标签的流（按区取消用）
 
 private:
     QNetworkAccessManager* m_nam;
     QSet<QNetworkReply*> m_replies;
+    QHash<QNetworkReply*, QString> m_tags; // reply -> 调用方标签（通常是区名）
 };

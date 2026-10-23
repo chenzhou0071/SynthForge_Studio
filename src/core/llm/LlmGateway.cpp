@@ -66,7 +66,8 @@ LlmGateway::LlmGateway(QObject* parent)
 }
 
 void LlmGateway::chatStream(const LlmConfig& cfg, const QJsonArray& messages,
-                            const QJsonArray& tools, StreamHandlers handlers)
+                            const QJsonArray& tools, StreamHandlers handlers,
+                            const QString& tag)
 {
     QJsonObject body{{"model", cfg.model}, {"messages", messages}, {"stream", true}};
     if (!tools.isEmpty())
@@ -83,6 +84,7 @@ void LlmGateway::chatStream(const LlmConfig& cfg, const QJsonArray& messages,
 
     QNetworkReply* reply = m_nam->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
     m_replies.insert(reply);
+    m_tags.insert(reply, tag);
 
     auto state = std::make_shared<StreamState>();
     auto process = [state, handlers](const QList<SseParser::Event>& events) {
@@ -130,6 +132,7 @@ void LlmGateway::chatStream(const LlmConfig& cfg, const QJsonArray& messages,
     connect(reply, &QNetworkReply::finished, this,
             [this, reply, state, process, handlers]() {
                 m_replies.remove(reply);
+                m_tags.remove(reply);
                 if (reply->error() != QNetworkReply::NoError) {
                     if (!state->done && handlers.onError)
                         handlers.onError(reply->errorString());
@@ -145,6 +148,17 @@ void LlmGateway::chatStream(const LlmConfig& cfg, const QJsonArray& messages,
 void LlmGateway::abort()
 {
     const QSet<QNetworkReply*> replies = m_replies;
+    for (QNetworkReply* reply : replies)
+        reply->abort();
+}
+
+void LlmGateway::abortTag(const QString& tag)
+{
+    // 先收集再 abort：abort 会触发 finished，直接遍历会被 remove 掉元素
+    QList<QNetworkReply*> replies;
+    for (auto it = m_tags.constBegin(); it != m_tags.constEnd(); ++it)
+        if (it.value() == tag)
+            replies.append(it.key());
     for (QNetworkReply* reply : replies)
         reply->abort();
 }
