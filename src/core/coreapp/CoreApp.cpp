@@ -1,5 +1,6 @@
 #include "core/coreapp/CoreApp.h"
 
+#include "core/agent/SummarizerAgent.h"
 #include "core/llm/LlmGateway.h"
 #include "core/mcp/BridgeCommands.h"
 #include "core/mcp/McpRuntime.h"
@@ -19,22 +20,6 @@
 #include <memory>
 #include <stdexcept>
 #include <utility>
-
-namespace {
-
-// 预置服务商只存 model + key，baseUrl 从 providerBaseUrls 表取；自定义服务商才带 baseUrl
-QString resolveBaseUrl(const QJsonObject& primary, const QJsonObject& settings)
-{
-    const QString explicitUrl = primary.value(QStringLiteral("baseUrl")).toString();
-    if (!explicitUrl.isEmpty())
-        return explicitUrl;
-    return settings.value(QStringLiteral("providerBaseUrls"))
-        .toObject()
-        .value(primary.value(QStringLiteral("provider")).toString())
-        .toString();
-}
-
-} // namespace
 
 CoreApp::CoreApp(const CoreOptions& options, QObject* parent)
     : QObject(parent)
@@ -72,6 +57,21 @@ bool CoreApp::start()
     registerBridge(QStringLiteral("blender"), [this] { return m_blender->restart(); });
     m_preflight = std::make_unique<PreflightChecker>(m_settings.get(), m_blender);
 
+    m_summarizer = new SummarizerAgent(m_llm.get(), m_sessions.get(), m_settings.get(), this);
+    connect(m_summarizer, &SummarizerAgent::draftReady, this,
+            [this](const QString& area, const QString& prompt) {
+                m_ws->broadcastEvent(
+                    QStringLiteral("draft.created"),
+                    QJsonObject{{"area", area},
+                                {"taskId", QStringLiteral("draft-%1").arg(++m_seq)},
+                                {"prompt", prompt}});
+            });
+    connect(m_summarizer, &SummarizerAgent::failed, this,
+            [this](const QString& area, const QString& reason) {
+                m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                     QJsonObject{{"area", area}, {"reason", reason}});
+            });
+
     m_router->registerHandler(QStringLiteral("settings.get"), [this](const QJsonObject&) {
         return QJsonValue(m_settings->data());
     });
@@ -100,6 +100,35 @@ bool CoreApp::start()
     m_router->registerHandler(QStringLiteral("chat.send"),
                               [this](const QJsonObject& params) {
                                   return handleChatSend(params);
+                              });
+    m_router->registerHandler(QStringLiteral("draft.send"),
+                              [this](const QJsonObject& params) {
+                                  const QString area =
+                                      params.value(QStringLiteral("area")).toString();
+                                  const QString prompt =
+                                      params.value(QStringLiteral("prompt")).toString().trimmed();
+                                  if (area.isEmpty() || prompt.isEmpty())
+                                      return QJsonValue(QJsonObject{
+                                          {"accepted", false}, {"reason", "invalid-draft"}});
+                                  // 草稿确认后成为正式指令：落库 + 进历史（规格 5.2）；
+                                  // 规划阶段由 AgentOrchestrator 接管（Task 3）
+                                  m_sessions->saveDraft(area, prompt);
+                                  m_sessions->appendMessage(area, QStringLiteral("user"), prompt);
+                                  m_ws->broadcastEvent(
+                                      QStringLiteral("chat.message"),
+                                      QJsonObject{{"area", area},
+                                                  {"role", "user"},
+                                                  {"content", prompt}});
+                                  return QJsonValue(QJsonObject{{"accepted", true}});
+                              });
+    m_router->registerHandler(QStringLiteral("draft.cancel"),
+                              [this](const QJsonObject& params) {
+                                  const QString area =
+                                      params.value(QStringLiteral("area")).toString();
+                                  // content 列 NOT NULL：清空用空串，不能传 null QString
+                                  if (!area.isEmpty())
+                                      m_sessions->saveDraft(area, QStringLiteral(""));
+                                  return QJsonValue(QJsonObject{{"ok", true}});
                               });
     m_router->registerHandler(QStringLiteral("chat.retry"),
                               [this](const QJsonObject& params) {
@@ -198,7 +227,7 @@ LlmConfig CoreApp::primaryAgentConfig() const
                                    .toObject()
                                    .value(QStringLiteral("primary"))
                                    .toObject();
-    return {resolveBaseUrl(primary, data), primary.value(QStringLiteral("apiKey")).toString(),
+    return {resolveAgentBaseUrl(primary, data), primary.value(QStringLiteral("apiKey")).toString(),
             primary.value(QStringLiteral("model")).toString()};
 }
 
@@ -223,13 +252,32 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
 
     m_lastSend.insert(area, params);
 
-    if (appendUser) {
-        m_sessions->appendMessage(area, QStringLiteral("user"), text);
-        m_ws->broadcastEvent(QStringLiteral("chat.message"),
-                             QJsonObject{{"area", area}, {"role", "user"}, {"content", text}});
+    // 低模模式：先落库用户需求，再交给总结 agent 改写草稿（规格 5.2）
+    if (mode == QLatin1String("lowpoly")) {
+        if (appendUser) {
+            m_sessions->appendMessage(area, QStringLiteral("user"), text);
+            m_ws->broadcastEvent(
+                QStringLiteral("chat.message"),
+                QJsonObject{{"area", area}, {"role", "user"}, {"content", text}});
+        }
+        const LlmConfig cfg = primaryAgentConfig();
+        if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty() || cfg.model.isEmpty()) {
+            m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                 QJsonObject{{"area", area}, {"reason", "agent-not-configured"}});
+            return QJsonValue(
+                QJsonObject{{"accepted", false}, {"reason", "agent-not-configured"}});
+        }
+        m_summarizer->generate(area, text); // 草稿经 draft.created 下发
+        return QJsonValue(QJsonObject{{"accepted", true}});
     }
 
     if (mode == QLatin1String("cloud3d")) {
+        if (appendUser) {
+            m_sessions->appendMessage(area, QStringLiteral("user"), text);
+            m_ws->broadcastEvent(
+                QStringLiteral("chat.message"),
+                QJsonObject{{"area", area}, {"role", "user"}, {"content", text}});
+        }
         // P5 接管云 API 生成：先占位拒绝，避免落到通用流
         m_ws->broadcastEvent(QStringLiteral("error.card"),
                              QJsonObject{{"area", area}, {"reason", "cloud3d-not-implemented"}});
@@ -237,15 +285,15 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
                                       {"reason", "cloud3d-not-implemented"}});
     }
 
-    const QJsonObject data = m_settings->data();
-    const QJsonObject primary = data.value(QStringLiteral("agent"))
-                                   .toObject()
-                                   .value(QStringLiteral("primary"))
-                                   .toObject();
-    const QString baseUrl = resolveBaseUrl(primary, data);
-    const QString apiKey = primary.value(QStringLiteral("apiKey")).toString();
-    const QString model = primary.value(QStringLiteral("model")).toString();
-    if (apiKey.isEmpty() || model.isEmpty() || baseUrl.isEmpty()) {
+    // 通用流（无模式兼容路径）：user 消息在这里落库
+    if (appendUser) {
+        m_sessions->appendMessage(area, QStringLiteral("user"), text);
+        m_ws->broadcastEvent(QStringLiteral("chat.message"),
+                             QJsonObject{{"area", area}, {"role", "user"}, {"content", text}});
+    }
+
+    const LlmConfig cfg = primaryAgentConfig();
+    if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty() || cfg.model.isEmpty()) {
         m_ws->broadcastEvent(QStringLiteral("error.card"),
                              QJsonObject{{"area", area}, {"reason", "agent-not-configured"}});
         return QJsonValue(
@@ -260,7 +308,6 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
                                    {"content", message.value(QStringLiteral("content"))}});
     }
 
-    const LlmConfig cfg{baseUrl, apiKey, model};
     const QString taskId = QStringLiteral("chat-%1").arg(++m_seq);
     m_tasks->enqueue(Task{
         taskId, area, QString(),

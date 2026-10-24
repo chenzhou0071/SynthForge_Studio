@@ -26,6 +26,17 @@ QString dataDirFromArgs(const QStringList& args)
     return defaultDataDir();
 }
 
+QString resolveAgentBaseUrl(const QJsonObject& agent, const QJsonObject& settings)
+{
+    const QString explicitUrl = agent.value(QStringLiteral("baseUrl")).toString();
+    if (!explicitUrl.isEmpty())
+        return explicitUrl;
+    return settings.value(QStringLiteral("providerBaseUrls"))
+        .toObject()
+        .value(agent.value(QStringLiteral("provider")).toString())
+        .toString();
+}
+
 QJsonObject makeDefaultSettings()
 {
     auto provider = [](const QString& id) {

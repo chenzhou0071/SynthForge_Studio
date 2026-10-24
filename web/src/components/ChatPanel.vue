@@ -4,6 +4,7 @@ import { isCloudConfigured } from "../chat/cloud";
 import { toChatItems } from "../chat/history";
 import type { ChatItem } from "../chat/history";
 import type { WsClient } from "../ws/WsClient";
+import DraftCard from "./DraftCard.vue";
 
 type Area = "blender" | "unity";
 
@@ -105,6 +106,19 @@ onMounted(() => {
     props.client.on("asset.created", (data) => {
       if ((data as { area?: string }).area === props.area) busy.value = false; // 落盘即任务结束
     }),
+    props.client.on("draft.created", (data) => {
+      const draft = data as { area?: string; taskId?: string; prompt?: string };
+      if (draft.area !== props.area) return;
+      // 后端已停止生成，等用户编辑确认；发送后才进入规划
+      busy.value = false;
+      messages.value.push({
+        role: "draft",
+        content: draft.prompt ?? "",
+        taskId: draft.taskId,
+        mode: mode.value,
+      });
+      scrollToBottom();
+    }),
     props.client.on("error.card", (data) => {
       const card = data as { area?: string; reason?: string };
       if (card.area !== props.area) return;
@@ -148,6 +162,39 @@ async function send() {
     pushError(error instanceof Error ? error.message : "发送失败");
   }
   scrollToBottom();
+}
+
+function removeDraft(item: ChatItem) {
+  messages.value = messages.value.filter((message) => message !== item);
+}
+
+async function sendDraft(item: ChatItem, text: string) {
+  if (busy.value) return;
+  busy.value = true;
+  try {
+    const result = await props.client.request<{ accepted?: boolean }>("draft.send", {
+      area: props.area,
+      prompt: text,
+      mode: item.mode ?? mode.value,
+    });
+    if (result?.accepted === false) {
+      busy.value = false;
+      return;
+    }
+    removeDraft(item); // 已转为正式指令，后端会广播 chat.message(user)
+  } catch (error) {
+    busy.value = false;
+    pushError(error instanceof Error ? error.message : "发送失败");
+  }
+}
+
+async function cancelDraft(item: ChatItem) {
+  removeDraft(item);
+  try {
+    await props.client.request("draft.cancel", { area: props.area, taskId: item.taskId });
+  } catch (error) {
+    pushError(error instanceof Error ? error.message : "取消失败");
+  }
 }
 
 async function cancelTask() {
@@ -211,6 +258,13 @@ function onKeydown(event: KeyboardEvent) {
         <div v-else-if="message.role === 'error'" class="error-card">
           <strong>请求失败</strong>
           <p>{{ message.content }}</p>
+        </div>
+        <div v-else-if="message.role === 'draft'" class="draft-row">
+          <DraftCard
+            :prompt="message.content ?? ''"
+            @send="(text) => sendDraft(message, text)"
+            @cancel="cancelDraft(message)"
+          />
         </div>
         <div v-else class="bubble" :class="[message.role, { streaming: message.streaming }]">
           <p>{{ message.content }}<i v-if="message.streaming" class="caret" /></p>

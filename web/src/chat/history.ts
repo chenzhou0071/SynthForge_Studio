@@ -1,4 +1,4 @@
-export type ChatRole = "user" | "assistant" | "error" | "image";
+export type ChatRole = "user" | "assistant" | "error" | "image" | "draft";
 
 export interface ChatItem {
   role: ChatRole;
@@ -6,6 +6,8 @@ export interface ChatItem {
   dataUrl?: string;
   caption?: string;
   streaming?: boolean;
+  taskId?: string;
+  mode?: "lowpoly" | "cloud3d";
 }
 
 // session.load 返回 {messages, hasMore, nextCursor}；界面只认能渲染的两种角色

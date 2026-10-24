@@ -24,10 +24,17 @@ add_library(synthforge_core STATIC
     src/core/llm/SseParser.cpp
     src/core/llm/ToolBridge.cpp
     src/core/llm/LlmGateway.cpp
+    src/core/agent/SummarizerAgent.cpp
     src/core/coreapp/CoreApp.cpp
 )
 target_include_directories(synthforge_core PUBLIC src)
 target_link_libraries(synthforge_core PUBLIC Qt6::Core Qt6::Sql Qt6::WebSockets Qt6::Network)
+
+# 提示词模板编进 core 库；SummarizerAgent 显式 Q_INIT_RESOURCE 以保证静态库资源被链接
+qt_add_resources(synthforge_core "prompts"
+    PREFIX "/prompts"
+    BASE "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts"
+    FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/summarizer.md")
 
 enable_testing()
 
@@ -173,6 +180,14 @@ target_include_directories(tst_llm_gateway PRIVATE tests)
 target_link_libraries(tst_llm_gateway PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_llm_gateway COMMAND tst_llm_gateway)
 set_tests_properties(tst_llm_gateway PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_summarizer tests/tst_summarizer.cpp
+    tests/mock/MockLlmServer.cpp tests/mock/MockLlmServer.h)
+target_include_directories(tst_summarizer PRIVATE tests)
+target_link_libraries(tst_summarizer PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_summarizer COMMAND tst_summarizer)
+set_tests_properties(tst_summarizer PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
 add_executable(tst_headless_ws tests/tst_headless_ws.cpp)

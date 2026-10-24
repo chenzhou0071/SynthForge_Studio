@@ -9,6 +9,8 @@ QString defaultDataDir(); // %APPDATA%/SynthForgeStudio
 // 自动测试用它指向临时目录，避免写到真实用户配置。
 QString dataDirFromArgs(const QStringList& args);
 QJsonObject makeDefaultSettings();
+// 预置服务商只存 model + key，baseUrl 从 providerBaseUrls 表取；自定义服务商才带 baseUrl
+QString resolveAgentBaseUrl(const QJsonObject& agent, const QJsonObject& settings);
 
 class SettingsStore
 {

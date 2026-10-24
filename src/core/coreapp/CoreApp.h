@@ -20,6 +20,7 @@ class ProtocolRouter;
 class WsServer;
 class McpRuntime;
 class PreflightChecker;
+class SummarizerAgent;
 
 struct CoreOptions
 {
@@ -56,6 +57,7 @@ private:
     std::unique_ptr<LlmGateway> m_llm;
     McpRuntime* m_blender = nullptr; // QObject child，析构由 parent 负责
     std::unique_ptr<PreflightChecker> m_preflight;
+    SummarizerAgent* m_summarizer = nullptr; // QObject child，析构由 parent 负责
     QJsonArray m_blenderTools;
     QHash<QString, QString> m_status; // area -> off|reconnecting|ready
     QHash<QString, QString> m_hints;  // area -> 状态提示文案
