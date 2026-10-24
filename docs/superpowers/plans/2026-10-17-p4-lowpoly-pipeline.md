@@ -1588,9 +1588,12 @@ void AgentOrchestrator::onTurnFinished()   // 一轮 LLM 无工具调用时进�
                 "import bpy, os\n"
                 "folder = r\"%1\"\n"
                 "name = \"<草稿中的英文基名>\"\n"
-                "bpy.ops.export_scene.gltf(filepath=os.path.join(folder, name + \".glb\"), export_format='GLB')\n"
+                "bpy.ops.export_scene.gltf(filepath=os.path.join(folder, name + \".glb\"),\n"
+                "                          export_format='GLB', export_animations=True,\n"
+                "                          export_animation_mode='ACTIONS', export_frame_range=True)\n"
                 "bpy.ops.export_scene.fbx(filepath=os.path.join(folder, name + \".fbx\"))\n"
                 "bpy.ops.wm.save_as_mainfile(filepath=os.path.join(folder, name + \".blend\"))\n"
+                "不要删除场景里已有的关键帧动画（导出时它们会作为 GLB 动画保留）。"
                 "三个文件必须同基名；导出完成后停止调用工具。").arg(m_targetFolder)}});
         m_stream.clear();
         tick();
@@ -1957,7 +1960,7 @@ public:
     bool isValidTarget(const QString& relative) const; // canonical 前缀校验，防 ../ 逃逸
     QString absoluteFor(const QString& relative) const;
     QString relativeFor(const QString& absolute) const; // 越界或不存在返回空
-    QStringList scanModels() const;               // glb + fbx，供文件树与资产选择器
+    QStringList scanAssets() const;               // glb + fbx + blend，供文件树；AssetPicker 按 kind 过滤
 
     // 文件操作（fs.operate / folderPick.mkdir 后端）：返回错误码，空串=成功
     QString makeFolder(const QString& parentRelative, const QString& name);
@@ -1992,10 +1995,10 @@ QString AssetLibrary::relativeFor(const QString& absolute) const
     return QDir(root).relativeFilePath(path);
 }
 
-QStringList AssetLibrary::scanModels() const
+QStringList AssetLibrary::scanAssets() const
 {
     QStringList result;
-    QDirIterator it(m_root, {"*.glb", "*.fbx"}, QDir::Files,
+    QDirIterator it(m_root, {"*.glb", "*.fbx", "*.blend"}, QDir::Files,
                     QDirIterator::Subdirectories);
     while (it.hasNext())
         result << QDir(m_root).relativeFilePath(it.next());   // 统一正斜杠相对路径
@@ -2296,13 +2299,14 @@ Expected: 2 用例 Passed。
 
 ### Task 5: 文件树数据源 + three.js GLB 预览
 
-**Files:** Modify `web/src/components/FileTree.vue`、`PreviewPane.vue`、`App.vue`；Modify `CoreApp`（`assets.list`、`file.read`、`fileTree.changed`）。
+**Files:** Modify `web/src/components/FileTree.vue`、`PreviewPane.vue`、`App.vue`、`web/src/preview/file.ts`；Modify `CoreApp`（`assets.list`、`file.read`、`fileTree.changed`）。
 
 **Interfaces:**
-- 请求 `assets.list {}` → `[{name, relativePath, kind}]`（`kind ∈ glb|fbx`；目录由前端按相对路径聚合，FileTree 仅列 `kind==="glb"`，P6 AssetPicker 取 `glb`+`fbx`）；事件 `fileTree.changed {area:"blender", reason, paths}` 触发重新拉取（可直接全量刷新，`paths` 仅作后续优化）。
-- 请求 `file.read {area, path}` → `{ok, kind:'text'|'image'|'model', content?, dataUrl?, language?}`；blender 区路径相对资产库根（复用 `isValidTarget`）；unity 区由 P6 接管（P4 返回 `area-not-supported`）。
-- `PreviewPane` props 与 P3 Task 6 一致：`{area, file}`；`file.kind==='model'` 时用 three.js 加载 `file.dataUrl`；未选中 → 概览卡。
-- `App.vue`：FileTree `select(path)` → `file.read` → `previewFile`；订阅 `asset.created` → 用其相对路径 `path` 自动加载新资产。
+- 请求 `assets.list {}` → `[{name, relativePath, kind, size, modified}]`：`kind ∈ glb|fbx|blend`，**三种都返回**（目录由前端按相对路径聚合，FileTree 平铺三种文件；P6 AssetPicker 已在消费端按 `kind === "glb" || "fbx"` 过滤，不受影响）。
+- 请求 `file.read {area, path}` → `{ok, kind:'text'|'image'|'model'|'info', content?, dataUrl?, language?, size?, modified?, blendPath?}`；`kind==='info'` 是模型文件的**文件信息卡**（fbx/blend 不读内容）；模型三种格式额外返回 `blendPath`（同目录同名 `.blend` 的相对路径，没有则空串），供修改入口判定。blender 区路径相对资产库根（复用 `isValidTarget`）；unity 区由 P6 接管（P4 返回 `area-not-supported`）。
+- `PreviewPane` props 与 P3 Task 6 一致：`{area, file}`；`file.kind==='model'` 时用 three.js 加载 `file.dataUrl`；`file.kind==='info'` 渲染文件信息卡（类型/大小/修改时间/能否修改）；文件为 glb/fbx/blend 时**标题栏右侧显示 [修改此资产]**（emit `modify(path)`）；未选中 → 概览卡。加载完成后按包围球自动摆相机；`gltf.animations` 全部同时循环播放，底部显示播放/暂停与各段时长（无动画不显示），右上角常驻「完整材质、动画与特效请在 Blender 中查看」。
+- `App.vue`：FileTree `select(path)` → `file.read` → `previewFile`。FileTree 右键「修改此资产」与 PreviewPane 的 `modify` 事件走同一个 `requestModify(path)`：先 `file.read` 取 `blendPath` → 有则设为 `modifyTarget`（传给 ChatPanel），无则弹窗（见 Task 6）。订阅 `asset.created` → 用其相对路径 `path` 自动加载新资产。
+- **语义变更**：点文件只预览，不再等于修改；只有 [修改此资产] 按钮 / 右键菜单会把资产设为修改目标（替换 P4 早期的「选中即修改」）。
 
 `file.read` handler（CoreApp）：
 
@@ -2324,16 +2328,41 @@ m_router->registerHandler("file.read", [this](const QJsonObject& params) {
         QFile file(abs);
         if (!file.open(QIODevice::ReadOnly))
             return QJsonValue(QJsonObject{{"ok", false}, {"error", "io-error"}});
-        const QString mime = suffix == "png" ? QStringLiteral("image/png")
-                                             : QStringLiteral("image/jpeg");
+        QString mime = QStringLiteral("image/jpeg");
+        if (suffix == QLatin1String("png"))
+            mime = QStringLiteral("image/png");
+        else if (suffix == QLatin1String("webp"))
+            mime = QStringLiteral("image/webp");
         return QJsonValue(QJsonObject{
             {"ok", true}, {"kind", "image"},
             {"dataUrl", QStringLiteral("data:%1;base64,").arg(mime)
                             + QString::fromLatin1(file.readAll().toBase64())}});
     }
     if (suffix == "glb") {
-        return QJsonValue(QJsonObject{{"ok", true}, {"kind", "model"},
-                                      {"dataUrl", QUrl::fromLocalFile(abs).toString()}});
+        // 模型三种格式都回 blendPath：修改入口据此判断有没有可编辑源文件
+        const QFileInfo blend(info.dir().filePath(info.completeBaseName()
+                                                  + QStringLiteral(".blend")));
+        return QJsonValue(QJsonObject{
+            {"ok", true}, {"kind", "model"},
+            {"dataUrl", QUrl::fromLocalFile(abs).toString()},
+            {"blendPath", blend.exists()
+                              ? m_library->relativeFor(blend.absoluteFilePath())
+                              : QString()}});
+    }
+    // fbx / blend 不读内容（可能几十 MB），只回文件信息卡
+    if (suffix == "fbx" || suffix == "blend") {
+        const QFileInfo blend =
+            suffix == "blend"
+                ? info
+                : QFileInfo(info.dir().filePath(info.completeBaseName()
+                                                + QStringLiteral(".blend")));
+        return QJsonValue(QJsonObject{
+            {"ok", true}, {"kind", "info"},
+            {"size", static_cast<double>(info.size())},
+            {"modified", info.lastModified().toString(Qt::ISODate)},
+            {"blendPath", blend.exists()
+                              ? m_library->relativeFor(blend.absoluteFilePath())
+                              : QString()}});
     }
     QFile file(abs);
     if (!file.open(QIODevice::ReadOnly))
@@ -2350,16 +2379,18 @@ m_router->registerHandler("file.read", [this](const QJsonObject& params) {
 });
 ```
 
-`assets.list` handler（文件树与 AssetPicker 的唯一数据源；`kind` 为不含点后缀，返回 glb 与 fbx；目录由前端按相对路径聚合）：
+`assets.list` handler（文件树与 AssetPicker 的唯一数据源；`kind` 为不含点后缀，返回 glb/fbx/blend 三种；目录由前端按相对路径聚合）：
 
 ```cpp
 m_router->registerHandler("assets.list", [this](const QJsonObject&) {
     QJsonArray items;
-    for (const QString& relative : m_library->scanModels()) {
-        const QFileInfo info(relative);
-        items.append(QJsonObject{{"name", info.baseName()},
+    for (const QString& relative : m_library->scanAssets()) {
+        const QFileInfo info(m_library->absoluteFor(relative));
+        items.append(QJsonObject{{"name", info.completeBaseName()},
                                  {"relativePath", relative},
-                                 {"kind", info.suffix().toLower()}});
+                                 {"kind", info.suffix().toLower()},
+                                 {"size", static_cast<double>(info.size())},
+                                 {"modified", info.lastModified().toString(Qt::ISODate)}});
     }
     return QJsonValue(items);
 });
@@ -2368,6 +2399,25 @@ m_router->registerHandler("assets.list", [this](const QJsonObject&) {
 > 若 WebEngine 拒绝 `file:///`（自定义 scheme 页面跨 local 资源），把 glb 分支改为 `data:application/octet-stream;base64,` + 文件字节（低模 GLB 通常 < 5MB，内存可接受）。
 
 - [ ] **Step 1: 实现 PreviewPane 核心**
+
+先扩 P3 的类型契约 `web/src/preview/file.ts`（新增 `model` 与三个可选字段）：
+
+```ts
+export type PreviewKind = "text" | "image" | "info" | "model";
+
+export interface PreviewFile {
+  path: string;
+  kind: PreviewKind;
+  content?: string;
+  dataUrl?: string;
+  language?: string;
+  size?: number;       // info：字节数
+  modified?: string;   // info：ISO 时间
+  blendPath?: string;  // 模型文件同名 .blend 相对路径，无则空
+}
+```
+
+`PreviewPane.vue`：
 
 ```vue
 <script setup lang="ts">
@@ -2381,37 +2431,83 @@ import json from "highlight.js/lib/languages/json";
 import typescript from "highlight.js/lib/languages/typescript";
 import lua from "highlight.js/lib/languages/lua";
 import "highlight.js/styles/vs2015.css";
+import type { PreviewFile } from "../preview/file";
 
 hljs.registerLanguage("csharp", csharp);
 hljs.registerLanguage("json", json);
 hljs.registerLanguage("typescript", typescript);
 hljs.registerLanguage("lua", lua);
 
-interface PreviewFile {
-  path: string;
-  kind: "text" | "image" | "info" | "model";
-  content?: string;
-  dataUrl?: string;
-  language?: string;
-}
-
 const props = defineProps<{ area: "blender" | "unity"; file: PreviewFile | null }>();
+const emit = defineEmits<{ modify: [path: string] }>();
 const host = ref<HTMLDivElement>();
 const isModel = computed(() => props.file?.kind === "model");
 const loadError = ref("");
+const clips = ref<{ name: string; duration: number }[]>([]); // glb 自带的动画片段
+const playing = ref(true);
+
+const ASSET_SUFFIXES = ["glb", "fbx", "blend"];
+// 修改入口只属于 blender 模型库：P6 的 unity 树也会列 fbx，但不能走 .blend 修改流程
+const isAssetFile = computed(
+  () => props.area === "blender" && !!props.file
+    && ASSET_SUFFIXES.includes(props.file.path.split(".").pop()?.toLowerCase() ?? ""),
+);
+
+function baseName(path: string) {
+  return path.split("/").pop() ?? path;
+}
+
+function folderOf(path: string) {
+  const parts = path.split("/");
+  parts.pop();
+  return parts.length ? parts.join("/") : "模型库根目录";
+}
+
+function typeLabel(path: string) {
+  const suffix = path.split(".").pop()?.toLowerCase();
+  return suffix === "glb" ? "GLB 模型（可直接预览）"
+       : suffix === "fbx" ? "FBX 交换格式（导入 Unity 用）"
+       : "Blender 源文件（修改用）";
+}
+
+function formattedSize(bytes?: number) {
+  if (!bytes) return "—";
+  return bytes >= 1024 * 1024
+    ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+    : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+function formattedModified(iso?: string) {
+  return iso ? new Date(iso).toLocaleString() : "—";
+}
 
 let renderer: THREE.WebGLRenderer;
 let scene: THREE.Scene;
 let camera: THREE.PerspectiveCamera;
 let controls: OrbitControls;
 let loaded: THREE.Group | null = null;
+let mixer: THREE.AnimationMixer | null = null;
 let frame = 0;
+const clock = new THREE.Clock();
 
 function resize() {
   if (!host.value) return;
   renderer.setSize(host.value.clientWidth, host.value.clientHeight);
   camera.aspect = host.value.clientWidth / host.value.clientHeight;
   camera.updateProjectionMatrix();
+}
+
+// 资产尺度差异很大（1m 到几十米）：按包围球重新摆相机，否则动画摆了也看不见
+function fitCamera(object: THREE.Object3D) {
+  const sphere = new THREE.Box3().setFromObject(object).getBoundingSphere(new THREE.Sphere());
+  const size = Math.max(sphere.radius * 2, 0.1);
+  camera.position.copy(sphere.center)
+    .add(new THREE.Vector3(size * 0.55, size * 0.45, size * 0.7));
+  camera.near = Math.max(size / 1000, 0.001);
+  camera.far = size * 20;
+  camera.updateProjectionMatrix();
+  controls.target.copy(sphere.center);
+  controls.update();
 }
 
 onMounted(() => {
@@ -2426,6 +2522,9 @@ onMounted(() => {
   resize();
   const loop = () => {
     frame = requestAnimationFrame(loop);
+    const delta = Math.min(clock.getDelta(), 0.1); // 切标签页回来不跳帧
+    if (mixer && playing.value)
+      mixer.update(delta);
     controls.update();
     renderer.render(scene, camera);
   };
@@ -2434,7 +2533,14 @@ onMounted(() => {
 
 watch(() => props.file, (f) => {
   loadError.value = "";
+  playing.value = true;
+  clips.value = [];
   if (loaded) {
+    if (mixer) {
+      mixer.stopAllAction();
+      mixer.uncacheRoot(loaded);
+      mixer = null;
+    }
     scene.remove(loaded);
     loaded = null;
   }
@@ -2445,6 +2551,17 @@ watch(() => props.file, (f) => {
     (gltf) => {
       loaded = gltf.scene;
       scene.add(loaded);
+      fitCamera(loaded);
+      // glTF 只能携带物体 TRS 关键帧：把自带动画全部同时循环播放
+      if (gltf.animations.length) {
+        mixer = new THREE.AnimationMixer(loaded);
+        for (const clip of gltf.animations)
+          mixer.clipAction(clip).setLoop(THREE.LoopRepeat, Infinity).play();
+        clips.value = gltf.animations.map((c) => ({
+          name: c.name || "动画",
+          duration: c.duration,
+        }));
+      }
     },
     undefined,
     () => { loadError.value = "模型加载失败"; },
@@ -2454,6 +2571,10 @@ watch(() => props.file, (f) => {
 onBeforeUnmount(() => {
   cancelAnimationFrame(frame);
   window.removeEventListener("resize", resize);
+  if (mixer) {
+    mixer.stopAllAction();
+    mixer = null;
+  }
   renderer.dispose();
 });
 
@@ -2465,45 +2586,140 @@ function highlighted(content: string, language?: string) {
 
 <template>
   <section class="preview">
-    <div ref="host" class="canvas-host" :class="{ hidden: !isModel }" />
-    <p v-if="isModel && loadError" class="info-card">{{ loadError }}</p>
-    <template v-else-if="!isModel && file">
-      <img v-if="file.kind === 'image'" :src="file.dataUrl" class="preview-image" :alt="file.path" />
-      <pre v-else-if="file.kind === 'text'" class="code"><code v-html="highlighted(file.content ?? '', file.language)" /></pre>
-      <div v-else class="info-card">
-        <h3>{{ file.path }}</h3>
-        <p>暂无可用预览</p>
+    <header class="panel-head">
+      <span>预览</span>
+      <span v-if="file" class="preview-path">{{ file.path }}</span>
+      <button v-if="isAssetFile" class="modify-btn" @click="emit('modify', file!.path)">
+        修改此资产
+      </button>
+    </header>
+
+    <div class="preview-body">
+      <div ref="host" class="canvas-host" :class="{ hidden: !isModel }" />
+      <p v-if="isModel && loadError" class="info-card">{{ loadError }}</p>
+
+      <!-- GLB 只承载几何、基础材质与物体关键帧；其余效果要回 Blender 看 -->
+      <p v-if="isModel && !loadError" class="preview-note">
+        完整材质、动画与特效请在 Blender 中查看
+      </p>
+      <div v-if="isModel && clips.length" class="anim-bar">
+        <button class="anim-toggle" @click="playing = !playing">
+          {{ playing ? "暂停" : "播放" }}
+        </button>
+        <span v-for="(clip, index) in clips" :key="index" class="anim-clip">
+          {{ clip.name }} {{ clip.duration.toFixed(1) }}s
+        </span>
       </div>
-    </template>
-    <div v-else-if="!isModel" class="info-card">
-      <h3>{{ area === "blender" ? "资产库概览" : "工程信息" }}</h3>
-      <p>{{ area === "blender" ? "选中资产后在此预览" : "选中文件后在此预览" }}</p>
+
+      <template v-if="!isModel && file">
+        <img v-if="file.kind === 'image'" :src="file.dataUrl" class="preview-image" :alt="file.path" />
+        <pre v-else-if="file.kind === 'text'" class="code"><code v-html="highlighted(file.content ?? '', file.language)" /></pre>
+        <div v-else-if="file.kind === 'info'" class="info-card file-info">
+          <h3>{{ baseName(file.path) }}</h3>
+          <dl>
+            <dt>类型</dt><dd>{{ typeLabel(file.path) }}</dd>
+            <dt>大小</dt><dd>{{ formattedSize(file.size) }}</dd>
+            <dt>修改时间</dt><dd>{{ formattedModified(file.modified) }}</dd>
+            <dt>所在目录</dt><dd>{{ folderOf(file.path) }}</dd>
+            <dt>可修改</dt>
+            <dd>{{ file.blendPath ? "是 · 已找到同名的 .blend 源文件" : "否 · 没有 .blend 源文件" }}</dd>
+          </dl>
+          <p v-if="!file.blendPath" class="file-info-hint">
+            3D 高模（云 API 生成）与外部导入的模型只能重新生成，无法对话修改。
+          </p>
+        </div>
+        <div v-else class="info-card">
+          <h3>{{ file.path }}</h3>
+          <p>暂无可用预览</p>
+        </div>
+      </template>
+      <div v-else-if="!isModel" class="info-card">
+        <h3>{{ area === "blender" ? "资产库概览" : "工程信息" }}</h3>
+        <p>{{ area === "blender" ? "点击 GLB 预览模型；FBX / BLEND 显示文件信息" : "选中文件后在此预览" }}</p>
+      </div>
     </div>
   </section>
 </template>
 
 <style scoped>
-.preview { flex: 1; min-width: 0; position: relative; background: #1e1e1e; }
+.preview { flex: 1; min-width: 0; display: flex; flex-direction: column; background: #1e1e1e; }
+.preview-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #999; }
+.modify-btn { flex: none; padding: 2px 10px; font-size: 12px; }
+/* canvas 铺满内容区（不能 inset:0 到整个 section，否则盖住标题栏） */
+.preview-body { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .canvas-host { position: absolute; inset: 0; }
 .canvas-host.hidden { display: none; }
+.preview-note {
+  position: absolute; top: 10px; right: 12px; z-index: 1;
+  margin: 0; padding: 4px 8px;
+  font-size: 11px; color: #999;
+  background: rgba(20, 20, 20, 0.65);
+  border-radius: 3px;
+  pointer-events: none; /* 不挡鼠标拖拽旋转 */
+}
+.anim-bar {
+  position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 1;
+  display: flex; align-items: center; gap: 10px;
+  max-width: calc(100% - 24px); overflow-x: auto;
+  padding: 6px 12px;
+  font-size: 12px; color: #ccc;
+  background: rgba(20, 20, 20, 0.75);
+  border-radius: 4px;
+}
+.anim-toggle { flex: none; padding: 2px 10px; font-size: 12px; }
+.anim-clip { flex: none; color: #999; white-space: nowrap; }
 .preview-image { max-width: 100%; max-height: 100%; margin: auto; object-fit: contain; }
 .code { position: absolute; inset: 0; overflow: auto; margin: 0; padding: 12px; }
 .info-card { margin: auto; text-align: center; color: #999; }
+.file-info { min-width: 280px; text-align: left; }
+.file-info h3 { margin: 0 0 12px; color: #ddd; font-size: 14px; }
+.file-info dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; margin: 0; font-size: 12px; }
+.file-info dt { color: #777; }
+.file-info dd { margin: 0; word-break: break-all; }
+.file-info-hint { margin: 12px 0 0; color: #d7a55a; font-size: 12px; }
 </style>
 ```
 
 依赖增量：`web/package.json` 加 `"three": "^0.169.0"`、`"@types/three": "^0.169.0"`（`highlight.js` 已在 P3 Task 6 安装）。
 
-`FileTree.vue`：在 P3 Task 6 的右键菜单骨架上填数据：`assets.list` 拉取 → 按 `kind === "glb"` 过滤出文件项 → 文件夹可折叠 + `.glb` 文件项（`.blend`/`.fbx` 仅作为资产卡引用不单独列出，规格 4.4；fbx 仅供 P6 AssetPicker 消费）；点击文件 emit `select(relativePath)`；`fileTree.changed` → 重新拉取；右键节点的 `path` 使用相对路径。
+`FileTree.vue`：在 P3 Task 6 的右键菜单骨架上填数据：`assets.list` 拉取 → 目录按相对路径聚合成可折叠节点，**三种模型文件平铺列出**（每行 = 文件名 + 后缀标签；glb 正常色，fbx/blend 用 `--muted` 淡一档，让人一眼看出哪个能直接预览）；点击任意文件 emit `select(relativePath)`；`fileTree.changed` → 重新拉取；右键节点的 `path` 使用相对路径。
 
-`App.vue` 接线（在 P3 Task 6 的 `previewFile` 基础上）：
+模型文件项的右键菜单在既有五项后追加一条 **修改此资产**（`emit("modify", path)`，由 App 统一判定）；目录项与根不显示该条。`.blend` / `.fbx` 同样提供入口——是否有可编辑源文件由 App 拿 `file.read` 的 `blendPath` 判断，不在树里做二次推断（避免树与后端各算一套）。
+
+`App.vue` 接线（在 P3 Task 6 的 `previewFile` 基础上，新增 `modifyTarget`）：
 
 ```ts
+// previewFile 已在 P3 Task 6 声明，直接复用
+const modifyTarget = ref<string | null>(null); // 已归一化到 .blend 的修改目标
+
+async function readFile(path: string) {
+  return (await client.request("file.read", { area: active.value, path })) as any;
+}
+
 async function openPreview(path: string) {
-  const res: any = await client.request("file.read", { area: active.value, path });
+  const res = await readFile(path);
   if (res.ok)
-    previewFile.value = { path, kind: res.kind, content: res.content,
-                          dataUrl: res.dataUrl, language: res.language };
+    previewFile.value = {
+      path, kind: res.kind, content: res.content, dataUrl: res.dataUrl,
+      language: res.language, size: res.size, modified: res.modified,
+      blendPath: res.blendPath,
+    };
+}
+
+// 修改入口：预览区按钮与树右键菜单共用。没有 .blend 时明确告知只能重新生成
+async function requestModify(path: string) {
+  const res = await readFile(path);
+  if (!res.ok)
+    return;
+  if (!res.blendPath) {
+    window.alert(
+      "无法修改此资产\n\n" +
+      "未找到同名的 .blend 源文件。\n" +
+      "3D 高模（云 API 生成）与外部导入的模型不支持对话修改，只能重新生成。",
+    );
+    return;
+  }
+  modifyTarget.value = res.blendPath; // 输入框上方出现 chip，随下一条消息发给 chat.send
 }
 
 onMounted(() => {
@@ -2517,12 +2733,15 @@ onMounted(() => {
 
 > 同时把 P3 `App.vue` 的 `previewFile` 类型扩为 `"text" | "image" | "info" | "model"`，与 P4 `PreviewFile` 保持一致（`QUrl` 需在 `CoreApp.cpp` 顶部 `#include <QUrl>`）。
 
-`<FileTree @select="openPreview" ... />`、`<ChatPanel ... :selected-asset="..." />`（Task 6）。
+`<FileTree @select="openPreview" @modify="requestModify" ... />`、`<PreviewPane ... @modify="requestModify" />`、`<ChatPanel ... :selected-asset="modifyTarget" @clear-asset="modifyTarget = null" />`（Task 6）。
 
 - [ ] **Step 2: 手工验收（P4 总验收）**
 
 1. 真实链路：Blender 打开且插件运行；发送「做三个低模木箱」→ 草稿卡出现；双击可编辑；发送 → 计划卡出现（分组/验收标准可读）→ [开始生成] → 选 `Props/` 子目录 → 步骤卡逐步更新 + `task.progress` 显示当前组 → 对话区出现截图 → 完成后文件树出现 `Props/xxx.glb`，点击可预览旋转。
-2. 拒绝路径：关掉 Blender 插件 → 发送 → 立刻出现 `blender-not-ready` 错误卡，无总结 agent 请求。
+2. 三文件平铺：同一目录下 `xxx.glb` / `xxx.fbx` / `xxx.blend` 三行都在；点 glb → 3D 预览；点 fbx 或 blend → 中间显示文件信息卡（类型/大小/修改时间/目录/可修改=是）。
+3. 修改入口：点 glb → 预览区右上出现 [修改此资产] → 点击 → 输入框上方 chip 显示 `目标资产：xxx`（指向 .blend）；删掉该资产的 .blend 后再点 → 弹窗「无法修改此资产 …只能重新生成」。
+4. 动画：生成一个带可导出动效的资产（门开合 / 招牌轻摆 / 指针转动）→ 预览自动循环播放，底部动画条列出各段名称与时长，暂停 / 播放按钮生效；无动画的资产不显示动画条；相机自动对准模型。
+5. 拒绝路径：关掉 Blender 插件 → 发送 → 立刻出现 `blender-not-ready` 错误卡，无总结 agent 请求。
 
 - [ ] **Step 3: Commit**（`feat: 资产文件树与 three.js GLB 预览`）
 
@@ -2530,14 +2749,18 @@ onMounted(() => {
 
 ### Task 6: 修改已有资产（跳过草稿/计划）
 
-**Files:** Modify `CoreApp`（`chat.send` 增加 `mode:"modify"` + `asset` 参数）、`web/src/components/ChatPanel.vue`（目标资产 chip）、`App.vue`（FileTree 选中项传给 ChatPanel）；无新 C++ 模块（复用 `AgentOrchestrator::execute`）。
+**Files:** Modify `CoreApp`（`chat.send` 增加 `mode:"modify"` + `asset` 参数）、`web/src/components/ChatPanel.vue`（目标资产 chip）、`App.vue`（`modifyTarget` 传给 ChatPanel）；无新 C++ 模块（复用 `AgentOrchestrator::execute`）。
 
 **Interfaces:**
-- 前端：FileTree 选中 `.glb` → ChatPanel 输入框上方显示 `目标资产：<name> ✕` chip；发送 `chat.send {area:"blender", mode:"modify", asset:"道具/sword_01/sword_01.glb", text:"把剑改短一点"}`。
-- `CoreApp`：`mode=="modify"` → `checkLowpoly()` → 校验 `asset` 在库内且存在（否则返回 `{"accepted":false, "error":"asset-not-found"}`，不占 error.card 字典）→ 构造单组计划并调 `execute()`，**不经过** SummarizerAgent、plan 卡、folderPick。
+- 前端：**不再「选中即修改」**。点文件只预览；[修改此资产] 按钮或右键菜单 → Task 5 的 `requestModify(path)` → `file.read` 取 `blendPath`：
+  - 有 → `modifyTarget = blendPath`，ChatPanel 输入框上方显示 `目标资产：<name> ✕` chip；
+  - 无 → 弹窗「无法修改此资产 / 未找到同名的 .blend 源文件 / 3D 高模（云 API 生成）与外部导入的模型不支持对话修改，只能重新生成」。
+  - 发送 `chat.send {area:"blender", mode:"modify", asset:"道具/sword_01/sword_01.blend", text:"把剑改短一点"}`（`asset` 恒为 `.blend` 相对路径）。
+- `CoreApp`：`mode=="modify"` → `checkLowpoly()` → **把 `asset` 归一化到同目录同名 `.blend`**（传 glb/fbx 也能工作，作为前端预检的兜底）→ 不存在/越界返回 `{"accepted":false, "error":"no-blend-source"}`（不占 error.card 字典）→ 构造单组计划并调 `execute()`，**不经过** SummarizerAgent、plan 卡、folderPick。
 - 门禁：`execute()` 以 `"blender-agent"` 获取同一把 `BlenderGate`；Unity 转换进行中直接 `failed("blender-busy")`，用户等待后重新发送修改指令。
-- prompt 包装：`"打开并修改已有资产 <绝对路径>。要求：<用户原话>。完成后覆盖导出同名 GLB/FBX 并保存 .blend。"`；`targetFolder = 资产所在目录`。
+- prompt 包装：`"打开 .blend 源文件 <绝对路径>。要求：<用户原话>。保留场景里已有的可导出动效（物体关键帧），不要删除或覆盖。完成后覆盖导出同名 GLB/FBX 并保存 .blend。"`；`targetFolder = 资产所在目录`。
 - 完成后 `asset.created` 同名覆盖并触发 `fileTree.changed`。
+- 云 API 资产没有 `.blend`，天然落进「无源文件」分支；混合素材（外部导入 glb）同理。v1 不做版本管理。
 
 - [ ] **Step 1: CoreApp 接线**
 
@@ -2547,11 +2770,20 @@ onMounted(() => {
 if (mode == "modify") {
     const QString area = params.value("area").toString(QStringLiteral("blender"));
     const QString asset = params.value("asset").toString();
-    const QString text = params.value("text").toString();
-    const QFileInfo info(m_library->absoluteFor(asset));
-    if (asset.isEmpty() || !info.exists()
-        || !m_library->isValidTarget(QFileInfo(asset).path()))
-        return QJsonValue(QJsonObject{{"accepted", false}, {"error", "asset-not-found"}});
+    const QString text = params.value("text").toString().trimmed();
+    // 修改锚点统一是 .blend：传 glb/fbx 时自动找同目录同名源文件
+    QFileInfo info;
+    if (!asset.isEmpty()) {
+        info = QFileInfo(m_library->absoluteFor(asset));
+        if (info.suffix().toLower() != QLatin1String("blend"))
+            info = QFileInfo(info.dir().filePath(info.completeBaseName()
+                                                 + QStringLiteral(".blend")));
+    }
+    const QString blendRelative =
+        info.exists() ? m_library->relativeFor(info.absoluteFilePath()) : QString();
+    if (asset.isEmpty() || text.isEmpty() || blendRelative.isEmpty()
+        || !m_library->isValidTarget(blendRelative))
+        return QJsonValue(QJsonObject{{"accepted", false}, {"error", "no-blend-source"}});
     if (appendUser) {
         m_sessions->appendMessage(area, "user", text);
         m_ws->broadcastEvent("chat.message",
@@ -2562,7 +2794,8 @@ if (mode == "modify") {
         BuildGroup{QStringLiteral("修改资产"), {},
                    QStringLiteral("修改意图达成；同名 GLB/FBX/blend 已覆盖")});
     plan.maxSteps = 50;
-    const QString prompt = QStringLiteral("打开并修改已有资产 %1。要求：%2。"
+    const QString prompt = QStringLiteral("打开 .blend 源文件 %1。要求：%2。"
+                                          "保留场景里已有的可导出动效（物体关键帧），不要删除或覆盖。"
                                           "完成后覆盖导出同名 GLB/FBX 并保存 .blend。")
                                .arg(info.absoluteFilePath(), text);
     const QString taskId = QStringLiteral("chat-%1").arg(++m_seq);
@@ -2587,33 +2820,41 @@ const props = defineProps<{
   client: WsClient;
   selectedAsset?: string;
 }>();
+const emit = defineEmits<{ clearAsset: [] }>();
 
 async function send() {
   const text = input.value.trim();
   if (!text) return;
   input.value = "";
+  // modifyTarget 只由 [修改此资产] / 右键菜单设定，点文件不会触发修改
   const modify = props.area === "blender" && !!props.selectedAsset;
   const res: any = await props.client.request("chat.send", {
     area: props.area,
-    // 选中资产 → modify；否则 blender 区用顶部模式切换（lowpoly/cloud3d）
+    // 有修改目标 → modify；否则 blender 区用顶部模式切换（lowpoly/cloud3d）
     mode: modify ? "modify" : props.area === "blender" ? mode.value : undefined,
     text,
     asset: modify ? props.selectedAsset : undefined,
   });
+  if (res?.error === "no-blend-source") {
+    window.alert("无法修改此资产：源文件已不存在，请重新选择。");
+    emit("clearAsset");
+    return;
+  }
   busy.value = res?.accepted !== false; // 被前置检查拒绝时不进入“进行中”
+  if (res?.accepted !== false && modify) emit("clearAsset"); // 一次修改一条指令
 }
 ```
 
 ```vue
 <div v-if="selectedAsset" class="asset-chip">
-  目标资产：{{ selectedAsset.split("/").pop() }}
+  目标资产：{{ selectedAsset.split("/").pop()?.replace(/\.blend$/, "") }}
   <button @click="emit('clearAsset')">✕</button>
 </div>
 ```
 
-`App.vue` 把 FileTree 的 `select` 结果同时传给 `ChatPanel:selected-asset`（与 PreviewPane 共用选中状态）；chip 的 `✕` 清空选中。
+`App.vue` 把 `modifyTarget`（已归一化的 `.blend` 相对路径）传给 `ChatPanel:selected-asset`；chip 的 `✕` 和提交成功后都清空。
 
-- [ ] **Step 3: 手工验证**（选中已有资产 → 输入修改指令 → 步骤卡执行 → 检查 .glb 修改时间与预览更新 → 文件树刷新；确认全程未出现草稿卡/计划卡/位置弹窗）
+- [ ] **Step 3: 手工验证**（点 glb 仅预览、**不应**出现 chip → 点 [修改此资产] → chip 出现且指向 .blend → 输入修改指令 → 步骤卡执行 → 检查 .glb 修改时间与预览更新 → 文件树刷新；确认全程未出现草稿卡/计划卡/位置弹窗；再对一个没有 .blend 的 glb 点按钮 → 弹窗提示只能重新生成）
 
 - [ ] **Step 4: Commit**（`feat: 修改已有资产（跳过草稿与计划，直接执行）`）
 
@@ -2631,4 +2872,9 @@ async function send() {
 - [ ] 取消任务后 MCP 调用在工具边界停止，任务事件 `finished(cancelled=true)`；草稿/规划/计划/执行四个可等待阶段的「停止」均生效（规划丢弃迟到结果不弹卡）
 - [ ] `tst_preflight`、`tst_mcp_runtime`、`tst_blender_gate`、`tst_asset_library`、`tst_orchestrator`、`tst_llm_gateway` 全绿（`tst_orchestrator` 6 用例，含门禁忙拒绝与成功释放；`tst_llm_gateway` 7 用例走真实 HTTP+SSE，删掉 `LlmGateway` 的 `readyRead`/`finished` 分支必须变红）
 - [ ] `fs.operate` 五项操作全部可用（mkdir/rename/delete/reveal/refresh），越界路径返回 `invalid-path`；`folderPick.mkdir` 可在弹窗内新建文件夹
-- [ ] `file.read` 支持文本/图片/GLB 三类；`asset.created` 后预览区自动加载新资产；未选中时显示概览卡
+- [ ] `file.read` 支持文本 / 图片 / GLB / 模型文件信息卡四类，模型文件返回 `blendPath`；`asset.created` 后预览区自动加载新资产；未选中时显示概览卡
+- [ ] 资产树平铺 glb/fbx/blend 三种文件；点 glb 出 3D 预览，点 fbx/blend 出文件信息卡；点文件**不**产生修改 chip
+- [ ] [修改此资产] 按钮与右键菜单都能进入修改模式（chip 指向 `.blend`）；无 `.blend` 时弹窗说明只能重新生成，且不发 `chat.send`
+- [ ] glb 自带的物体关键帧动画全部自动循环播放，底部动画条显示播放 / 暂停与各段时长，无动画时不显示；相机按包围球自动定位
+- [ ] 预览区右上角常驻「完整材质、动画与特效请在 Blender 中查看」
+- [ ] 修改资产后原可导出动效仍在（导出命令带 `export_animations=True` 且 agent 未删关键帧）
