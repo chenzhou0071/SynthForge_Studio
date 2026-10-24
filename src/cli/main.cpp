@@ -22,11 +22,16 @@ int main(int argc, char* argv[])
     QCoreApplication::setApplicationName(QStringLiteral("SynthForgeStudio"));
 
     // headless 核心服务：起 WebSocket，向 stderr 输出带 token 的地址后进入事件循环
-    if (QCoreApplication::arguments().contains(QStringLiteral("--headless"))) {
-        CoreApp core({defaultDataDir(), true});
+    const QStringList args = QCoreApplication::arguments();
+    if (args.contains(QStringLiteral("--headless"))) {
+        const QString dataDir = dataDirFromArgs(args);
+        // 先亮出实际数据目录：自动测试靠它确认没有写到真实用户配置
+        std::fprintf(stderr, "data dir: %s\n", dataDir.toUtf8().constData());
+        std::fflush(stderr);
+        CoreApp core({dataDir, true});
         if (!core.start()) {
             std::fprintf(stderr, "error: core start failed (data dir: %s)\n",
-                         defaultDataDir().toUtf8().constData());
+                         dataDir.toUtf8().constData());
             std::fflush(stderr);
             return 1;
         }

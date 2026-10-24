@@ -2,8 +2,12 @@
 
 #include <QJsonObject>
 #include <QString>
+#include <QStringList>
 
 QString defaultDataDir(); // %APPDATA%/SynthForgeStudio
+// --data-dir <path> / --data-dir=<path> 覆盖默认目录；缺省或值为空时回落默认值。
+// 自动测试用它指向临时目录，避免写到真实用户配置。
+QString dataDirFromArgs(const QStringList& args);
 QJsonObject makeDefaultSettings();
 
 class SettingsStore

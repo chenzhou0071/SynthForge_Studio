@@ -29,7 +29,7 @@ int main(int argc, char* argv[])
                      ? QUrl(args.at(devIdx + 1))
                      : QUrl(QStringLiteral("app://ui/index.html"));
 
-    CoreApp core({defaultDataDir(), false});
+    CoreApp core({dataDirFromArgs(args), false});
     if (!core.start())
         return 1;
 

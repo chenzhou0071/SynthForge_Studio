@@ -10,6 +10,22 @@ QString defaultDataDir()
     return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
 }
 
+QString dataDirFromArgs(const QStringList& args)
+{
+    const QString flag = QStringLiteral("--data-dir");
+    for (int i = 0; i < args.size(); ++i) {
+        const QString& arg = args.at(i);
+        if (arg == flag && i + 1 < args.size() && !args.at(i + 1).isEmpty())
+            return args.at(i + 1);
+        if (arg.startsWith(flag + QLatin1Char('='))) {
+            const QString value = arg.mid(flag.size() + 1);
+            if (!value.isEmpty())
+                return value;
+        }
+    }
+    return defaultDataDir();
+}
+
 QJsonObject makeDefaultSettings()
 {
     auto provider = [](const QString& id) {

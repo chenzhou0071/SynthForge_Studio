@@ -20,6 +20,34 @@ private slots:
                  QStringLiteral("https://api.deepseek.com/v1"));
     }
 
+    void dataDirFromArgsUsesExplicitValue()
+    {
+        const QStringList args{QStringLiteral("synthforge_cli"), QStringLiteral("--headless"),
+                               QStringLiteral("--data-dir"), QStringLiteral("E:/tmp/t5")};
+        QCOMPARE(dataDirFromArgs(args), QStringLiteral("E:/tmp/t5"));
+    }
+
+    void dataDirFromArgsAcceptsEqualsForm()
+    {
+        const QStringList args{QStringLiteral("synthforge_cli"),
+                               QStringLiteral("--data-dir=E:/tmp/t5b")};
+        QCOMPARE(dataDirFromArgs(args), QStringLiteral("E:/tmp/t5b"));
+    }
+
+    void dataDirFromArgsFallsBackWhenMissing()
+    {
+        const QStringList args{QStringLiteral("synthforge_cli"), QStringLiteral("--headless")};
+        QCOMPARE(dataDirFromArgs(args), defaultDataDir());
+    }
+
+    void dataDirFromArgsFallsBackWhenValueEmpty()
+    {
+        const QStringList dangling{QStringLiteral("synthforge_cli"), QStringLiteral("--data-dir")};
+        QCOMPARE(dataDirFromArgs(dangling), defaultDataDir());
+        const QStringList empty{QStringLiteral("synthforge_cli"), QStringLiteral("--data-dir=")};
+        QCOMPARE(dataDirFromArgs(empty), defaultDataDir());
+    }
+
     void saveLoadRoundTrip()
     {
         QTemporaryDir dir;
