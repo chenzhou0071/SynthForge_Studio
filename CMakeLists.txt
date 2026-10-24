@@ -10,6 +10,7 @@ find_package(Qt6 6.5 REQUIRED COMPONENTS Core Test Sql WebSockets Network WebEng
 add_library(synthforge_core STATIC
     src/core/mcp/JsonRpcLineCodec.cpp
     src/core/mcp/McpClient.cpp
+    src/core/mcp/McpRuntime.cpp
     src/core/mcp/McpTransport.h
     src/core/mcp/StdioTransport.cpp
     src/core/mcp/BridgeCommands.cpp
@@ -49,6 +50,14 @@ set_tests_properties(tst_mcpclient PROPERTIES
 
 add_executable(mock_mcp_server tests/mock/mock_mcp_server.cpp)
 target_link_libraries(mock_mcp_server PRIVATE Qt6::Core)
+
+add_executable(tst_mcp_runtime tests/tst_mcp_runtime.cpp)
+target_link_libraries(tst_mcp_runtime PRIVATE synthforge_core Qt6::Test)
+# 同样不传路径宏：测试用 applicationDirPath() 定位同目录的 mock server
+add_dependencies(tst_mcp_runtime mock_mcp_server)
+add_test(NAME tst_mcp_runtime COMMAND tst_mcp_runtime)
+set_tests_properties(tst_mcp_runtime PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
 add_executable(tst_stdio_transport tests/tst_stdio_transport.cpp)
 target_link_libraries(tst_stdio_transport PRIVATE synthforge_core Qt6::Test)
