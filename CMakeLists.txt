@@ -14,6 +14,7 @@ add_library(synthforge_core STATIC
     src/core/mcp/McpTransport.h
     src/core/mcp/StdioTransport.cpp
     src/core/mcp/BridgeCommands.cpp
+    src/core/mcp/BlenderGate.cpp
     src/core/preflight/PreflightChecker.cpp
     src/core/settings/SettingsStore.cpp
     src/core/settings/UiState.cpp
@@ -200,4 +201,10 @@ add_executable(tst_ui_state tests/tst_ui_state.cpp)
 target_link_libraries(tst_ui_state PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_ui_state COMMAND tst_ui_state)
 set_tests_properties(tst_ui_state PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_blender_gate tests/tst_blender_gate.cpp)
+target_link_libraries(tst_blender_gate PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_blender_gate COMMAND tst_blender_gate)
+set_tests_properties(tst_blender_gate PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")

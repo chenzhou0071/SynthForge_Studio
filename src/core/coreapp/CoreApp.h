@@ -12,6 +12,7 @@
 #include <memory>
 
 #include "core/llm/LlmGateway.h"
+#include "core/mcp/BlenderGate.h"
 
 class SettingsStore;
 class SessionStore;
@@ -58,6 +59,7 @@ private:
     McpRuntime* m_blender = nullptr; // QObject child，析构由 parent 负责
     std::unique_ptr<PreflightChecker> m_preflight;
     SummarizerAgent* m_summarizer = nullptr; // QObject child，析构由 parent 负责
+    BlenderGate m_blenderGate; // Blender agent 任务与 unity 转换互斥
     QJsonArray m_blenderTools;
     QHash<QString, QString> m_status; // area -> off|reconnecting|ready
     QHash<QString, QString> m_hints;  // area -> 状态提示文案
