@@ -156,6 +156,14 @@ add_test(NAME tst_tool_bridge COMMAND tst_tool_bridge)
 set_tests_properties(tst_tool_bridge PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
+add_executable(tst_llm_gateway tests/tst_llm_gateway.cpp
+    tests/mock/MockLlmServer.cpp tests/mock/MockLlmServer.h)
+target_include_directories(tst_llm_gateway PRIVATE tests)
+target_link_libraries(tst_llm_gateway PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_llm_gateway COMMAND tst_llm_gateway)
+set_tests_properties(tst_llm_gateway PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
 add_executable(tst_headless_ws tests/tst_headless_ws.cpp)
 target_link_libraries(tst_headless_ws PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_headless_ws COMMAND tst_headless_ws)

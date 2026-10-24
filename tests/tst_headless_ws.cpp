@@ -400,8 +400,9 @@ private slots:
         WsClient client;
         QVERIFY(client.connectTo(app));
 
+        // blender 已在 P4 注册，这里用与注册表演进无关的未知区名验证 fallback
         const QJsonObject res =
-            client.request(QStringLiteral("bridge.restart"), {{"area", "blender"}});
+            client.request(QStringLiteral("bridge.restart"), {{"area", "unknown"}});
         QCOMPARE(res.value("result").toObject().value("error").toString(),
                  QStringLiteral("bridge-not-registered"));
     }

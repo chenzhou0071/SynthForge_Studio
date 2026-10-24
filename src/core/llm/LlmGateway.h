@@ -32,10 +32,10 @@ public:
 
     explicit LlmGateway(QObject* parent = nullptr);
 
-    // 注：virtual 为 P2 遗留，P4 Task 1B 会移除；禁止子类 mock（测试一律走真实 HTTP + SSE）
-    virtual void chatStream(const LlmConfig& cfg, const QJsonArray& messages,
-                            const QJsonArray& tools, StreamHandlers handlers,
-                            const QString& tag = QString());
+    // 禁止子类 mock：测试一律走真实 HTTP + SSE（见 tests/tst_llm_gateway.cpp）
+    void chatStream(const LlmConfig& cfg, const QJsonArray& messages,
+                    const QJsonArray& tools, StreamHandlers handlers,
+                    const QString& tag = QString());
     void abort();               // 中止所有在途流（退出时用），每个流会走 onError
     void abortTag(const QString& tag); // 只中止该标签的流（按区取消用）
 
