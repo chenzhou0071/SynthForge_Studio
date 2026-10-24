@@ -1,5 +1,6 @@
 #include <QApplication>
 #include <QCoreApplication>
+#include <QIcon>
 #include <QStringList>
 #include <QUrl>
 #include <QUrlQuery>
@@ -28,6 +29,7 @@ int main(int argc, char* argv[])
     // 规格固定 %APPDATA%/SynthForgeStudio：不能设 organizationName，
     // 否则 AppDataLocation 会变成 %APPDATA%/SynthForge/SynthForgeStudio
     QCoreApplication::setApplicationName(QStringLiteral("SynthForgeStudio"));
+    app.setWindowIcon(QIcon(QStringLiteral(":/icons/app.png"))); // qrc 见 CMake app_icons
 
     const QStringList args = QCoreApplication::arguments();
     const int devIdx = args.indexOf(QStringLiteral("--dev-url"));

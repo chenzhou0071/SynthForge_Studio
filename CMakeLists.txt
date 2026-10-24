@@ -91,6 +91,17 @@ add_executable(synthforge_app
     src/app/MainWindow.cpp
     src/app/AppSchemeHandler.cpp)
 target_link_libraries(synthforge_app PRIVATE synthforge_core Qt6::WebEngineWidgets)
+
+# 应用图标：exe 资源（Windows 任务栏/资源管理器）+ qrc（窗口图标，跨平台）
+if(WIN32)
+    set(APP_ICON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/app.ico")
+    configure_file(src/resources/app.rc.in "${CMAKE_CURRENT_BINARY_DIR}/app.rc" @ONLY)
+    target_sources(synthforge_app PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/app.rc")
+endif()
+qt_add_resources(synthforge_app "app_icons"
+    PREFIX "/icons"
+    BASE "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons"
+    FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/app.png")
 # TODO(完工打包时)：set_target_properties(synthforge_app PROPERTIES WIN32_EXECUTABLE TRUE)
 # 改成 GUI 子系统后双击不再弹控制台，但 stdout/stderr 也看不到了；开发期先保留控制台。
 if(WEB_DIST_FILES)
