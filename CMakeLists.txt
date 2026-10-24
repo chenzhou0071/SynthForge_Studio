@@ -14,6 +14,7 @@ add_library(synthforge_core STATIC
     src/core/mcp/StdioTransport.cpp
     src/core/mcp/BridgeCommands.cpp
     src/core/settings/SettingsStore.cpp
+    src/core/settings/UiState.cpp
     src/core/store/SessionStore.cpp
     src/core/tasks/TaskManager.cpp
     src/core/ws/ProtocolRouter.cpp
@@ -74,6 +75,8 @@ add_executable(synthforge_app
     src/app/MainWindow.cpp
     src/app/AppSchemeHandler.cpp)
 target_link_libraries(synthforge_app PRIVATE synthforge_core Qt6::WebEngineWidgets)
+# TODO(完工打包时)：set_target_properties(synthforge_app PROPERTIES WIN32_EXECUTABLE TRUE)
+# 改成 GUI 子系统后双击不再弹控制台，但 stdout/stderr 也看不到了；开发期先保留控制台。
 if(WEB_DIST_FILES)
     qt_add_resources(synthforge_app "web_assets"
         PREFIX "/web"
@@ -141,4 +144,10 @@ add_executable(tst_headless_ws tests/tst_headless_ws.cpp)
 target_link_libraries(tst_headless_ws PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_headless_ws COMMAND tst_headless_ws)
 set_tests_properties(tst_headless_ws PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_ui_state tests/tst_ui_state.cpp)
+target_link_libraries(tst_ui_state PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_ui_state COMMAND tst_ui_state)
+set_tests_properties(tst_ui_state PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
