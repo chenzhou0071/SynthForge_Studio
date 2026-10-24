@@ -2,19 +2,41 @@
 
 #include <QCloseEvent>
 #include <QColor>
+#include <QContextMenuEvent>
 #include <QPalette>
 #include <QResizeEvent>
 #include <QScreen>
+#include <QWebEngineContextMenuRequest>
 #include <QWebEnginePage>
 #include <QWebEngineView>
 
 #include <utility>
 
+namespace {
+// 网页层的右键已由前端全局拦截；这里兜底 WebEngine 的非 DOM 区域（如滚动条）。
+// 只把可编辑区域交给默认实现，保留聊天输入框的复制/粘贴菜单。
+class SuppressedMenuWebView : public QWebEngineView
+{
+public:
+    using QWebEngineView::QWebEngineView;
+
+protected:
+    void contextMenuEvent(QContextMenuEvent* event) override
+    {
+        const QWebEngineContextMenuRequest* request = lastContextMenuRequest();
+        // 输入框保留完整编辑菜单；有选中文本时保留复制/全选菜单
+        if (request
+            && (request->isContentEditable() || !request->selectedText().isEmpty()))
+            QWebEngineView::contextMenuEvent(event);
+    }
+};
+} // namespace
+
 MainWindow::MainWindow(const QUrl& uiUrl, QByteArray savedGeometry,
                        std::function<void(const QByteArray&)> onGeometrySave, QWidget* parent)
     : QMainWindow(parent)
     , m_host(new QWidget(this))
-    , m_view(new QWebEngineView(m_host))
+    , m_view(new SuppressedMenuWebView(m_host))
     , m_onGeometrySave(std::move(onGeometrySave))
 {
     setWindowTitle(QStringLiteral("SynthForge Studio"));
