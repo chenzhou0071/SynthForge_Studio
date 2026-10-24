@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- **前置检查先于总结 agent**：云模式未配置 / Blender 链未就绪 → 直接 `error.card`（`reason` 分别为 `cloud3d-not-configured` / `blender-not-ready`），不浪费改写调用。
+- **前置检查先于总结 agent**：云模式未配置 / Blender 链未就绪 → 直接 `error.card`（`reason` 分别为 `cloud3d-not-configured` / `blender-not-ready`），不浪费改写调用。（**Task 7 起修订**：低模 / 修改改为草稿阶段不预检，`draft.send` 时才检查；云模式仍早拦。）
 - 总结 agent 与主 agent 配置相互独立；总结 agent 未配置时回退主 agent 配置。
 - 工具清单按区裁剪：blender 区仅 Blender MCP 工具 + 文件工具。
 - 截图回传模型前统一压缩：最长边 ≤1024px，JPEG q80，base64。
@@ -1492,7 +1492,11 @@ static QString blenderSystemPrompt()
 {
     return QStringLiteral("你是 SynthForge Studio 的 Blender 建模 agent。使用提供的 MCP 工具"
                           "（execute_blender_code 等）完成低模场景：先清场再分组建造，"
-                          "必要时截图查看结果并修正；全部完成后按规范导出并落盘。");
+                          "必要时截图查看结果并修正；全部完成后按规范导出并落盘。\n"
+                          "硬性约束（P5.5 场景拼装依赖这三条，不得违反）：\n"
+                          "1. 场景单位为米：1 Blender 单位 = 1 米（门高约 2.1，楼层约 3，人眼高 1.65）。\n"
+                          "2. 每个道具的 origin 落在包围盒底部中心，摆到平面上不悬空。\n"
+                          "3. 贴图必须打包进 .blend（导出前 pack_all），不得引用外部图片。");
 }
 
 QJsonArray AgentOrchestrator::initialMessages(const QString& system, const QString& user) const
@@ -1539,7 +1543,39 @@ void AgentOrchestrator::execute(const QString& taskId, TaskManager* tm, const QJ
     m_messages = initialMessages(
         blenderSystemPrompt(),
         QStringLiteral("已确认的专业提示词：\n%1\n目标存放目录：%2。").arg(prompt, targetFolder));
-    startGroup();
+
+    // 清场：活会话里还留着上一次任务的模型，不清就会被 save_as_mainfile 一起存进新 blend
+    // （先做超市再做路灯，路灯.blend 里就会带着超市）。确定性操作直调 MCP，不交给 LLM 记得。
+    static const QString kClearScene = QStringLiteral(R"python(
+import bpy
+# 不用 read_factory_settings：那会重置 preferences，可能把 BlenderMCP 插件关掉、连接直接断
+if bpy.context.object and bpy.context.object.mode != 'OBJECT':
+    bpy.ops.object.mode_set(mode='OBJECT')
+bpy.ops.object.select_all(action='SELECT')
+bpy.ops.object.delete(use_global=False)
+for coll in (bpy.data.meshes, bpy.data.materials, bpy.data.images,
+             bpy.data.armatures, bpy.data.actions, bpy.data.cameras, bpy.data.lights):
+    for item in list(coll):
+        if item.users == 0:
+            coll.remove(item)
+)python");
+    if (!m_mcp) {                      // 单测/降级路径：没有 MCP 就没有会话可清
+        startGroup();
+        return;
+    }
+    m_mcp->callTool(QStringLiteral("execute_blender_code"),
+                    QJsonObject{{"code", kClearScene}},
+                    [this](const QJsonValue&, const QJsonObject& error) {
+                        if (m_tm && m_tm->isCancelled(m_taskId)) {
+                            finishCancelled();
+                            return;
+                        }
+                        if (!error.isEmpty()) {
+                            fail(QStringLiteral("clear-scene-failed"));
+                            return;
+                        }
+                        startGroup();
+                    });
 }
 
 void AgentOrchestrator::startGroup()
@@ -1584,17 +1620,25 @@ void AgentOrchestrator::onTurnFinished()   // 一轮 LLM 无工具调用时进�
         m_messages.append(QJsonObject{
             {"role", "user"},
             {"content", QStringLiteral(
-                "全部组已完成。现在执行导出（execute_blender_code），基名沿用草稿命名清单：\n"
+                "全部组已完成。现在执行导出（execute_blender_code），把下面脚本原样执行，"
+                "只把 <BASENAME> 换成草稿命名清单里的英文基名；基名撞车会自动加序号，不要改逻辑：\n"
                 "import bpy, os\n"
                 "folder = r\"%1\"\n"
-                "name = \"<草稿中的英文基名>\"\n"
-                "bpy.ops.export_scene.gltf(filepath=os.path.join(folder, name + \".glb\"),\n"
+                "name = \"<BASENAME>\"\n"
+                "base, n = name, 1\n"
+                "while os.path.exists(os.path.join(folder, base + \".blend\")):\n"
+                "    n += 1\n"
+                "    base = name + \"_\" + str(n)\n"
+                "bpy.ops.export_scene.gltf(filepath=os.path.join(folder, base + \".glb\"),\n"
                 "                          export_format='GLB', export_animations=True,\n"
                 "                          export_animation_mode='ACTIONS', export_frame_range=True)\n"
-                "bpy.ops.export_scene.fbx(filepath=os.path.join(folder, name + \".fbx\"))\n"
-                "bpy.ops.wm.save_as_mainfile(filepath=os.path.join(folder, name + \".blend\"))\n"
+                "bpy.ops.export_scene.fbx(filepath=os.path.join(folder, base + \".fbx\"))\n"
+                "bpy.ops.file.pack_all()\n"
+                "bpy.ops.wm.save_as_mainfile(filepath=os.path.join(folder, base + \".blend\"))\n"
+                "print('EXPORTED_BASE=' + base)\n"
                 "不要删除场景里已有的关键帧动画（导出时它们会作为 GLB 动画保留）。"
-                "三个文件必须同基名；导出完成后停止调用工具。").arg(m_targetFolder)}});
+                "三个文件必须同基名；如果 base 和 name 不同（加了序号），在最终回复里告诉用户实际文件名；"
+                "导出完成后停止调用工具。").arg(m_targetFolder)}});
         m_stream.clear();
         tick();
         return;
@@ -1910,6 +1954,7 @@ function cancel() {
 <template>
   <div class="plan-card">
     <div class="plan-hint">建造计划 · 预估 {{ plan.totalSteps }} 步</div>
+    <div class="plan-warn">开始后会先清空 Blender 当前场景（未保存的手工修改会丢失）</div>
     <ol>
       <li v-for="(g, i) in plan.groups" :key="i">
         <div class="group-title">{{ i + 1 }}. {{ g.title }}</div>
@@ -1928,6 +1973,8 @@ function cancel() {
   </div>
 </template>
 ```
+
+样式里补 `.plan-warn { font-size: 12px; color: #d97706; margin: 2px 0 8px; }`。
 
 `ChatPanel.vue` 新增订阅 `plan.created` → 追加计划卡并 `busy.value = false`（等待用户决策）；计划卡 `start` 等待 `plan.confirm` 返回，`ok:false` 时保持 pending 并显示错误（`blender-busy` 时计划卡保留，可稍后再点）；`cancel` → `client.request("plan.cancel", {area, taskId})`；收到 `folderPick.open`（Task 4）后弹存放位置。
 
@@ -2737,11 +2784,12 @@ onMounted(() => {
 
 - [ ] **Step 2: 手工验收（P4 总验收）**
 
-1. 真实链路：Blender 打开且插件运行；发送「做三个低模木箱」→ 草稿卡出现；双击可编辑；发送 → 计划卡出现（分组/验收标准可读）→ [开始生成] → 选 `Props/` 子目录 → 步骤卡逐步更新 + `task.progress` 显示当前组 → 对话区出现截图 → 完成后文件树出现 `Props/xxx.glb`，点击可预览旋转。
-2. 三文件平铺：同一目录下 `xxx.glb` / `xxx.fbx` / `xxx.blend` 三行都在；点 glb → 3D 预览；点 fbx 或 blend → 中间显示文件信息卡（类型/大小/修改时间/目录/可修改=是）。
-3. 修改入口：点 glb → 预览区右上出现 [修改此资产] → 点击 → 输入框上方 chip 显示 `目标资产：xxx`（指向 .blend）；删掉该资产的 .blend 后再点 → 弹窗「无法修改此资产 …只能重新生成」。
-4. 动画：生成一个带可导出动效的资产（门开合 / 招牌轻摆 / 指针转动）→ 预览自动循环播放，底部动画条列出各段名称与时长，暂停 / 播放按钮生效；无动画的资产不显示动画条；相机自动对准模型。
-5. 拒绝路径：关掉 Blender 插件 → 发送 → 立刻出现 `blender-not-ready` 错误卡，无总结 agent 请求。
+1. 真实链路：Blender 打开且插件运行；发送「做三个低模木箱」→ 草稿卡出现； 双击可编辑；发送 → 计划卡出现（分组/验收标准可读）→ [开始生成] → 选 `Props/` 子 目录 → 步骤卡逐步更新 + `task.progress` 显示当前组 → 对话区出现截图 → 完成后文件树出现 `Props/xxx.glb`，点击可预览旋转。
+2. 接着再发一个不相关的任务（如「做一盏路灯」）：打开新生成的 `.blend`，场景里**只有路灯**，没有上一个任务的木箱。
+3. 三文件平铺：同一目录下 `xxx.glb` / `xxx.fbx` / `xxx.blend` 三行都在；点 glb → 3D 预览；点 fbx 或 blend → 中间显示文件信息卡（类型/大小/修改时间/目录/可修改=是）。
+4. 修改入口：点 glb → 预览区右上出现 [修改此资产] → 点击 → 输入框上方 chip 显示 `目标资产：xxx`（指向 .blend）；删掉该资产的 .blend 后再点 → 弹窗「无法修改此资产 …只能重新生成」。
+5. 动画：生成一个带可导出动效的资产（门开合 / 招牌轻摆 / 指针转动）→ 预览自动循环播放，底部动画条列出各段名称与时长，暂停 / 播放按钮生效；无动画的资产不显示动画条；相机自动对准模型。
+6. 拒绝路径：关掉 Blender 插件 → 发送 → 立刻出现 `blender-not-ready` 错误卡，无总结 agent 请求。（**Task 7 后改为**：仍先出草稿卡，点执行时才报。）
 
 - [ ] **Step 3: Commit**（`feat: 资产文件树与 three.js GLB 预览`）
 
@@ -2860,17 +2908,1050 @@ async function send() {
 
 ---
 
+### Task 7: 讨论模式 + 统一草稿卡（P4 收尾）
+
+> **依赖**：Task 3（orchestrator）、Task 5（资产树/预览）、Task 6（modify 归一化）全部完成后才能开始。
+>
+> **本任务对前序任务的修订**：
+> 1. `chat.send` 的 `lowpoly` / `modify` 不再入口预检，改到 `draft.send`；`cloud3d` 仍早拦。
+> 2. 修改已有资产从「跳过所有确认直接干」改为「先出一张修改草稿卡」，`startModify` 从 Task 6 的 `chat.send` 分支抽成独立函数。
+> 3. `drafts` 表与 `saveDraft` / `draft()` 删除，草稿改存 `messages.meta`。
+> 4. Task 6 验收里「关掉 Blender 再发送 → 立刻报 `blender-not-ready`」被推翻：现在会先出草稿卡，点执行才报。
+>
+> **为何存在**：用户需要在动手前先和模型讨论方案（「这个招牌怎么改好看」「为什么预览里没有雨」），而现有每条消息都会直接进入建模链。本任务加一个「讨论 / 执行」开关：讨论模式只对话、不碰 Blender；讨论收敛后模型在回复末尾附一段可直接执行的草稿，前端把它转成草稿卡。同时把「任何执行前都有一张草稿卡」固化成统一规则：执行模式改已有资产也先出草稿卡。
+
+**Files:**
+- Create: `src/core/agent/AskReply.h/.cpp`、`src/resources/prompts/ask.md`、`src/resources/prompts/summarizer-modify.md`、`tests/tst_ask_reply.cpp`
+- Modify: `src/core/store/SessionStore.h/.cpp`（messages 加 meta 列、删 drafts 表）、`src/core/agent/SummarizerAgent.h/.cpp`、`src/core/coreapp/CoreApp.h/.cpp`、`tests/tst_session_store.cpp`、`tests/tst_summarizer.cpp`、`CMakeLists.txt`、`web/src/components/ChatPanel.vue`、`web/src/components/DraftCard.vue`、`web/src/chat/history.ts`
+
+**Interfaces:**
+- `chat.send { area, mode: "ask", text, asset? }` → 流式 `chat.delta` → 收尾 `chat.message { role:"assistant", content }`；若回答里带了可执行块，紧跟一条 `draft.created { id, prompt, origin:"discussion", asset }`。ask 分支**不做 preflight**（不碰 Blender）、不占 `BlenderGate`、不进计划/执行链；`asset` 是当前选中资产的相对路径，可为空。
+- 回答协议：模型在末尾输出 `[[EXEC]]…[[/EXEC]]` 块（ASCII 方括号，避免特殊字符在源码与模型输出里被改写）。后端在流式阶段把块剥掉，转成一条独立草稿消息；无块时只落 assistant 正文。
+- `draft.created { id, prompt, origin, asset, mode }`：`id` 是 messages 表的行号，后续 `draft.save / send / regenerate / cancel` 全用它定位；`origin` 为 `discussion`（模型顺手写）或 `generated`（SummarizerAgent）。
+- `draft.save { id, content }`：用户编辑草稿后失焦即存，刷新不丢。
+- `draft.send { id, prompt }`：先把这一行改成 `role='user'`（不新增 user 消息，否则历史里重复两条），再按 meta.asset 分流——有资产走 `modify`，没有走 `plan()`。
+- `draft.cancel { id }`：meta.state 改为 `cancelled`，卡片变灰只读。
+- `draft.regenerate { id }`：从 meta 读 `asset` / `source`，从 content 读讨论产出，重新调 SummarizerAgent，结果 `updateMessageContent` 后广播 `draft.updated`。
+- 前置检查位置：`chat.send` 的 `lowpoly` / `modify` **不再**在入口预检；统一在 `draft.send` 调 `checkLowpoly()`，失败弹 `error.card` 且草稿卡保留。理由：写方案只需要 LLM，Blender 没开也应能先把要求写好。
+- `SummarizerAgent::generate(SummarizeRequest)`：
+
+```cpp
+struct SummarizeRequest {
+    QString area;
+    QString userText;
+    QString mode = QStringLiteral("lowpoly"); // lowpoly | cloud3d | modify
+    QString asset;      // modify：目标资产名（写进模板，避免改错对象）
+    QString discussion; // 可选：讨论结论，追加在 system 末尾
+};
+```
+
+- 前端开关：`ChatPanel` 输入区左侧 segmented control，默认「执行」；选「讨论」时发 `mode:"ask"`，选「执行」时有 `modifyTarget` 发 `mode:"modify"` + `asset`，否则发 `mode:"lowpoly"`。
+
+- [ ] **Step 1: messages 表加 meta（红 → 绿）**
+
+草稿卡刷新后能不能恢复，全靠这一列：`role='draft'` 的消息把 `asset` / `state` / `origin` / `source` 存在 `meta` 里，`id` 就是渲染顺序。
+
+`tests/tst_session_store.cpp` 追加：
+
+```cpp
+    void draftRoundTripsWithMeta()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        SessionStore store(dir.path() + QStringLiteral("/sessions.db"));
+        QVERIFY(store.open());
+
+        const qint64 id = store.appendMessage(
+            QStringLiteral("blender"), QStringLiteral("draft"),
+            QStringLiteral("主题与视角：雨夜便利店"),
+            QJsonObject{{QStringLiteral("state"), QStringLiteral("pending")},
+                        {QStringLiteral("asset"), QStringLiteral("shop.glb")}});
+        QVERIFY(id > 0);
+
+        const MessagePage page = store.messagePage(QStringLiteral("blender"), 10);
+        QCOMPARE(page.messages.size(), 1);
+        const QJsonObject row = page.messages.first().toObject();
+        QCOMPARE(row.value(QStringLiteral("id")).toInteger(), id);
+        QCOMPARE(row.value(QStringLiteral("role")).toString(), QStringLiteral("draft"));
+        QCOMPARE(row.value(QStringLiteral("meta")).toObject()
+                     .value(QStringLiteral("asset")).toString(),
+                 QStringLiteral("shop.glb"));
+    }
+
+    void confirmedDraftBecomesUserMessage()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        SessionStore store(dir.path() + QStringLiteral("/sessions.db"));
+        QVERIFY(store.open());
+        const qint64 id = store.appendMessage(
+            QStringLiteral("blender"), QStringLiteral("draft"), QStringLiteral("旧文本"),
+            QJsonObject{{QStringLiteral("state"), QStringLiteral("pending")}});
+
+        QVERIFY(store.updateMessageContent(id, QStringLiteral("改过的文本")));
+        QVERIFY(store.setMessageRole(id, QStringLiteral("user")));
+
+        const QJsonObject row = store.messageById(id);
+        QCOMPARE(row.value(QStringLiteral("role")).toString(), QStringLiteral("user"));
+        QCOMPARE(row.value(QStringLiteral("content")).toString(), QStringLiteral("改过的文本"));
+    }
+```
+
+先跑一次，预期编译失败（`appendMessage` 还不接受第 4 个参数）。
+
+`SessionStore.h`：
+
+```cpp
+    qint64 appendMessage(const QString& area, const QString& role, const QString& content,
+                         const QJsonObject& meta = QJsonObject{});
+    QJsonObject messageById(qint64 id) const;
+    bool updateMessageContent(qint64 id, const QString& content);
+    bool updateMessageMeta(qint64 id, const QJsonObject& meta);
+    bool setMessageRole(qint64 id, const QString& role);
+    // 删除 saveDraft / draft()：草稿卡改为 messages 里的一行，不再用独立表
+```
+
+同步删掉 `tests/tst_session_store.cpp` 里的 `draftUpsertKeepsLatest` 用例（它测的是即将消失的单值草稿表）。
+
+`SessionStore.cpp` 四处：
+
+```cpp
+// open()：新库建表带 meta，旧库补列，顺手丢掉废弃的 drafts 表
+q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS messages("
+                      "id INTEGER PRIMARY KEY AUTOINCREMENT, area TEXT NOT NULL,"
+                      "role TEXT NOT NULL, content TEXT NOT NULL, ts INTEGER NOT NULL,"
+                      "meta TEXT NOT NULL DEFAULT '{}')"));
+{
+    // SQLite 的 ADD COLUMN 没有 IF NOT EXISTS：先查 PRAGMA 再补
+    QSqlQuery probe(m_db);
+    probe.exec(QStringLiteral("PRAGMA table_info(messages)"));
+    bool hasMeta = false;
+    while (probe.next()) {
+        if (probe.value(1).toString() == QLatin1String("meta"))
+            hasMeta = true;
+    }
+    if (!hasMeta)
+        q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'"));
+}
+q.exec(QStringLiteral("DROP TABLE IF EXISTS drafts"));
+
+// 写入返回自增 id
+qint64 SessionStore::appendMessage(const QString& area, const QString& role,
+                                   const QString& content, const QJsonObject& meta)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "INSERT INTO messages(area, role, content, ts, meta) VALUES(?,?,?,?,?)"));
+    q.addBindValue(area);
+    q.addBindValue(role);
+    q.addBindValue(content);
+    q.addBindValue(QDateTime::currentMSecsSinceEpoch());
+    q.addBindValue(QString::fromUtf8(QJsonDocument(meta).toJson(QJsonDocument::Compact)));
+    if (!q.exec())
+        return 0;
+    return q.lastInsertId().toLongLong();
+}
+
+// 三种更新：内容（用户编辑 / 重新生成）、meta（取消失效）、角色（草稿转正式指令）
+bool SessionStore::updateMessageContent(qint64 id, const QString& content)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE messages SET content=? WHERE id=?"));
+    q.addBindValue(content);
+    q.addBindValue(id);
+    return q.exec() && q.numRowsAffected() > 0;
+}
+
+bool SessionStore::updateMessageMeta(qint64 id, const QJsonObject& meta)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE messages SET meta=? WHERE id=?"));
+    q.addBindValue(QString::fromUtf8(QJsonDocument(meta).toJson(QJsonDocument::Compact)));
+    q.addBindValue(id);
+    return q.exec() && q.numRowsAffected() > 0;
+}
+
+bool SessionStore::setMessageRole(qint64 id, const QString& role)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE messages SET role=? WHERE id=?"));
+    q.addBindValue(role);
+    q.addBindValue(id);
+    return q.exec() && q.numRowsAffected() > 0;
+}
+
+// 单条读取：draft.send / draft.regenerate 要拿 meta 里的 asset / source
+QJsonObject SessionStore::messageById(qint64 id) const
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT id, area, role, content, ts, meta FROM messages WHERE id=?"));
+    q.addBindValue(id);
+    q.exec();
+    if (!q.next())
+        return {};
+    return QJsonObject{
+        {QStringLiteral("id"), q.value(0).toLongLong()},
+        {QStringLiteral("area"), q.value(1).toString()},
+        {QStringLiteral("role"), q.value(2).toString()},
+        {QStringLiteral("content"), q.value(3).toString()},
+        {QStringLiteral("ts"), q.value(4).toLongLong()},
+        {QStringLiteral("meta"),
+         QJsonDocument::fromJson(q.value(5).toString().toUtf8()).object()}};
+}
+```
+
+`messagePage` 与 `messages` 的 SELECT 都要带上 `meta`，并把列尾拼成对象：
+
+```cpp
+    q.prepare(QStringLiteral("SELECT id, role, content, ts, meta FROM messages "
+                             "WHERE area=? ORDER BY id DESC LIMIT ?"));
+    // ...
+    newestFirst.append(QJsonObject{
+        {QStringLiteral("id"), q.value(0).toLongLong()},
+        {QStringLiteral("role"), q.value(1).toString()},
+        {QStringLiteral("content"), q.value(2).toString()},
+        {QStringLiteral("ts"), q.value(3).toLongLong()},
+        {QStringLiteral("meta"),
+         QJsonDocument::fromJson(q.value(4).toString().toUtf8()).object()}});
+```
+
+Run: `ctest --test-dir build -C Debug -R tst_session_store --output-on-failure`
+Expected: 原有用例 + 新增 2 用例全绿。
+
+- [ ] **Step 2: 标记解析纯函数（红 → 绿）**
+
+`tests/tst_ask_reply.cpp`：
+
+```cpp
+#include <QtTest>
+
+#include "core/agent/AskReply.h"
+
+class AskReplyTest : public QObject
+{
+    Q_OBJECT
+private slots:
+    void plainAnswerHasNoExecutable()
+    {
+        const AskReply r = parseAskReply(QStringLiteral("建议把招牌换成旧铁皮。"));
+        QCOMPARE(r.visible, QStringLiteral("建议把招牌换成旧铁皮。"));
+        QVERIFY(r.executable.isEmpty());
+    }
+
+    void execBlockIsSplitOut()
+    {
+        const AskReply r = parseAskReply(QStringLiteral(
+            "建议从材质和破损两处入手。\n\n[[EXEC]]\n把招牌换成深绿做旧铁皮\n[[/EXEC]]"));
+        QCOMPARE(r.visible, QStringLiteral("建议从材质和破损两处入手。"));
+        QCOMPARE(r.executable, QStringLiteral("把招牌换成深绿做旧铁皮"));
+    }
+
+    void unclosedBlockTakesRest()
+    {
+        const AskReply r = parseAskReply(QStringLiteral("方案如下。\n[[EXEC]]\n主题与视角：雨夜街角"));
+        QCOMPARE(r.visible, QStringLiteral("方案如下。"));
+        QCOMPARE(r.executable, QStringLiteral("主题与视角：雨夜街角"));
+    }
+
+    void emptyBlockIsNotExecutable()
+    {
+        const AskReply r = parseAskReply(QStringLiteral("先不定。\n[[EXEC]][[/EXEC]]"));
+        QCOMPARE(r.visible, QStringLiteral("先不定。"));
+        QVERIFY(r.executable.isEmpty());
+    }
+};
+
+QTEST_MAIN(AskReplyTest)
+#include "tst_ask_reply.moc"
+```
+
+`src/core/agent/AskReply.h`：
+
+```cpp
+#pragma once
+
+#include <QString>
+
+// 讨论模式的回答分两部分：正文给用户看，[[EXEC]] 块是可直接执行的草稿。
+struct AskReply
+{
+    QString visible;
+    QString executable;
+};
+
+AskReply parseAskReply(const QString& raw);
+```
+
+`src/core/agent/AskReply.cpp`：
+
+```cpp
+#include "core/agent/AskReply.h"
+
+namespace {
+const QString kOpen = QStringLiteral("[[EXEC]]");
+const QString kClose = QStringLiteral("[[/EXEC]]");
+}
+
+AskReply parseAskReply(const QString& raw)
+{
+    AskReply reply;
+    const int start = raw.indexOf(kOpen);
+    if (start < 0) {
+        reply.visible = raw.trimmed();
+        return reply;
+    }
+    const int bodyStart = start + kOpen.size();
+    const int end = raw.indexOf(kClose, bodyStart);
+    // 模型偶尔忘写闭合标记：把剩余内容整段当成草稿，不让用户看到半截标记
+    reply.executable = (end < 0 ? raw.mid(bodyStart) : raw.mid(bodyStart, end - bodyStart)).trimmed();
+    reply.visible = raw.left(start).trimmed();
+    return reply;
+}
+```
+
+Run: `ctest --test-dir build -C Debug -R tst_ask_reply --output-on-failure`
+Expected: 4 用例 Passed。
+
+- [ ] **Step 3: SummarizerAgent 多模板（红 → 绿）**
+
+`tests/tst_summarizer.cpp` 追加两个用例（同时把现有 4 处 `agent.generate(X, Y)` 改成 `agent.generate({X, Y})`，默认 `mode` 为 `lowpoly`，行为不变）：
+
+```cpp
+void modifyModeUsesModifyTemplate()
+{
+    MockLlmServer server({textChunk("把招牌材质换成深绿做旧铁皮，粗糙度调高")});
+    LlmGateway llm;
+    SessionStore sessions(QDir::tempPath());
+    SettingsStore settings(QDir::tempPath());
+    settings.update(agentSettings(server.baseUrl(), "k", "m", QJsonObject()));
+    SummarizerAgent agent(&llm, &sessions, &settings);
+    QSignalSpy ready(&agent, &SummarizerAgent::draftReady);
+
+    agent.generate({QStringLiteral("blender"), QStringLiteral("招牌弄旧一点"),
+                    QStringLiteral("modify"), QStringLiteral("sword_01"), {}});
+
+    QTRY_COMPARE(ready.count(), 1);
+    const QString system = server.requestAt(0).value("messages").toArray()
+                               .first().toObject().value("content").toString();
+    QVERIFY(system.contains(QStringLiteral("已经存在")));   // 修改模板
+    QVERIFY(!system.contains(QStringLiteral("底座与构图"))); // 不是新建模板
+    QVERIFY(system.contains(QStringLiteral("sword_01")));   // 资产名已注入
+}
+
+void discussionIsInjected()
+{
+    MockLlmServer server({textChunk("主题与视角：雨夜便利店")});
+    LlmGateway llm;
+    SessionStore sessions(QDir::tempPath());
+    SettingsStore settings(QDir::tempPath());
+    settings.update(agentSettings(server.baseUrl(), "k", "m", QJsonObject()));
+    SummarizerAgent agent(&llm, &sessions, &settings);
+    QSignalSpy ready(&agent, &SummarizerAgent::draftReady);
+
+    agent.generate({QStringLiteral("blender"), QStringLiteral("做个便利店"),
+                    QStringLiteral("lowpoly"), {},
+                    QStringLiteral("已确认：要有自动门与积水")});
+
+    QTRY_COMPARE(ready.count(), 1);
+    const QString system = server.requestAt(0).value("messages").toArray()
+                               .first().toObject().value("content").toString();
+    QVERIFY(system.contains(QStringLiteral("用户已确认的讨论要点")));
+    QVERIFY(system.contains(QStringLiteral("自动门与积水")));
+}
+```
+
+`src/core/agent/SummarizerAgent.h` 改签名：
+
+```cpp
+struct SummarizeRequest
+{
+    QString area;
+    QString userText;
+    QString mode = QStringLiteral("lowpoly");
+    QString asset;
+    QString discussion;
+};
+
+void generate(const SummarizeRequest& request);
+```
+
+`SummarizerAgent.cpp` 的模板选择与注入：
+
+```cpp
+void SummarizerAgent::generate(const SummarizeRequest& request)
+{
+    ensurePromptResources();
+
+    const LlmConfig cfg = resolveConfig();
+    if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty() || cfg.model.isEmpty()) {
+        emit failed(request.area, QStringLiteral("agent-not-configured"));
+        return;
+    }
+
+    // 三种模式三份模板：修改已有资产绝不能套用新建场景的骨架，否则 agent 会清场重建
+    QString templatePath = QStringLiteral(":/prompts/summarizer.md");
+    if (request.mode == QLatin1String("modify"))
+        templatePath = QStringLiteral(":/prompts/summarizer-modify.md");
+    else if (request.mode == QLatin1String("cloud3d"))
+        templatePath = QStringLiteral(":/prompts/summarizer-cloud3d.md");
+
+    QFile tpl(templatePath);
+    QString system;
+    if (tpl.open(QIODevice::ReadOnly | QIODevice::Text))
+        system = QString::fromUtf8(tpl.readAll());
+    if (system.isEmpty()) {
+        emit failed(request.area, QStringLiteral("prompt-template-missing"));
+        return;
+    }
+    system.replace(QStringLiteral("{{user_request}}"), request.userText);
+    system.replace(QStringLiteral("{{mode}}"), request.mode);
+    system.replace(QStringLiteral("{{asset}}"),
+                   request.asset.isEmpty() ? QStringLiteral("（未指定）") : request.asset);
+    // 讨论结论用代码拼接：模板里留空段会比留空行更难维护
+    if (!request.discussion.isEmpty()) {
+        system += QStringLiteral("\n\n## 用户已确认的讨论要点\n") + request.discussion;
+    }
+
+    const QJsonArray messages{
+        QJsonObject{{QStringLiteral("role"), QStringLiteral("system")},
+                    {QStringLiteral("content"), system}},
+        QJsonObject{{QStringLiteral("role"), QStringLiteral("user")},
+                    {QStringLiteral("content"), request.userText}}};
+
+    auto buffer = std::make_shared<QString>();
+    const QString area = request.area;
+    m_llm->chatStream(
+        cfg, messages, {},
+        {.onDelta = [buffer](const QString& delta) { buffer->append(delta); },
+         .onToolCalls = nullptr,
+         .onError = [this, area](const QString& error) { emit failed(area, error); },
+         .onDone = [this, area, buffer]() {
+             // 落库交给 CoreApp 的 draftReady 接线：那里才知道 asset / source，并能拿到新行 id
+             emit draftReady(area, *buffer);
+         }});
+}
+```
+
+`src/resources/prompts/summarizer-modify.md`：
+
+```markdown
+你是 3D 资产修改指令的改写助手。用户正在修改一个**已经存在**的低模资产，不是新建场景。
+
+## 本次任务
+- 目标资产：{{asset}}
+- 用户需求：{{user_request}}
+
+## 改写要求
+把用户需求改写成一条明确、可执行的 Blender 修改指令：
+1. 说清改哪个部分、改成什么（材质 / 几何 / 颜色 / 尺寸 / 位置）。
+2. 只描述**改动**，不要重述整个场景，不要给建造计划，不要列物体清单。
+3. 不要提导出、保存、文件名——这些由系统负责。
+4. 用户没提到要改的部分一律保持原样。
+5. 一到三句话，不分节，不加小标题。
+
+## 输出格式
+只输出改写后的指令：不要解释、不要寒暄、不要 markdown 代码块围栏。
+```
+
+Run: `ctest --test-dir build -C Debug -R tst_summarizer --output-on-failure`
+Expected: 6 用例 Passed。
+
+- [ ] **Step 4: ask 分支（CoreApp）**
+
+`src/resources/prompts/ask.md`：
+
+```markdown
+你是 SynthForge Studio 的 3D 资产顾问，正在和用户讨论建模与改造方案。
+
+## 当前上下文
+- 当前选中资产：{{asset}}
+- 资产状态：{{asset_state}}
+
+## 资产库
+{{assets}}
+
+## 你的职责
+1. 回答用户的问题，解释可行做法、代价与取舍，可以给多个方案并推荐一个。
+2. 用户问「为什么预览里看不到某个效果」时，如实说明：粒子雨、材质动画、三渲二着色只存在于 .blend 中，不会进入 GLB。
+3. 不要声称你已经修改了模型——你只讨论，不动手。
+4. 目标资产没有 .blend 源文件时（云 API 生成 / 外部导入），说明只能重新生成。
+
+## 可执行草稿
+当讨论已经形成**具体的、可以直接动手**的方案时，在回答正文之后追加：
+
+[[EXEC]]
+（可直接执行的草稿）
+[[/EXEC]]
+
+块内写什么：
+- 当前**有选中资产**：一到三句话，说清改哪个部分、改成什么；不要重述整个场景，不要提导出与保存。
+- 当前**没有选中资产**：写一份可用的建模提示词，按下面的节标题组织，每节一句到三句。
+
+主题与视角：
+底座与构图：
+场景主体：
+细节内容：
+美术风格：
+动效（分别标注「可导出」的物体关键帧与「仅源文件」的粒子/自发光）：
+产出结构要求（每个可辨识物品独立成物体，列出必须独立的清单）：
+层级与命名：
+轴心与摆放：
+材质与贴图（贴图必须是图片文件，不超 1024×1024）：
+数量下限（含可导出动效不少于 3 个）：
+禁止项（无人物、无品牌 Logo、禁止片状几何体冒充粒子）：
+
+只是解释原因、回答疑问、或方案还没定时，**不要**输出 [[EXEC]] 块。
+
+## 输出格式
+正文正常聊天。不要在正文里提到标记本身，不要说“我给出了执行块”。
+```
+
+`CoreApp.cpp` 顶部补 `#include "core/agent/AskReply.h"`、`#include <QFile>`、`#include <QFileInfo>`、`#include <QSet>`。
+
+`CoreApp::handleChatSend` 在 `m_lastSend.insert` 之后、lowpoly 分支之前插入 ask 分支：
+
+```cpp
+    if (mode == QLatin1String("ask")) {
+        if (appendUser) {
+            m_sessions->appendMessage(area, QStringLiteral("user"), text);
+            m_ws->broadcastEvent(
+                QStringLiteral("chat.message"),
+                QJsonObject{{QStringLiteral("area"), area}, {QStringLiteral("role"), "user"},
+                            {QStringLiteral("content"), text}});
+        }
+        const LlmConfig cfg = primaryAgentConfig();
+        if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty() || cfg.model.isEmpty()) {
+            m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                 QJsonObject{{"area", area}, {"reason", "agent-not-configured"}});
+            return QJsonValue(QJsonObject{{"accepted", false}, {"reason", "agent-not-configured"}});
+        }
+
+        const QString asset = params.value(QStringLiteral("asset")).toString();
+        QFile tpl(QStringLiteral(":/prompts/ask.md"));
+        QString system;
+        if (tpl.open(QIODevice::ReadOnly | QIODevice::Text))
+            system = QString::fromUtf8(tpl.readAll());
+        const bool hasSource = !asset.isEmpty()
+                               && QFileInfo::exists(m_library->absoluteFor(asset));
+        system.replace(QStringLiteral("{{asset}}"),
+                       asset.isEmpty() ? QStringLiteral("（未选中）") : asset);
+        system.replace(QStringLiteral("{{asset_state}}"),
+                       asset.isEmpty() ? QStringLiteral("无")
+                                       : (hasSource ? QStringLiteral("已选中的低模资产")
+                                                    : QStringLiteral("无 .blend 源文件，只能重新生成")));
+        // 资产清单：让模型能说「你库里有三个招牌」而不是瞎猜；glb/fbx/blend 同基名只列一次
+        QString assetLines;
+        QSet<QString> seenBases;
+        for (const QString& rel : m_library->scanAssets()) {
+            const QFileInfo fi(m_library->absoluteFor(rel));
+            if (fi.suffix().toLower() != QLatin1String("glb"))
+                continue;
+            const QString base = fi.completeBaseName();
+            if (seenBases.contains(base))
+                continue;
+            seenBases.insert(base);
+            const bool hasBlend =
+                QFileInfo(fi.dir().filePath(base + QStringLiteral(".blend"))).exists();
+            assetLines += QStringLiteral("- %1%2\n").arg(
+                rel, hasBlend ? QStringLiteral("（有 .blend，可修改）")
+                              : QStringLiteral("（无 .blend，只能重新生成）"));
+            if (seenBases.size() >= 30)
+                break;
+        }
+        system.replace(QStringLiteral("{{assets}}"),
+                       assetLines.isEmpty() ? QStringLiteral("（空）") : assetLines);
+
+        QJsonArray messages{
+            QJsonObject{{"role", "system"}, {"content", system}}};
+        for (const QJsonValue& value : m_sessions->messagePage(area, 20).messages) {
+            const QJsonObject message = value.toObject();
+            messages.append(QJsonObject{{"role", message.value("role")},
+                                        {"content", message.value("content")}});
+        }
+
+        const QString taskId = QStringLiteral("ask-%1").arg(++m_seq);
+        m_tasks->enqueue(Task{
+            taskId, area, QString(),
+            [this, area, cfg, messages, asset, text](const QString& tid, TaskManager* tm) {
+                // 尾部缓冲：[[EXEC]] 块可能在任意 delta 边界被切开，先压住 32 字符
+                auto buffer = std::make_shared<QString>();
+                auto tail = std::make_shared<QString>();
+                LlmGateway::StreamHandlers handlers;
+                handlers.onDelta = [this, area, buffer, tail](const QString& delta) {
+                    buffer->append(delta);
+                    tail->append(delta);
+                    constexpr int kKeep = 32;
+                    if (tail->size() > kKeep) {
+                        const QString part = tail->left(tail->size() - kKeep);
+                        *tail = tail->right(kKeep);
+                        m_ws->broadcastEvent(QStringLiteral("chat.delta"),
+                                             QJsonObject{{"area", area}, {"text", part}});
+                    }
+                };
+                handlers.onDone = [this, area, tid, tm, buffer, asset, text]() {
+                    if (tm->isCancelled(tid)) {
+                        m_sessions->upsertTask(tid, area, QStringLiteral("chat"),
+                                               QStringLiteral("cancelled"), {});
+                        tm->finish(tid);
+                        return;
+                    }
+                    const AskReply reply = parseAskReply(*buffer);
+                    m_sessions->appendMessage(area, QStringLiteral("assistant"), reply.visible);
+                    m_ws->broadcastEvent(
+                        QStringLiteral("chat.message"),
+                        QJsonObject{{"area", area}, {"role", "assistant"},
+                                    {"content", reply.visible}});
+                    // 讨论产出的草稿也是一行 draft：刷新后靠它重建草稿卡
+                    if (!reply.executable.isEmpty()) {
+                        const qint64 draftId = m_sessions->appendMessage(
+                            area, QStringLiteral("draft"), reply.executable,
+                            QJsonObject{{"state", "pending"}, {"origin", "discussion"},
+                                        {"asset", asset}, {"source", text}});
+                        m_ws->broadcastEvent(
+                            QStringLiteral("draft.created"),
+                            QJsonObject{{"area", area}, {"id", draftId},
+                                        {"prompt", reply.executable},
+                                        {"origin", "discussion"}, {"asset", asset}});
+                    }
+                    m_sessions->upsertTask(tid, area, QStringLiteral("chat"),
+                                           QStringLiteral("done"), {},
+                                           QJsonObject{{"reply", reply.visible}});
+                    tm->finish(tid);
+                };
+                handlers.onError = [this, area, tid, tm](const QString& error) {
+                    if (tm->isCancelled(tid)) {
+                        m_sessions->upsertTask(tid, area, QStringLiteral("chat"),
+                                               QStringLiteral("cancelled"), {});
+                        tm->finish(tid);
+                        return;
+                    }
+                    m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                         QJsonObject{{"area", area}, {"reason", error}});
+                    tm->finish(tid);
+                };
+                m_llm->chatStream(cfg, messages, {}, handlers, area);
+            }});
+        return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
+    }
+```
+
+注意：`ask` 不在 preflight 条件里，天然不触发；把 ask 分支放在 `m_lastSend.insert` 之后、lowpoly 分支之前即可。（Step 5 会把 `lowpoly` / `modify` 也从条件里摘掉，届时只剩 `cloud3d`。）
+
+- [ ] **Step 5: 草稿卡绑定资产与执行分流**
+
+`CoreApp.h` 加暂存与方法声明：
+
+```cpp
+QHash<QString, QString> m_pendingDraftAsset;   // area -> 本次草稿针对的资产
+QHash<QString, QString> m_pendingDraftSource;  // area -> 用户原始需求（供「重新生成」）
+QHash<QString, qint64> m_regenDraft;           // area -> 正在重新生成的草稿 id
+QJsonValue startModify(const QString& area, const QString& asset, const QString& text);
+```
+
+`handleChatSend` 开头那段 `if (mode == lowpoly || cloud3d || modify) { preflight… }` 先拆：**删掉 `lowpoly` 与 `modify` 两项，只留 `cloud3d`**（P5 未实现，仍需早拦）。
+
+两个分支都改成「先记下来源，再交给 SummarizerAgent」，草稿由 `draftReady` 统一落库：
+
+```cpp
+    if (mode == QLatin1String("lowpoly")) {
+        if (appendUser) {
+            m_sessions->appendMessage(area, QStringLiteral("user"), text);
+            m_ws->broadcastEvent(
+                QStringLiteral("chat.message"),
+                QJsonObject{{"area", area}, {"role", "user"}, {"content", text}});
+        }
+        const LlmConfig cfg = primaryAgentConfig();
+        if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty() || cfg.model.isEmpty()) {
+            // …同现状：error.card + accepted=false
+        }
+        m_pendingDraftAsset.insert(area, QString());
+        m_pendingDraftSource.insert(area, text);
+        m_summarizer->generate({area, text}); // 默认 mode=lowpoly
+        return QJsonValue(QJsonObject{{"accepted", true}});
+    }
+
+    if (mode == QLatin1String("modify")) {
+        const QString asset = params.value(QStringLiteral("asset")).toString();
+        if (appendUser) {
+            m_sessions->appendMessage(area, QStringLiteral("user"), text);
+            m_ws->broadcastEvent(
+                QStringLiteral("chat.message"),
+                QJsonObject{{"area", area}, {"role", "user"}, {"content", text}});
+        }
+        // 执行模式也先过一遍草稿卡：模糊指令由修改模板收敛，用户还能改措辞
+        m_pendingDraftAsset.insert(area, asset);
+        m_pendingDraftSource.insert(area, text);
+        m_summarizer->generate({area, text, QStringLiteral("modify"),
+                                QFileInfo(asset).completeBaseName(), {}});
+        return QJsonValue(QJsonObject{{"accepted", true}});
+    }
+```
+
+`draftReady`：入库并带回 id；若是「重新生成」触发的，改走 update：
+
+```cpp
+connect(m_summarizer, &SummarizerAgent::draftReady, this,
+        [this](const QString& area, const QString& prompt) {
+            // 重新生成：同一条草稿原地换文本，不新增卡片
+            if (const qint64 regenId = m_regenDraft.take(area); regenId > 0) {
+                m_sessions->updateMessageContent(regenId, prompt);
+                m_ws->broadcastEvent(
+                    QStringLiteral("draft.updated"),
+                    QJsonObject{{"area", area}, {"id", regenId}, {"prompt", prompt}});
+                return;
+            }
+            const QString asset = m_pendingDraftAsset.take(area);
+            const QString source = m_pendingDraftSource.take(area);
+            const QString mode = asset.isEmpty() ? QStringLiteral("lowpoly")
+                                                 : QStringLiteral("modify");
+            const qint64 id = m_sessions->appendMessage(
+                area, QStringLiteral("draft"), prompt,
+                QJsonObject{{"state", "pending"}, {"origin", "generated"},
+                            {"mode", mode}, {"asset", asset}, {"source", source}});
+            m_ws->broadcastEvent(
+                QStringLiteral("draft.created"),
+                QJsonObject{{"area", area}, {"id", id}, {"prompt", prompt},
+                            {"origin", "generated"}, {"mode", mode}, {"asset", asset}});
+        });
+```
+
+四个草稿请求（全部按 id 定位；原 `draft.cancel` 那段 `saveDraft("")` 整段删掉）：
+
+```cpp
+    m_router->registerHandler(QStringLiteral("draft.save"),
+                              [this](const QJsonObject& params) {
+        const qint64 id = params.value(QStringLiteral("id")).toInteger();
+        const QString content = params.value(QStringLiteral("content")).toString();
+        if (id <= 0)
+            return QJsonValue(QJsonObject{{"ok", false}});
+        // 编辑失焦即存：刷新后看到的是改过的版本
+        return QJsonValue(
+            QJsonObject{{"ok", m_sessions->updateMessageContent(id, content)}});
+                              });
+    m_router->registerHandler(QStringLiteral("draft.send"),
+                              [this](const QJsonObject& params) {
+        const qint64 id = params.value(QStringLiteral("id")).toInteger();
+        const QString prompt = params.value(QStringLiteral("prompt")).toString().trimmed();
+        const QJsonObject row = id > 0 ? m_sessions->messageById(id) : QJsonObject{};
+        if (row.isEmpty() || prompt.isEmpty())
+            return QJsonValue(QJsonObject{{"accepted", false}, {"reason", "invalid-draft"}});
+
+        const QString area = row.value(QStringLiteral("area")).toString();
+        const QString asset = row.value(QStringLiteral("meta")).toObject()
+                                  .value(QStringLiteral("asset")).toString();
+
+        // 草稿阶段不拦 Blender（写方案只需 LLM）；点执行才检查，没开就弹提示且不占门禁
+        const PreflightResult pre = m_preflight->checkLowpoly();
+        if (!pre.ok) {
+            m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                 QJsonObject{{"area", area}, {"reason", pre.reason}});
+            return QJsonValue(QJsonObject{{"accepted", false}, {"reason", pre.reason}});
+        }
+
+        // 先确认源文件在，再转正：否则草稿卡消失了但执行失败，用户无法回头改
+        if (!asset.isEmpty()) {
+            QFileInfo src(m_library->absoluteFor(asset));
+            if (src.suffix().toLower() != QLatin1String("blend"))
+                src = QFileInfo(src.dir().filePath(src.completeBaseName()
+                                                   + QStringLiteral(".blend")));
+            if (!src.exists())
+                return QJsonValue(QJsonObject{{"accepted", false},
+                                              {"error", "no-blend-source"}});
+        }
+        // 草稿转正：改角色而不是新增 user 消息，否则历史里同一段文本出现两次
+        m_sessions->updateMessageContent(id, prompt);
+        m_sessions->setMessageRole(id, QStringLiteral("user"));
+        m_ws->broadcastEvent(QStringLiteral("draft.done"),
+                             QJsonObject{{"area", area}, {"id", id}});
+        m_ws->broadcastEvent(QStringLiteral("chat.message"),
+                             QJsonObject{{"area", area}, {"role", "user"},
+                                         {"content", prompt}});
+
+        if (!asset.isEmpty())
+            return startModify(area, asset, prompt);
+        m_orch->setModelConfig(primaryAgentConfig());
+        m_orch->setConversationHistory(m_sessions->recentMessages(area, 20));
+        m_orch->plan(QStringLiteral("plan-%1").arg(++m_seq), nullptr, prompt, area);
+        return QJsonValue(QJsonObject{{"accepted", true}});
+                              });
+    m_router->registerHandler(QStringLiteral("draft.cancel"),
+                              [this](const QJsonObject& params) {
+        const qint64 id = params.value(QStringLiteral("id")).toInteger();
+        const QJsonObject row = id > 0 ? m_sessions->messageById(id) : QJsonObject{};
+        if (row.isEmpty())
+            return QJsonValue(QJsonObject{{"ok", false}});
+        QJsonObject meta = row.value(QStringLiteral("meta")).toObject();
+        meta.insert(QStringLiteral("state"), QStringLiteral("cancelled"));
+        m_sessions->updateMessageMeta(id, meta);
+        m_ws->broadcastEvent(
+            QStringLiteral("draft.done"),
+            QJsonObject{{"area", row.value(QStringLiteral("area")).toString()},
+                        {"id", id}, {"cancelled", true}});
+        return QJsonValue(QJsonObject{{"ok", true}});
+                              });
+    m_router->registerHandler(QStringLiteral("draft.regenerate"),
+                              [this](const QJsonObject& params) {
+        const qint64 id = params.value(QStringLiteral("id")).toInteger();
+        const QJsonObject row = id > 0 ? m_sessions->messageById(id) : QJsonObject{};
+        if (row.isEmpty())
+            return QJsonValue(QJsonObject{{"accepted", false}});
+
+        const QString area = row.value(QStringLiteral("area")).toString();
+        const QJsonObject meta = row.value(QStringLiteral("meta")).toObject();
+        const QString asset = meta.value(QStringLiteral("asset")).toString();
+        const QString source = meta.value(QStringLiteral("source")).toString();
+        // 讨论产出的正文本身就是讨论结论；SummarizerAgent 产出的不能再当讨论喂回去
+        const QString discussion =
+            meta.value(QStringLiteral("origin")).toString() == QLatin1String("discussion")
+                ? row.value(QStringLiteral("content")).toString()
+                : QString();
+
+        m_regenDraft.insert(area, id);
+        m_summarizer->generate({area, source.isEmpty() ? discussion : source,
+                                asset.isEmpty() ? QStringLiteral("lowpoly")
+                                                : QStringLiteral("modify"),
+                                QFileInfo(asset).completeBaseName(), discussion});
+        return QJsonValue(QJsonObject{{"accepted", true}});
+                              });
+```
+
+`startModify`：Task 6 的 `modify` 分支原样搬进来（`chat.send` 不再保留这段），只是不再自己落用户消息（`draft.send` 已经落过）：
+
+```cpp
+QJsonValue CoreApp::startModify(const QString& area, const QString& asset, const QString& text)
+{
+    // 修改锚点统一是 .blend：传 glb/fbx 时自动找同目录同名源文件
+    QFileInfo info;
+    if (!asset.isEmpty()) {
+        info = QFileInfo(m_library->absoluteFor(asset));
+        if (info.suffix().toLower() != QLatin1String("blend"))
+            info = QFileInfo(info.dir().filePath(info.completeBaseName()
+                                                 + QStringLiteral(".blend")));
+    }
+    const QString blendRelative =
+        info.exists() ? m_library->relativeFor(info.absoluteFilePath()) : QString();
+    if (asset.isEmpty() || text.isEmpty() || blendRelative.isEmpty()
+        || !m_library->isValidTarget(blendRelative))
+        return QJsonValue(QJsonObject{{"accepted", false}, {"error", "no-blend-source"}});
+
+    BuildPlan plan;
+    plan.groups.append(
+        BuildGroup{QStringLiteral("修改资产"), {},
+                   QStringLiteral("修改意图达成；同名 GLB/FBX/blend 已覆盖")});
+    plan.maxSteps = 50;
+    const QString prompt = QStringLiteral("打开 .blend 源文件 %1。要求：%2。"
+                                          "保留场景里已有的可导出动效（物体关键帧），不要删除或覆盖。"
+                                          "完成后覆盖导出同名 GLB/FBX 并保存 .blend。")
+                               .arg(info.absoluteFilePath(), text);
+    const QString taskId = QStringLiteral("chat-%1").arg(++m_seq);
+    const QString targetFolder = info.absolutePath();
+    m_tasks->enqueue(
+        Task{taskId, area, QString(),
+             [this, plan, prompt, targetFolder, area](const QString& tid, TaskManager* tm) {
+                 m_orch->setModelConfig(primaryAgentConfig());
+                 m_orch->setConversationHistory(m_sessions->recentMessages(area, 20));
+                 m_orch->execute(tid, tm, ToolBridge::mcpToolsToOpenAi(m_blenderTools),
+                                 plan, prompt, targetFolder, area);
+             }});
+    return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
+}
+```
+
+- [ ] **Step 6: 前端开关与三按钮草稿卡**
+
+> 至此 `CoreApp.cpp` 里两处 `saveDraft`（原 `draft.send` / `draft.cancel`）已随新 handler 消失，全库不再引用 `drafts` 表。
+
+`ChatPanel.vue`：输入区左侧加分段开关，发送时按开关与 `modifyTarget` 决定 mode：
+
+```vue
+<div class="mode-switch">
+  <button :class="{ active: chatMode === 'ask' }" @click="chatMode = 'ask'">讨论</button>
+  <button :class="{ active: chatMode === 'exec' }" @click="chatMode = 'exec'">执行</button>
+</div>
+```
+
+```ts
+const chatMode = ref<"ask" | "exec">("exec");
+
+async function send() {
+  const text = input.value.trim();
+  if (!text || busy.value)
+    return;
+  busy.value = true;
+  const mode = chatMode.value === "ask"
+    ? "ask"
+    : (props.modifyTarget ? "modify" : "lowpoly");
+  await client.request("chat.send", {
+    area: props.area, mode, text,
+    asset: props.modifyTarget ?? undefined,
+  });
+  input.value = "";
+}
+```
+
+订阅三条草稿事件（替掉现有的 `draft.created` 处理）：
+
+```ts
+props.client.on("draft.created", (data) => {
+  const d = data as { area?: string; id?: number; prompt?: string; origin?: string };
+  if (d.area !== props.area) return;
+  busy.value = false;
+  messages.value.push({
+    role: "draft",
+    id: d.id,
+    content: d.prompt ?? "",
+    origin: d.origin === "discussion" ? "discussion" : "generated",
+    state: "pending",
+  });
+  scrollToBottom();
+}),
+props.client.on("draft.updated", (data) => {
+  const d = data as { area?: string; id?: number; prompt?: string };
+  const card = messages.value.find((m) => m.role === "draft" && m.id === d.id);
+  if (card) card.content = d.prompt ?? "";
+}),
+props.client.on("draft.done", (data) => {
+  const d = data as { area?: string; id?: number; cancelled?: boolean };
+  const card = messages.value.find((m) => m.role === "draft" && m.id === d.id);
+  if (!card) return;
+  if (d.cancelled)
+    card.state = "cancelled"; // 灰卡只读
+  else
+    messages.value = messages.value.filter((m) => m !== card); // 已转成 user 气泡，避免重复
+}),
+```
+
+`DraftCard.vue`：三按钮 + 失焦落库：
+
+```vue
+<div class="draft-actions" v-if="state === 'pending'">
+  <button @click="run">执行</button>
+  <button @click="regenerate">重新生成</button>
+  <button @click="cancel">取消</button>
+</div>
+```
+
+```ts
+const props = defineProps<{
+  id?: number;
+  content: string;
+  client: WsClient;
+  state?: "pending" | "cancelled";
+  origin?: "discussion" | "generated";
+}>();
+
+const text = ref(props.content);
+watch(() => props.content, (v) => { text.value = v; }); // 重新生成后回填
+
+// 退出编辑即落库：刷新后看到的是改过的版本
+async function save() {
+  if (props.state !== "pending" || !props.id || text.value === props.content)
+    return;
+  await props.client.request("draft.save", { id: props.id, content: text.value });
+}
+
+async function run() {
+  const res: any = await props.client.request("draft.send", {
+    id: props.id, prompt: text.value,
+  });
+  if (res?.accepted === false)
+    error.value = res.reason ?? "执行失败";
+}
+
+function regenerate() {
+  props.client.request("draft.regenerate", { id: props.id });
+}
+
+async function cancel() {
+  await props.client.request("draft.cancel", { id: props.id });
+}
+```
+
+`history.ts`：`toChatItems` 增加草稿分支，靠 meta 还原刷新后的卡片：
+
+```ts
+if (role === "draft") {
+  const meta = (item.meta ?? {}) as Record<string, unknown>;
+  return {
+    role: "draft",
+    id: item.id,
+    content: item.content,
+    origin: meta.origin === "discussion" ? "discussion" : "generated",
+    state: meta.state === "cancelled" ? "cancelled" : "pending",
+  };
+}
+```
+
+`ChatItem` 增加 `id?: number`、`origin?: "discussion" | "generated"`、`state?: "pending" | "cancelled"`。
+
+- [ ] **Step 7: CMake + 全量测试 + Commit**
+
+`CMakeLists.txt`：
+
+```cmake
+qt_add_resources(synthforge_core "prompts"
+    PREFIX "/prompts"
+    BASE "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts"
+    FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/summarizer.md"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/summarizer-modify.md"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/ask.md")
+
+add_executable(tst_ask_reply tests/tst_ask_reply.cpp)
+target_link_libraries(tst_ask_reply PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_ask_reply COMMAND tst_ask_reply)
+set_tests_properties(tst_ask_reply PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+```
+
+`src/core/agent/AskReply.cpp` 加进 `synthforge_core` 源列表。
+
+Run: `cmake --build build --config Debug` 然后 `ctest --test-dir build -C Debug -LE slow --output-on-failure`
+Expected: 全绿，`tst_ask_reply` 4 用例、`tst_summarizer` 6 用例。
+
+手工验收：
+1. 输入框切「讨论」→ 发「这个招牌怎么改才好看」→ 只有文字回答，Blender 未连接也能聊。
+2. 继续讨论到方案明确 → 回答下方出现草稿卡（内容即模型给的草稿）；点「重新生成」→ 卡片内容被 SummarizerAgent 重写。
+3. 点「执行」：无选中资产 → 计划卡；有选中资产 → 直接开干（无计划卡、无目录选择）。
+4. 切「执行」→ 选中有 `.blend` 的资产 → 发「弄旧一点」→ 先出草稿卡（修改模板），点执行才动 Blender。
+5. 选中云 API 资产（无 `.blend`）→ 讨论时模型说明只能重新生成；草稿卡点执行返回 `no-blend-source`。
+6. 改草稿文字 → 点空白处失焦 → 刷新页面 → 卡片回到原位且显示改过的文字。
+7. 取消一张草稿后刷新 → 灰卡只读，无按钮；执行过的那条变成普通 user 气泡，历史里不重复。
+8. 关掉 Blender 插件（或退出 Blender）→ 执行模式发「弄旧一点」→ **仍出草稿卡**；点执行 → 立刻弹 `blender-not-ready`，卡片保留可继续改。
+9. 讨论模式问「我库里都有什么」→ 回答能列出 `{{assets}}` 里的文件名，并区分「可修改」与「无 .blend」。
+
+```bash
+git add CMakeLists.txt src/core/agent/AskReply.h src/core/agent/AskReply.cpp \
+  src/core/agent/SummarizerAgent.h src/core/agent/SummarizerAgent.cpp \
+  src/resources/prompts/ask.md src/resources/prompts/summarizer-modify.md \
+  src/core/coreapp/CoreApp.h src/core/coreapp/CoreApp.cpp \
+  src/core/store/SessionStore.h src/core/store/SessionStore.cpp \
+  tests/tst_ask_reply.cpp tests/tst_summarizer.cpp tests/tst_session_store.cpp \
+  web/src/components/ChatPanel.vue web/src/components/DraftCard.vue web/src/chat/history.ts
+```
+
+Commit（`feat: 讨论/执行双模式与统一草稿卡`）。
+
+---
+
 ## P4 完成标准
 
 - [ ] 低模全链真实跑通（发送 → 草稿 → 计划卡确认 → 确认目录 → 分组建模/自检 → 截图 → 落盘 → 预览）
-- [ ] 修改已有资产路径跑通，且全程无草稿卡/计划卡/位置弹窗
+- [ ] 修改已有资产路径跑通：先出修改草稿卡，确认后无计划卡、无位置弹窗
+- [ ] 讨论模式全程不碰 Blender：不 preflight、不占 `BlenderGate`，Blender 未启动时也能正常对话
+- [ ] 讨论收敛后回答下方出现草稿卡（`[[EXEC]]` 标记对用户不可见，流式过程中也不闪现）；可编辑、可重新生成（走 SummarizerAgent）、可执行
+- [ ] 草稿卡点执行按有无资产分流：有资产直接 `modify`，无资产进 `plan()`；无 `.blend` 源文件时返回 `no-blend-source` 且不动 Blender
+- [ ] `draft.regenerate` 按资产有无选择 `modify` / `lowpoly` 模板，并把讨论结论注入 system
+- [ ] 草稿卡落库在 `messages.meta`（不再用 `drafts` 表）：刷新/重启后按 `id` 原位恢复；手动编辑失焦即存；点执行后同一行转成 `role='user'`（历史不重复），取消后变灰只读
+- [ ] `tst_ask_reply`（4 用例：无标记 / 正常切分 / 未闭合 / 空块）与 `tst_summarizer`（6 用例，含 modify 模板不串新建骨架、讨论结论已注入）全绿
 - [ ] 规划解析失败自动降级默认四分组，流程不中断；`plan.cancel` 正确取消任务
-- [ ] 前置检查先于总结 agent；`blender-not-ready` 时零 LLM 调用
+- [ ] 每个新建任务开始前确定性清场（MCP 直调，不经 LLM）：连做两个任务，第二个 `.blend` 里不含第一个任务的物体；清场失败以 `clear-scene-failed` 终止，不带着旧场景继续建
+- [ ] 导出三件套同基名；目标目录已有同名文件时自动递增为 `name_2`，旧资产不被覆盖，最终回复告知实际文件名
+- [ ] 草稿阶段不前置检查：Blender 未连接时仍能生成草稿；点执行（`draft.send`）时立即弹 `blender-not-ready` 且不占门禁、不进计划/执行链
 - [ ] Blender 低模 / 修改任务全程持有 `BlenderGate`（owner=`blender-agent`）；成功 / 失败 / 取消三个出口均释放；门禁忙时 `failed("blender-busy")` 且零 LLM / MCP 调用
 - [ ] `plan.confirm` 在门禁忙时返回 `blender-busy` 且**不消费** `m_pendingPlans`（计划卡保留，可稍后再点开始）
 - [ ] 截图压缩后回喂（长边 ≤1024、JPEG q80），且同一截图以 `chat.image` 事件在对话区渲染为图片卡
 - [ ] 取消任务后 MCP 调用在工具边界停止，任务事件 `finished(cancelled=true)`；草稿/规划/计划/执行四个可等待阶段的「停止」均生效（规划丢弃迟到结果不弹卡）
-- [ ] `tst_preflight`、`tst_mcp_runtime`、`tst_blender_gate`、`tst_asset_library`、`tst_orchestrator`、`tst_llm_gateway` 全绿（`tst_orchestrator` 6 用例，含门禁忙拒绝与成功释放；`tst_llm_gateway` 7 用例走真实 HTTP+SSE，删掉 `LlmGateway` 的 `readyRead`/`finished` 分支必须变红）
+- [ ] `tst_preflight`、`tst_mcp_runtime`、`tst_blender_gate`、`tst_asset_library`、`tst_orchestrator`、`tst_llm_gateway`、`tst_ask_reply` 全绿（`tst_orchestrator` 6 用例，含门禁忙拒绝与成功释放；`tst_llm_gateway` 7 用例走真实 HTTP+SSE，删掉 `LlmGateway` 的 `readyRead`/`finished` 分支必须变红）
 - [ ] `fs.operate` 五项操作全部可用（mkdir/rename/delete/reveal/refresh），越界路径返回 `invalid-path`；`folderPick.mkdir` 可在弹窗内新建文件夹
 - [ ] `file.read` 支持文本 / 图片 / GLB / 模型文件信息卡四类，模型文件返回 `blendPath`；`asset.created` 后预览区自动加载新资产；未选中时显示概览卡
 - [ ] 资产树平铺 glb/fbx/blend 三种文件；点 glb 出 3D 预览，点 fbx/blend 出文件信息卡；点文件**不**产生修改 chip
