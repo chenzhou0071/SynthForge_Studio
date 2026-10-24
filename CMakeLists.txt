@@ -14,6 +14,7 @@ add_library(synthforge_core STATIC
     src/core/mcp/McpTransport.h
     src/core/mcp/StdioTransport.cpp
     src/core/mcp/BridgeCommands.cpp
+    src/core/preflight/PreflightChecker.cpp
     src/core/settings/SettingsStore.cpp
     src/core/settings/UiState.cpp
     src/core/store/SessionStore.cpp
@@ -57,6 +58,12 @@ target_link_libraries(tst_mcp_runtime PRIVATE synthforge_core Qt6::Test)
 add_dependencies(tst_mcp_runtime mock_mcp_server)
 add_test(NAME tst_mcp_runtime COMMAND tst_mcp_runtime)
 set_tests_properties(tst_mcp_runtime PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_preflight tests/tst_preflight.cpp)
+target_link_libraries(tst_preflight PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_preflight COMMAND tst_preflight)
+set_tests_properties(tst_preflight PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
 add_executable(tst_stdio_transport tests/tst_stdio_transport.cpp)

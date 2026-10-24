@@ -1,12 +1,17 @@
 #include "core/coreapp/CoreApp.h"
 
 #include "core/llm/LlmGateway.h"
+#include "core/mcp/BridgeCommands.h"
+#include "core/mcp/McpRuntime.h"
+#include "core/mcp/StdioTransport.h"
+#include "core/preflight/PreflightChecker.h"
 #include "core/settings/SettingsStore.h"
 #include "core/store/SessionStore.h"
 #include "core/tasks/TaskManager.h"
 #include "core/ws/ProtocolRouter.h"
 #include "core/ws/WsServer.h"
 
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 
@@ -51,6 +56,21 @@ bool CoreApp::start()
     m_settings->load();
     if (!m_sessions->open())
         return false;
+
+    // Blender 桥接运行时：先建好再注册 handler，保证 chat.send 的前置检查有可用对象
+    m_blender = new McpRuntime(
+        QStringLiteral("blender"),
+        std::make_unique<StdioTransport>(defaultBridgeCommand(QStringLiteral("blender"))),
+        this);
+    connect(m_blender, &McpRuntime::toolsChanged, this, [this](const QJsonArray& tools) {
+        m_blenderTools = tools;
+        if (m_blender->isReady()) // 顶栏悬停文案：已就绪 · N 个工具（规格 4.2）
+            broadcastConnStatus(QStringLiteral("blender"), QStringLiteral("ready"),
+                                QStringLiteral("已就绪 · %1 个工具").arg(tools.size()));
+    });
+    connect(m_blender, &McpRuntime::statusChanged, this, &CoreApp::broadcastConnStatus);
+    registerBridge(QStringLiteral("blender"), [this] { return m_blender->restart(); });
+    m_preflight = std::make_unique<PreflightChecker>(m_settings.get(), m_blender);
 
     m_router->registerHandler(QStringLiteral("settings.get"), [this](const QJsonObject&) {
         return QJsonValue(m_settings->data());
@@ -131,6 +151,7 @@ bool CoreApp::start()
                      m_ws->token().toUtf8().constData());
         std::fflush(stderr);
     }
+    m_blender->start(); // 异步启动：握手完成后通过 conn.status 点亮顶栏
     return true;
 }
 
@@ -139,16 +160,81 @@ void CoreApp::registerBridge(const QString& area, RestartFn fn)
     m_bridgeRestarts.insert(area, std::move(fn));
 }
 
+void CoreApp::broadcastConnStatus(const QString& area, const QString& status,
+                                  const QString& hint)
+{
+    m_status.insert(area, status);
+    if (hint.isEmpty())
+        m_hints.remove(area); // ready 时清掉旧的“第 N 次重连”提示
+    else
+        m_hints.insert(area, hint);
+
+    QJsonObject hints;
+    for (auto it = m_hints.constBegin(); it != m_hints.constEnd(); ++it)
+        hints.insert(it.key(), it.value());
+
+    m_ws->broadcastEvent(QStringLiteral("conn.status"),
+                         QJsonObject{{"blender", m_status.value(QStringLiteral("blender"), "off")},
+                                     {"unity", m_status.value(QStringLiteral("unity"), "off")},
+                                     {"hints", hints}});
+
+    if (status == QLatin1String("ready")) {
+        m_everReady.insert(area);
+        m_crashNotified.remove(area); // 恢复后再次崩溃会重新出卡
+    } else if (status == QLatin1String("off") && m_everReady.contains(area)
+               && !m_crashNotified.contains(area)) {
+        m_crashNotified.insert(area); // 一次断链只报一张卡（重试循环不重复弹）
+        m_ws->broadcastEvent("error.card",
+                             QJsonObject{{"area", area},
+                                         {"reason", "bridge-crashed"},
+                                         {"message", hint}});
+    }
+}
+
+LlmConfig CoreApp::primaryAgentConfig() const
+{
+    const QJsonObject data = m_settings->data();
+    const QJsonObject primary = data.value(QStringLiteral("agent"))
+                                   .toObject()
+                                   .value(QStringLiteral("primary"))
+                                   .toObject();
+    return {resolveBaseUrl(primary, data), primary.value(QStringLiteral("apiKey")).toString(),
+            primary.value(QStringLiteral("model")).toString()};
+}
+
 QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
 {
     const QString area = params.value(QStringLiteral("area")).toString();
     const QString text = params.value(QStringLiteral("text")).toString();
+    const QString mode = params.value(QStringLiteral("mode")).toString(); // 空 = P2 通用流
+
+    // 前置检查先于任何落库/LLM 调用：链未就绪直接拒绝，不浪费总结/建模调用
+    if (mode == QLatin1String("lowpoly") || mode == QLatin1String("cloud3d")
+        || mode == QLatin1String("modify")) {
+        const PreflightResult pre = mode == QLatin1String("cloud3d")
+                                        ? m_preflight->checkCloud3d()
+                                        : m_preflight->checkLowpoly();
+        if (!pre.ok) {
+            m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                 QJsonObject{{"area", area}, {"reason", pre.reason}});
+            return QJsonValue(QJsonObject{{"accepted", false}});
+        }
+    }
+
     m_lastSend.insert(area, params);
 
     if (appendUser) {
         m_sessions->appendMessage(area, QStringLiteral("user"), text);
         m_ws->broadcastEvent(QStringLiteral("chat.message"),
                              QJsonObject{{"area", area}, {"role", "user"}, {"content", text}});
+    }
+
+    if (mode == QLatin1String("cloud3d")) {
+        // P5 接管云 API 生成：先占位拒绝，避免落到通用流
+        m_ws->broadcastEvent(QStringLiteral("error.card"),
+                             QJsonObject{{"area", area}, {"reason", "cloud3d-not-implemented"}});
+        return QJsonValue(QJsonObject{{"accepted", false},
+                                      {"reason", "cloud3d-not-implemented"}});
     }
 
     const QJsonObject data = m_settings->data();
