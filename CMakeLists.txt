@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Test Sql WebSockets Network)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Test Sql WebSockets Network WebEngineWidgets)
 
 add_library(synthforge_core STATIC
     src/core/mcp/JsonRpcLineCodec.cpp
@@ -66,6 +66,22 @@ set_tests_properties(tst_bridge_commands PROPERTIES
 
 add_executable(synthforge_cli src/cli/main.cpp)
 target_link_libraries(synthforge_cli PRIVATE synthforge_core)
+
+# GUI 壳：web/dist 打进 qrc，app://ui/ 从 :/web/ 取文件
+file(GLOB_RECURSE WEB_DIST_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/web/dist/*")
+add_executable(synthforge_app
+    src/main.cpp
+    src/app/MainWindow.cpp
+    src/app/AppSchemeHandler.cpp)
+target_link_libraries(synthforge_app PRIVATE synthforge_core Qt6::WebEngineWidgets)
+if(WEB_DIST_FILES)
+    qt_add_resources(synthforge_app "web_assets"
+        PREFIX "/web"
+        BASE "${CMAKE_CURRENT_SOURCE_DIR}/web/dist"
+        FILES ${WEB_DIST_FILES})
+else()
+    message(WARNING "web/dist 为空：先运行 cd web && npm run build，否则 synthforge_app 无法加载界面")
+endif()
 
 add_executable(tst_reconnect tests/tst_reconnect.cpp)
 target_link_libraries(tst_reconnect PRIVATE synthforge_core Qt6::Test)
