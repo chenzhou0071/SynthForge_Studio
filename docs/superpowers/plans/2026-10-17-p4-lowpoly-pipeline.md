@@ -19,7 +19,7 @@
 - 资产库根固定：`文档/SynthForgeStudio/ModelLibrary`（QStandardPaths::DocumentsLocation）；存放位置只能在该根的子路径中选择。
 - 落盘后 GLB 与 .blend 一并保留；命名遵循草稿中的英文命名清单。
 - **低模新资产走 Planner→Executor**：草稿发送后先规划、计划确认后才选存放位置并执行；解析失败降级默认四分组，不阻塞。修改已有资产不经过规划。
-- 步数预算按计划动态计算：`maxSteps = min(8 × 组数 + 10, 60)`。
+- 步数预算按计划动态计算：`maxSteps = min(30 × 组数, 200)`（实测 8×+10 会让 4 组任务在干到一半时撞 `max-steps-exceeded`；2/4/6 组分别 60/120/180，7 组以上 200）。
 - **LLM 测试必须走真实 HTTP + SSE**：禁止 `class Xxx : public LlmGateway` 重写 `chatStream` 来造 mock，也不允许把 `chatStream` 改成可注入回调来绕过网络。所有 LLM 相关测试一律让真实 `chatStream` 发出 `POST /chat/completions`，由 `MockLlmServer`（`QTcpServer` 假服务端）在 TCP 上回真实的 chunked SSE 字节。判据：删掉 `LlmGateway.cpp` 里 `readyRead` / `finished` 任一分支，测试必须变红；若仍绿，说明断言盯错了对象。
 
 ## File Structure
@@ -1935,6 +1935,14 @@ connect(m_orch, &AgentOrchestrator::finalText, this,
             m_ws->broadcastEvent("chat.message",
                                  {{"area", area}, {"role", "assistant"}, {"content", text}});
         });
+connect(m_orch, &AgentOrchestrator::turnFinished, this,
+        [this](const QString& area, const QString& text) {
+            if (text.trimmed().isEmpty())
+                return;
+            // 中间轮次也落库：刷新/重启后能看到每一步说明，而不是只剩最终一句
+            m_sessions->appendMessage(area, "assistant", text);
+            m_ws->broadcastEvent("chat.turn", {{"area", area}, {"content", text}});
+        });
 connect(m_orch, &AgentOrchestrator::failed, this,
         [this](const QString& area, const QString& reason) {
             m_ws->broadcastEvent("error.card", {{"area", area}, {"reason", reason}});
@@ -2243,7 +2251,7 @@ m_router->registerHandler("plan.confirm", [this](const QJsonObject& params) {
         group.acceptance = item.value("acceptance").toString();
         plan.groups.append(group);
     }
-    plan.maxSteps = json.value("totalSteps").toInt(50); // 规划阶段已按 8×组数+10 计算并封顶
+    plan.maxSteps = json.value("totalSteps").toInt(50); // 规划阶段已按 30×组数 计算并封顶 200
     m_pendingPicks.insert(area, PendingPick{area, "lowpoly",
                                             m_planPrompts.value(area), plan});
     openFolderPick(area);
@@ -2333,7 +2341,7 @@ void CoreApp::openFolderPick(const QString& area)
 }
 ```
 
-> `folderPick.submit` 先检查门禁再消费 `requestId` / `pendingPick`：`blender-busy` 或 `invalid-path` 时弹窗保持打开，用户可修正路径或等 Blender 空闲后再次确认；成功后才 `remove`。随后把 TaskManager 回调参数 `tid` 传给 `execute()`（与入队 id 相同，但以回调参数为准）；此后由 `execute()` 内部 `finishOk/finishCancelled/fail` 调用 `TaskManager::finish` 推进队列。`plan.maxSteps` 直接采用 planReady 的 `totalSteps`（已在规划阶段算好并封顶 60）。
+> `folderPick.submit` 先检查门禁再消费 `requestId` / `pendingPick`：`blender-busy` 或 `invalid-path` 时弹窗保持打开，用户可修正路径或等 Blender 空闲后再次确认；成功后才 `remove`。随后把 TaskManager 回调参数 `tid` 传给 `execute()`（与入队 id 相同，但以回调参数为准）；此后由 `execute()` 内部 `finishOk/finishCancelled/fail` 调用 `TaskManager::finish` 推进队列。`plan.maxSteps` 直接采用 planReady 的 `totalSteps`（已在规划阶段算好并封顶 200）。
 
 `fs.operate` 与 `folderPick.mkdir` handler：
 
@@ -2441,7 +2449,7 @@ Expected: 2 用例 Passed。
 **Files:** Modify `web/src/components/FileTree.vue`、`PreviewPane.vue`、`App.vue`、`web/src/preview/file.ts`；Modify `CoreApp`（`assets.list`、`file.read`、`fileTree.changed`）。
 
 **Interfaces:**
-- 请求 `assets.list {}` → `[{name, relativePath, kind, size, modified}]`：`kind ∈ glb|fbx|blend`，**三种都返回**（目录由前端按相对路径聚合，FileTree 平铺三种文件；P6 AssetPicker 已在消费端按 `kind === "glb" || "fbx"` 过滤，不受影响）。
+- 请求 `assets.list {}` → `[{name, relativePath, kind, size, modified}]`：`kind ∈ glb|fbx|blend|dir`，**文件三种都返回，外加 `dir` 目录条目**（目录由前端按相对路径聚合，空文件夹也能显示；P6 AssetPicker 已在消费端按 `kind === "glb" || "fbx"` 过滤，不受影响）。
 - 请求 `file.read {area, path}` → `{ok, kind:'text'|'image'|'model'|'info', content?, dataUrl?, language?, size?, modified?, blendPath?}`；`kind==='info'` 是模型文件的**文件信息卡**（fbx/blend 不读内容）；模型三种格式额外返回 `blendPath`（同目录同名 `.blend` 的相对路径，没有则空串），供修改入口判定。blender 区路径相对资产库根（复用 `isValidTarget`）；unity 区由 P6 接管（P4 返回 `area-not-supported`）。
 - `PreviewPane` props 与 P3 Task 6 一致：`{area, file}`；`file.kind==='model'` 时用 three.js 加载 `file.dataUrl`；`file.kind==='info'` 渲染文件信息卡（类型/大小/修改时间/能否修改）；文件为 glb/fbx/blend 时**标题栏右侧显示 [修改此资产]**（emit `modify(path)`）；未选中 → 概览卡。加载完成后按包围球自动摆相机；`gltf.animations` 全部同时循环播放，底部显示播放/暂停与各段时长（无动画不显示），右上角常驻「完整材质、动画与特效请在 Blender 中查看」。
 - `App.vue`：FileTree `select(path)` → `file.read` → `previewFile`。FileTree 右键「修改此资产」与 PreviewPane 的 `modify` 事件走同一个 `requestModify(path)`：先 `file.read` 取 `blendPath` → 有则设为 `modifyTarget`（传给 ChatPanel），无则弹窗（见 Task 6）。订阅 `asset.created` → 用其相对路径 `path` 自动加载新资产。
@@ -2518,7 +2526,7 @@ m_router->registerHandler("file.read", [this](const QJsonObject& params) {
 });
 ```
 
-`assets.list` handler（文件树与 AssetPicker 的唯一数据源；`kind` 为不含点后缀，返回 glb/fbx/blend 三种；目录由前端按相对路径聚合）：
+`assets.list` handler（文件树与 AssetPicker 的唯一数据源；`kind` 为不含点后缀，返回 glb/fbx/blend 三种文件，以及 `kind=dir` 的目录条目——否则空文件夹在左栏看不见）：
 
 ```cpp
 m_router->registerHandler("assets.list", [this](const QJsonObject&) {
@@ -2821,7 +2829,7 @@ function highlighted(content: string, language?: string) {
 
 依赖增量：`web/package.json` 加 `"three": "^0.169.0"`、`"@types/three": "^0.169.0"`（`highlight.js` 已在 P3 Task 6 安装）。
 
-`FileTree.vue`：在 P3 Task 6 的右键菜单骨架上填数据：`assets.list` 拉取 → 目录按相对路径聚合成可折叠节点，**三种模型文件平铺列出**（每行 = 文件名 + 后缀标签；glb 正常色，fbx/blend 用 `--muted` 淡一档，让人一眼看出哪个能直接预览）；点击任意文件 emit `select(relativePath)`；`fileTree.changed` → 重新拉取；右键节点的 `path` 使用相对路径。
+`FileTree.vue`：在 P3 Task 6 的右键菜单骨架上填数据：`assets.list` 拉取 → 目录（含 `kind=dir` 的空目录）按相对路径聚合成可折叠节点，**三种模型文件平铺列出**（每行 = 文件名 + 后缀标签；glb 正常色，fbx/blend 用 `--muted` 淡一档，让人一眼看出哪个能直接预览）；点击任意文件 emit `select(relativePath)`；`fileTree.changed` → 重新拉取；右键节点的 `path` 使用相对路径。
 
 模型文件项的右键菜单在既有五项后追加一条 **修改此资产**（`emit("modify", path)`，由 App 统一判定）；目录项与根不显示该条。`.blend` / `.fbx` 同样提供入口——是否有可编辑源文件由 App 拿 `file.read` 的 `blendPath` 判断，不在树里做二次推断（避免树与后端各算一套）。
 
@@ -3009,12 +3017,13 @@ async function send() {
 > 2. 修改已有资产从「跳过所有确认直接干」改为「先出一张修改草稿卡」，`startModify` 从 Task 6 的 `chat.send` 分支抽成独立函数。
 > 3. `drafts` 表与 `saveDraft` / `draft()` 删除，草稿改存 `messages.meta`。
 > 4. Task 6 验收里「关掉 Blender 再发送 → 立刻报 `blender-not-ready`」被推翻：现在会先出草稿卡，点执行才报。
+> 5. 计划卡也落 `messages`（`role='plan'`，`meta={taskId,state}`），刷新/重启后按 `id` 原位恢复；已确认/已取消只读，`pending` 在应用未重启时可继续确认。
 >
 > **为何存在**：用户需要在动手前先和模型讨论方案（「这个招牌怎么改好看」「为什么预览里没有雨」），而现有每条消息都会直接进入建模链。本任务加一个「讨论 / 执行」开关：讨论模式只对话、不碰 Blender；讨论收敛后模型在回复末尾附一段可直接执行的草稿，前端把它转成草稿卡。同时把「任何执行前都有一张草稿卡」固化成统一规则：执行模式改已有资产也先出草稿卡。
 
 **Files:**
 - Create: `src/core/agent/AskReply.h/.cpp`、`src/resources/prompts/ask.md`、`src/resources/prompts/summarizer-modify.md`、`tests/tst_ask_reply.cpp`
-- Modify: `src/core/store/SessionStore.h/.cpp`（messages 加 meta 列、删 drafts 表）、`src/core/agent/SummarizerAgent.h/.cpp`、`src/core/coreapp/CoreApp.h/.cpp`、`tests/tst_session_store.cpp`、`tests/tst_summarizer.cpp`、`CMakeLists.txt`、`web/src/components/ChatPanel.vue`、`web/src/components/DraftCard.vue`、`web/src/chat/history.ts`
+- Modify: `src/core/store/SessionStore.h/.cpp`（messages 加 meta 列、删 drafts 表）、`src/core/agent/SummarizerAgent.h/.cpp`、`src/core/coreapp/CoreApp.h/.cpp`、`tests/tst_session_store.cpp`、`tests/tst_summarizer.cpp`、`tests/tst_headless_ws.cpp`、`CMakeLists.txt`、`web/src/components/ChatPanel.vue`、`web/src/components/DraftCard.vue`、`web/src/components/PlanCard.vue`、`web/src/chat/history.ts`、`web/src/chat/history.test.ts`、`web/src/components/ChatPanel.test.ts`
 
 **Interfaces:**
 - `chat.send { area, mode: "ask", text, asset? }` → 流式 `chat.delta` → 收尾 `chat.message { role:"assistant", content }`；若回答里带了可执行块，紧跟一条 `draft.created { id, prompt, origin:"discussion", asset }`。ask 分支**不做 preflight**（不碰 Blender）、不占 `BlenderGate`、不进计划/执行链；`asset` 是当前选中资产的相对路径，可为空。
@@ -3038,12 +3047,16 @@ struct SummarizeRequest {
 ```
 
 - 前端开关：`ChatPanel` 输入区左侧 segmented control，默认「执行」；选「讨论」时发 `mode:"ask"`，选「执行」时有 `modifyTarget` 发 `mode:"modify"` + `asset`，否则发 `mode:"lowpoly"`。
+- `plan.created { area, id, taskId, rules, groups, totalSteps }`：`id` 是 `role='plan'` 那一行的行号；`content` 存计划 JSON，`meta={taskId,state:"pending"}`。前端用它渲染计划卡并定位后续确认/取消。
+- `plan.confirm { area, taskId, id? }` / `plan.cancel { area, taskId, id? }`：成功时把计划行 `meta.state` 改写为 `started` / `cancelled`；`id` 缺省（旧前端）时只保留原有内存行为；`id` 与当前待确认计划不一致（历史遗留的旧 pending 卡，或应用重启后内存里没有计划）时只把那张卡置为 `cancelled`（仅当它仍是 `pending`，不会把已 `started` 的卡改回去），不动当前计划。
+- 计划卡回放：`state='pending'` 的卡刷新后可继续（应用未重启时后端仍有 `m_pendingPlans`）；后端返回 `plan-not-found` 时前端提示「计划已失效」并置灰；`started` / `cancelled` 直接渲染只读卡，不显示按钮。
+- `CoreOptions { dataDir, headless, libraryRoot, blenderBridge }`：`blenderBridge.program` 为空时回落到默认 `uvx mcp-for-blender`；测试注入 `mock_mcp_server`，让 `checkLowpoly()` 走真实握手而不是永远 `blender-not-ready`。
 
 - [ ] **Step 1: messages 表加 meta（红 → 绿）**
 
-草稿卡刷新后能不能恢复，全靠这一列：`role='draft'` 的消息把 `asset` / `state` / `origin` / `source` 存在 `meta` 里，`id` 就是渲染顺序。
+草稿卡和计划卡刷新后能不能恢复，全靠这一列：`role='draft'` / `role='plan'` 的消息把 `asset` / `state` / `origin` / `source` / `taskId` 存在 `meta` 里，`id` 就是渲染顺序。
 
-`tests/tst_session_store.cpp` 追加：
+`tests/tst_session_store.cpp` 追加（顶部补 `#include <QJsonDocument>`：`planSurvivesAsMessage` 要解析 content）：
 
 ```cpp
     void draftRoundTripsWithMeta()
@@ -3086,6 +3099,32 @@ struct SummarizeRequest {
         const QJsonObject row = store.messageById(id);
         QCOMPARE(row.value(QStringLiteral("role")).toString(), QStringLiteral("user"));
         QCOMPARE(row.value(QStringLiteral("content")).toString(), QStringLiteral("改过的文本"));
+    }
+
+    void planSurvivesAsMessage()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        SessionStore store(dir.path() + QStringLiteral("/sessions.db"));
+        QVERIFY(store.open());
+
+        const QJsonObject plan{{QStringLiteral("taskId"), QStringLiteral("plan-1")},
+                               {QStringLiteral("totalSteps"), 60}};
+        const qint64 id = store.appendMessage(
+            QStringLiteral("blender"), QStringLiteral("plan"),
+            QString::fromUtf8(QJsonDocument(plan).toJson(QJsonDocument::Compact)),
+            QJsonObject{{QStringLiteral("state"), QStringLiteral("pending")},
+                        {QStringLiteral("taskId"), QStringLiteral("plan-1")}});
+        QVERIFY(id > 0);
+
+        const QJsonObject row = store.messageById(id);
+        QCOMPARE(row.value(QStringLiteral("role")).toString(), QStringLiteral("plan"));
+        QCOMPARE(row.value(QStringLiteral("meta")).toObject()
+                     .value(QStringLiteral("state")).toString(),
+                 QStringLiteral("pending"));
+        QCOMPARE(QJsonDocument::fromJson(row.value(QStringLiteral("content")).toString().toUtf8())
+                     .object().value(QStringLiteral("totalSteps")).toInt(),
+                 60);
     }
 ```
 
@@ -3208,7 +3247,7 @@ QJsonObject SessionStore::messageById(qint64 id) const
 ```
 
 Run: `ctest --test-dir build -C Debug -R tst_session_store --output-on-failure`
-Expected: 原有用例 + 新增 2 用例全绿。
+Expected: 原有用例 + 新增 3 用例全绿。
 
 - [ ] **Step 2: 标记解析纯函数（红 → 绿）**
 
@@ -3498,7 +3537,7 @@ Expected: 6 用例 Passed。
 正文正常聊天。不要在正文里提到标记本身，不要说“我给出了执行块”。
 ```
 
-`CoreApp.cpp` 顶部补 `#include "core/agent/AskReply.h"`、`#include <QFile>`、`#include <QFileInfo>`、`#include <QSet>`。
+`CoreApp.cpp` 顶部补 `#include "core/agent/AskReply.h"`、`#include <QFile>`、`#include <QFileInfo>`、`#include <QJsonDocument>`、`#include <QSet>`（`planReady` 序列化计划 JSON 也要用 `QJsonDocument`）。
 
 `CoreApp::handleChatSend` 在 `m_lastSend.insert` 之后、lowpoly 分支之前插入 ask 分支：
 
@@ -3555,11 +3594,9 @@ Expected: 6 用例 Passed。
 
         QJsonArray messages{
             QJsonObject{{"role", "system"}, {"content", system}}};
-        for (const QJsonValue& value : m_sessions->messagePage(area, 20).messages) {
-            const QJsonObject message = value.toObject();
-            messages.append(QJsonObject{{"role", message.value("role")},
-                                        {"content", message.value("content")}});
-        }
+        // recentMessages 只放行 user/assistant：草稿卡与计划卡行不能喂给 LLM
+        for (const QJsonValue& value : recentMessages(area, 20))
+            messages.append(value);
 
         const QString taskId = QStringLiteral("ask-%1").arg(++m_seq);
         m_tasks->enqueue(Task{
@@ -3761,8 +3798,13 @@ connect(m_summarizer, &SummarizerAgent::draftReady, this,
 
         if (!asset.isEmpty())
             return startModify(area, asset, prompt);
+        // plan.confirm 要用用户最后编辑过的提示词去执行，不是 Summarizer 的初稿
+        m_planPrompts.insert(area, prompt);
+        // 新指令作废上一次「取消规划」标记，否则 planReady 会把这次的新计划也丢掉
+        m_planCancelled.remove(area);
         m_orch->setModelConfig(primaryAgentConfig());
-        m_orch->setConversationHistory(m_sessions->recentMessages(area, 20));
+        // 本次指令已由草稿行转正落库，plan() 会把它拼在末尾：历史里去掉同一条避免重复
+        m_orch->setConversationHistory(historyForPrompt(area, prompt, 20));
         m_orch->plan(QStringLiteral("plan-%1").arg(++m_seq), nullptr, prompt, area);
         return QJsonValue(QJsonObject{{"accepted", true}});
                               });
@@ -3837,11 +3879,13 @@ QJsonValue CoreApp::startModify(const QString& area, const QString& asset, const
                                .arg(info.absoluteFilePath(), text);
     const QString taskId = QStringLiteral("chat-%1").arg(++m_seq);
     const QString targetFolder = info.absolutePath();
+    // 草稿已转正成最后一条 user，prompt 还会拼在末尾：历史里去掉同一条避免重复
+    const QJsonArray history = historyForPrompt(area, text, 20);
     m_tasks->enqueue(
         Task{taskId, area, QString(),
-             [this, plan, prompt, targetFolder, area](const QString& tid, TaskManager* tm) {
+             [this, plan, prompt, targetFolder, area, history](const QString& tid, TaskManager* tm) {
                  m_orch->setModelConfig(primaryAgentConfig());
-                 m_orch->setConversationHistory(m_sessions->recentMessages(area, 20));
+                 m_orch->setConversationHistory(history);
                  m_orch->execute(tid, tm, ToolBridge::mcpToolsToOpenAi(m_blenderTools),
                                  plan, prompt, targetFolder, area);
              }});
@@ -3849,7 +3893,427 @@ QJsonValue CoreApp::startModify(const QString& area, const QString& asset, const
 }
 ```
 
-- [ ] **Step 6: 前端开关与三按钮草稿卡**
+- [ ] **Step 6: 计划卡落库与状态回写（红 → 绿）**
+
+`planReady` 落库并带回行号；`plan.confirm` / `plan.cancel` 成功后回写 `meta.state`。刷新后计划卡按 `id` 原位恢复：`pending` 可继续确认，`started` / `cancelled` 只读。
+
+这条用例要真的走到 planner，但 `draft.send` 会先 `checkLowpoly()`——测试环境没有 Blender，直接死在 `blender-not-ready`。别加「跳过 preflight」的测试开关，给 `CoreOptions` 一个可替换的桥接命令，让测试用 `mock_mcp_server` 走**真实握手**把 `isReady()` 顶起来（与 `libraryRoot` 的注入方式一致）。
+
+`CoreApp.h`：
+
+```cpp
+#include "core/mcp/BridgeCommands.h" // BridgeCommand
+
+struct CoreOptions
+{
+    QString dataDir;
+    bool headless = false;
+    QString libraryRoot;         // 空 = Documents/SynthForgeStudio/ModelLibrary；测试注入用
+    BridgeCommand blenderBridge; // program 为空 = 默认 uvx mcp-for-blender；测试注入 mock_mcp_server
+};
+```
+
+`CoreApp::start()` 建桥接时改用注入命令：
+
+```cpp
+    const BridgeCommand bridge =
+        m_options.blenderBridge.program.isEmpty()
+            ? defaultBridgeCommand(QStringLiteral("blender"))
+            : m_options.blenderBridge;
+    m_blender = new McpRuntime(QStringLiteral("blender"),
+                               std::make_unique<StdioTransport>(bridge), this);
+```
+
+`tests/tst_headless_ws.cpp`：`WsClient` 补一个取事件 payload 的辅助（现在只有 `eventsSince` 的名称列表），文件顶部再补假桥接与 LLM 轮次辅助：
+
+```cpp
+    // 取 mark 之后最后一个同名事件的 payload；没有则返回空对象
+    QJsonObject lastEvent(const QString& name, int mark = 0) const
+    {
+        for (int i = m_log.size() - 1; i >= mark; --i) {
+            if (m_log.at(i).value(QStringLiteral("event")).toString() == name)
+                return m_log.at(i).value(QStringLiteral("data")).toObject();
+        }
+        return {};
+    }
+```
+
+```cpp
+#include "core/mcp/BridgeCommands.h"
+#include "mock/MockLlmServer.h"
+
+// mock server 与测试 exe 同目录；不用 CMake 宏传路径，Windows 反斜杠会被当成转义
+static QString mockServerProgram()
+{
+#ifdef Q_OS_WIN
+    return QCoreApplication::applicationDirPath() + QStringLiteral("/mock_mcp_server.exe");
+#else
+    return QCoreApplication::applicationDirPath() + QStringLiteral("/mock_mcp_server");
+#endif
+}
+
+static BridgeCommand mockBlenderBridge()
+{
+    BridgeCommand command;
+    command.program = mockServerProgram();
+    command.env = QProcessEnvironment::systemEnvironment();
+    return command;
+}
+
+static MockLlmServer::Turn textTurn(const QString& text)
+{
+    return MockLlmServer::Turn{{MockLlm::textChunk(text), MockLlm::doneChunk()}};
+}
+
+// 走低模链路必须带 mode：不传 mode 会落到 P2 的通用流，不会出草稿卡
+QJsonObject sendLowpoly(WsClient& client, const QString& text)
+{
+    return client.request(QStringLiteral("chat.send"),
+                          {{QStringLiteral("area"), QStringLiteral("blender")},
+                           {QStringLiteral("mode"), QStringLiteral("lowpoly")},
+                           {QStringLiteral("text"), text}});
+}
+```
+
+用例（MockLlmServer 两个 Turn：第一段给草稿，第二段给两组计划；`tst_headless_ws` 的 target 按 Step 8 的片段先加好源码与依赖）：
+
+```cpp
+    void planCardPersistsAndUpdatesState()
+    {
+        MockLlmServer server({
+            textTurn(QStringLiteral("主题与视角：测试店面")),
+            textTurn(QStringLiteral(R"({"rules":[],"groups":[{"title":"底座"},{"title":"主体"}]})")),
+        });
+        QVERIFY(server.listen());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        // 模拟上次会话留下的一张已取消计划卡：它不能混进这次规划请求的历史
+        {
+            SessionStore seed(dir.path() + QStringLiteral("/sessions.db"));
+            QVERIFY(seed.open());
+            QVERIFY(seed.appendMessage(QStringLiteral("blender"), QStringLiteral("plan"),
+                                       QStringLiteral("{}"),
+                                       QJsonObject{{QStringLiteral("state"),
+                                                    QStringLiteral("cancelled")}})
+                    > 0);
+        }
+
+        CoreApp app({dir.path(), true, dir.filePath(QStringLiteral("library")),
+                     mockBlenderBridge()});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+        // 假桥接握手完成后 isReady() 才为真，draft.send 的前置检查才会放行
+        QTRY_VERIFY_WITH_TIMEOUT(client.lastEvent(QStringLiteral("conn.status"))
+                                     .value(QStringLiteral("blender")).toString()
+                                 == QStringLiteral("ready"),
+                                 10000);
+        QVERIFY(configureLlm(client, server.baseUrl()).contains(QStringLiteral("result")));
+
+        QVERIFY(sendLowpoly(client, QStringLiteral("做一个测试店面"))
+                    .value(QStringLiteral("result")).toObject()
+                    .value(QStringLiteral("accepted")).toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(!client.lastEvent(QStringLiteral("draft.created")).isEmpty(),
+                                 10000);
+        const qint64 draftId = client.lastEvent(QStringLiteral("draft.created"))
+                                   .value(QStringLiteral("id")).toInteger();
+        QVERIFY(draftId > 0);
+
+        const QJsonObject sent =
+            client.request(QStringLiteral("draft.send"),
+                           QJsonObject{{QStringLiteral("id"), draftId},
+                                       {QStringLiteral("prompt"), QStringLiteral("做一个测试店面")}})
+                .value(QStringLiteral("result"))
+                .toObject();
+        QVERIFY2(sent.value(QStringLiteral("accepted")).toBool(),
+                 qPrintable(sent.value(QStringLiteral("reason")).toString()));
+        QTRY_VERIFY_WITH_TIMEOUT(!client.lastEvent(QStringLiteral("plan.created")).isEmpty(),
+                                 10000);
+        const QJsonObject created = client.lastEvent(QStringLiteral("plan.created"));
+        const qint64 planId = created.value(QStringLiteral("id")).toInteger();
+        QVERIFY(planId > 0);
+
+        // 历史里能看到计划行，且 JSON 能解析
+        const QJsonArray rows = client.request(QStringLiteral("session.load"),
+                                               {{QStringLiteral("area"), QStringLiteral("blender")}})
+                                    .value(QStringLiteral("result")).toObject()
+                                    .value(QStringLiteral("messages")).toArray();
+        bool found = false;
+        for (const QJsonValue& value : rows) {
+            const QJsonObject row = value.toObject();
+            if (row.value(QStringLiteral("id")).toInteger() != planId)
+                continue;
+            found = true;
+            QCOMPARE(row.value(QStringLiteral("role")).toString(), QStringLiteral("plan"));
+            QCOMPARE(row.value(QStringLiteral("meta")).toObject()
+                         .value(QStringLiteral("state")).toString(),
+                     QStringLiteral("pending"));
+            QCOMPARE(QJsonDocument::fromJson(row.value(QStringLiteral("content")).toString().toUtf8())
+                         .object().value(QStringLiteral("groups")).toArray().size(),
+                     2);
+        }
+        QVERIFY(found);
+
+        // 第 2 次 LLM 请求是 planner：卡片行（这里是上面种的 plan）不能原样喂给模型
+        const QJsonArray sentMessages =
+            server.requestObjectAt(1).value(QStringLiteral("messages")).toArray();
+        QVERIFY(!sentMessages.isEmpty());
+        for (const QJsonValue& value : sentMessages) {
+            const QString role = value.toObject().value(QStringLiteral("role")).toString();
+            QVERIFY2(role == QLatin1String("system") || role == QLatin1String("user")
+                         || role == QLatin1String("assistant"),
+                     qPrintable(QStringLiteral("卡片行混进了 LLM 历史：%1").arg(role)));
+        }
+
+        // 确认后置为 started，刷新不会又变回可点击
+        const QJsonObject confirmed =
+            client.request(QStringLiteral("plan.confirm"),
+                           QJsonObject{{QStringLiteral("area"), QStringLiteral("blender")},
+                                       {QStringLiteral("taskId"),
+                                        created.value(QStringLiteral("taskId"))},
+                                       {QStringLiteral("id"), planId}})
+                .value(QStringLiteral("result"))
+                .toObject();
+        QCOMPARE(confirmed.value(QStringLiteral("ok")).toBool(), true);
+        SessionStore store(dir.path() + QStringLiteral("/sessions.db"));
+        QVERIFY(store.open());
+        QCOMPARE(store.messageById(planId).value(QStringLiteral("meta")).toObject()
+                     .value(QStringLiteral("state")).toString(),
+                 QStringLiteral("started"));
+    }
+```
+
+先跑一次：预期红——`plan.created` 没有 `id`、`session.load` 里也没有 plan 行。确认失败原因是「没落库」而不是 `blender-not-ready`，再往下写实现。
+
+`CoreApp.cpp` 的 `planReady`：
+
+```cpp
+connect(m_orch, &AgentOrchestrator::planReady, this,
+        [this](const QString& area, const QString& taskId, const QJsonObject& plan) {
+            if (m_planCancelled.remove(area))
+                return; // 已取消的规划不再弹卡
+            // 计划卡也是一行：刷新后靠 content + meta.state 重建
+            const QJsonObject payload{
+                {QStringLiteral("taskId"), taskId},
+                {QStringLiteral("rules"), plan.value(QStringLiteral("rules"))},
+                {QStringLiteral("groups"), plan.value(QStringLiteral("groups"))},
+                {QStringLiteral("totalSteps"), plan.value(QStringLiteral("totalSteps"))}};
+            const qint64 planId = m_sessions->appendMessage(
+                area, QStringLiteral("plan"),
+                QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)),
+                QJsonObject{{QStringLiteral("state"), QStringLiteral("pending")},
+                            {QStringLiteral("taskId"), taskId}});
+            // id 也放进暂存：历史遗留的旧 pending 卡点确认时能和当前计划对上
+            QJsonObject pending = plan;
+            pending.insert(QStringLiteral("id"), planId);
+            m_pendingPlans.insert(area, pending);
+            m_ws->broadcastEvent(
+                QStringLiteral("plan.created"),
+                QJsonObject{{QStringLiteral("area"), area},
+                            {QStringLiteral("id"), planId},
+                            {QStringLiteral("taskId"), taskId},
+                            {QStringLiteral("rules"), plan.value(QStringLiteral("rules"))},
+                            {QStringLiteral("groups"), plan.value(QStringLiteral("groups"))},
+                            {QStringLiteral("totalSteps"), plan.value(QStringLiteral("totalSteps"))}});
+        });
+```
+
+`CoreApp::recentMessages` 只放行对话角色：卡片行会长期留在 messages 里，原样喂给 OpenAI 会因未知 `role` 直接 400（`historyForPrompt`、`startModify`、`execute`、ask 分支都走它）：
+
+```cpp
+QJsonArray CoreApp::recentMessages(const QString& area, int limit) const
+{
+    QJsonArray history;
+    for (const QJsonValue& value : m_sessions->messagePage(area, limit).messages) {
+        const QJsonObject message = value.toObject();
+        // draft/plan 是卡片不是对话：模型只认 system/user/assistant
+        const QString role = message.value(QStringLiteral("role")).toString();
+        if (role != QLatin1String("user") && role != QLatin1String("assistant"))
+            continue;
+        history.append(QJsonObject{{QStringLiteral("role"), role},
+                                   {QStringLiteral("content"),
+                                    message.value(QStringLiteral("content"))}});
+    }
+    return history;
+}
+```
+
+代价是卡片行会占用 `limit` 名额；需要更多上下文时由调用方加大 limit。
+
+`plan.confirm` 的两段（开头核对 id；`m_pendingPlans.remove(area)` 之后、`openFolderPick(area)` 之前回写 started）与 `plan.cancel` 的两段：
+
+```cpp
+// plan.confirm：先核对 id 是不是当前这张；历史遗留卡只置灰自己
+    const qint64 requestedId = params.value(QStringLiteral("id")).toInteger();
+    const qint64 pendingId =
+        m_pendingPlans.value(area).value(QStringLiteral("id")).toInteger();
+    if (requestedId > 0 && requestedId != pendingId) {
+        // pendingId==0：应用重启后内存里没计划；不相等：点的是旧卡。
+        // 只改仍为 pending 的卡，避免把已 started 的卡又改回 cancelled
+        const QJsonObject row = m_sessions->messageById(requestedId);
+        QJsonObject meta = row.value(QStringLiteral("meta")).toObject();
+        if (row.value(QStringLiteral("role")).toString() == QLatin1String("plan")
+            && meta.value(QStringLiteral("state")).toString() == QLatin1String("pending")) {
+            meta.insert(QStringLiteral("state"), QStringLiteral("cancelled"));
+            m_sessions->updateMessageMeta(requestedId, meta);
+        }
+        return QJsonValue(QJsonObject{{"ok", false}, {"error", "plan-not-found"}});
+    }
+
+// plan.confirm 成功分支：只有真正开始选目录才置 started；blender-busy 保持 pending
+    const QJsonObject row = m_sessions->messageById(requestedId);
+    if (requestedId > 0 && row.value(QStringLiteral("role")).toString() == QLatin1String("plan")) {
+        QJsonObject meta = row.value(QStringLiteral("meta")).toObject();
+        meta.insert(QStringLiteral("state"), QStringLiteral("started"));
+        m_sessions->updateMessageMeta(requestedId, meta);
+    }
+
+// plan.cancel：历史遗留卡只置灰自己，不取消当前计划
+    const qint64 requestedId = params.value(QStringLiteral("id")).toInteger();
+    const qint64 pendingId =
+        m_pendingPlans.value(area).value(QStringLiteral("id")).toInteger();
+    if (requestedId > 0 && requestedId != pendingId) {
+        const QJsonObject row = m_sessions->messageById(requestedId);
+        QJsonObject meta = row.value(QStringLiteral("meta")).toObject();
+        if (row.value(QStringLiteral("role")).toString() == QLatin1String("plan")
+            && meta.value(QStringLiteral("state")).toString() == QLatin1String("pending")) {
+            meta.insert(QStringLiteral("state"), QStringLiteral("cancelled"));
+            m_sessions->updateMessageMeta(requestedId, meta);
+        }
+        return QJsonValue(QJsonObject{{"ok", true}});
+    }
+
+// plan.cancel 正常分支：只把 pending 的卡置灰
+    const qint64 rowId = params.value(QStringLiteral("id")).toInteger();
+    if (rowId > 0) {
+        const QJsonObject row = m_sessions->messageById(rowId);
+        QJsonObject meta = row.value(QStringLiteral("meta")).toObject();
+        if (row.value(QStringLiteral("role")).toString() == QLatin1String("plan")
+            && meta.value(QStringLiteral("state")).toString() == QLatin1String("pending")) {
+            meta.insert(QStringLiteral("state"), QStringLiteral("cancelled"));
+            m_sessions->updateMessageMeta(rowId, meta);
+        }
+    }
+```
+
+`ChatPanel.vue` 收到 `plan.created` 时把 `id` 一起存进气泡（`payload` 类型加 `id?: number`），否则历史卡永远拿不到行号：
+
+```ts
+props.client.on("plan.created", (data) => {
+  const payload = data as {
+    area?: string; id?: number; taskId?: string;
+    rules?: string[]; groups?: PlanGroup[]; totalSteps?: number;
+  };
+  if (payload.area !== props.area) return;
+  // 计划已就绪，后端不再生成；等用户点开始才选存放位置
+  busy.value = false;
+  messages.value.push({
+    role: "plan",
+    id: payload.id,
+    state: "pending",
+    plan: {
+      taskId: payload.taskId ?? "",
+      rules: payload.rules ?? [],
+      groups: payload.groups ?? [],
+      totalSteps: payload.totalSteps ?? 0,
+    },
+  });
+  scrollToBottom();
+}),
+```
+
+`history.ts` 的 `toChatItems` 增加计划分支（循环从「只收 user/assistant 的白名单」改成按 role 分支，未识别的角色继续跳过；循环里用 `continue` 跳过坏行；循环变量的类型扩成 `{ id?: number; role?: string; content?: string; meta?: Record<string, unknown> }`）：
+
+```ts
+if (role === "plan") {
+  let plan: PlanData;
+  try {
+    plan = JSON.parse(content) as PlanData;
+  } catch {
+    continue; // 坏 JSON 不拖垮整页历史
+  }
+  if (!plan?.taskId || !Array.isArray(plan.groups)) continue;
+  const meta = (item.meta ?? {}) as Record<string, unknown>;
+  const state = meta.state;
+  items.push({
+    role: "plan",
+    plan,
+    id: item.id,
+    state: state === "started" || state === "cancelled" ? state : "pending",
+  });
+  continue;
+}
+```
+
+`ChatPanel.vue` 渲染计划卡时透传行号与状态：
+
+```vue
+<PlanCard :client="client" :area="area" :plan="message.plan"
+          :id="message.id" :state="message.state" />
+```
+
+`ChatItem` 增加 `id?: number`、`state?: "pending" | "started" | "cancelled"`。
+
+`PlanCard.vue`：接收 `id` / `state`，历史卡按状态决定按钮：
+
+```ts
+import { ref, watch } from "vue";
+
+const props = defineProps<{
+  client: WsClient;
+  area: string;
+  id?: number;
+  state?: "pending" | "started" | "cancelled";
+  plan: { taskId: string; rules: string[]; groups: {...}[]; totalSteps: number };
+}>();
+
+const decided = ref(props.state ?? "pending");
+const error = ref("");
+watch(() => props.state, (s) => { if (s) decided.value = s; });
+
+// 请求都带上 id：后端成功后会把这一行的 meta.state 改写
+async function start() {
+  error.value = "";
+  try {
+    const res = await props.client.request<{ ok?: boolean; error?: string }>("plan.confirm", {
+      area: props.area,
+      taskId: props.plan.taskId,
+      id: props.id,
+    });
+    if (res?.ok === false) {
+      error.value = res.error === "plan-not-found"
+        ? "计划已失效：应用重启后旧计划无法继续，请重新生成。"
+        : (res.error === "blender-busy" ? "Blender 会话正忙：请等当前建模/转换完成后再点开始" : (res.error ?? "确认失败"));
+      if (res.error === "plan-not-found") decided.value = "cancelled"; // 失效卡置灰
+      return;
+    }
+    decided.value = "started";
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : "确认失败";
+  }
+}
+
+async function cancel() {
+  decided.value = "cancelled";
+  await props.client.request("plan.cancel", {
+    area: props.area, taskId: props.plan.taskId, id: props.id,
+  }).catch(() => {
+    // 取消失败不阻断 UI：卡片已置灰，后端即便没收到也不会再执行
+  });
+}
+```
+
+前端单测（`history.test.ts` 追加解析用例，`ChatPanel.test.ts` 追加渲染用例；现有用例要仍然通过）：
+
+- `history.test.ts`：`role='plan'` 且 `meta.state='started'` / `'cancelled'` → 解析出对应 `state`；缺失或其它值 → `"pending"`。
+- `history.test.ts`：坏 JSON 的 plan 行不出现卡片，也不影响后续消息解析。
+- `ChatPanel.test.ts`：历史里 `meta.state='started'` → 只读卡，没有「开始生成」按钮；`pending` → 有按钮，点击后请求带 `id` 与 `taskId`。
+
+Run: `ctest --test-dir build -C Debug -R "tst_headless_ws|tst_session_store" --output-on-failure`
+Expected: 全绿。
+
+- [ ] **Step 7: 前端开关与三按钮草稿卡**
 
 > 至此 `CoreApp.cpp` 里两处 `saveDraft`（原 `draft.send` / `draft.cancel`）已随新 handler 消失，全库不再引用 `drafts` 表。
 
@@ -3964,19 +4428,20 @@ async function cancel() {
 ```ts
 if (role === "draft") {
   const meta = (item.meta ?? {}) as Record<string, unknown>;
-  return {
+  items.push({
     role: "draft",
     id: item.id,
     content: item.content,
     origin: meta.origin === "discussion" ? "discussion" : "generated",
     state: meta.state === "cancelled" ? "cancelled" : "pending",
-  };
+  });
+  continue;
 }
 ```
 
-`ChatItem` 增加 `id?: number`、`origin?: "discussion" | "generated"`、`state?: "pending" | "cancelled"`。
+`ChatItem` 增加 `id?: number`、`origin?: "discussion" | "generated"`、`state?: "pending" | "started" | "cancelled"`。
 
-- [ ] **Step 7: CMake + 全量测试 + Commit**
+- [ ] **Step 8: CMake + 全量测试 + Commit**
 
 `CMakeLists.txt`：
 
@@ -3997,6 +4462,15 @@ set_tests_properties(tst_ask_reply PROPERTIES
 
 `src/core/agent/AskReply.cpp` 加进 `synthforge_core` 源列表。
 
+`tst_headless_ws` 要直接喂两轮 LLM 脚本（草稿 + 计划），源码列表补上 MockLlmServer：
+
+```cmake
+add_executable(tst_headless_ws tests/tst_headless_ws.cpp tests/mock/MockLlmServer.cpp)
+target_include_directories(tst_headless_ws PRIVATE tests)
+# 假 Blender 桥接：mock_mcp_server 让 preflight 走真实握手（Step 6 的用例要用）
+add_dependencies(tst_headless_ws mock_mcp_server)
+```
+
 Run: `cmake --build build --config Debug` 然后 `ctest --test-dir build -C Debug -LE slow --output-on-failure`
 Expected: 全绿，`tst_ask_reply` 4 用例、`tst_summarizer` 6 用例。
 
@@ -4010,6 +4484,9 @@ Expected: 全绿，`tst_ask_reply` 4 用例、`tst_summarizer` 6 用例。
 7. 取消一张草稿后刷新 → 灰卡只读，无按钮；执行过的那条变成普通 user 气泡，历史里不重复。
 8. 关掉 Blender 插件（或退出 Blender）→ 执行模式发「弄旧一点」→ **仍出草稿卡**；点执行 → 立刻弹 `blender-not-ready`，卡片保留可继续改。
 9. 讨论模式问「我库里都有什么」→ 回答能列出 `{{assets}}` 里的文件名，并区分「可修改」与「无 .blend」。
+10. 生成计划卡后刷新页面（不重启应用）→ 卡片回到原位，仍可点「开始生成」选目录。
+11. 取消或已确认的计划卡 → 刷新后只读灰卡、无按钮；重启应用后点一张 `pending` 历史卡 → 提示「计划已失效」并置灰。
+12. 历史里留着一张已取消的计划卡时再发新指令 → 规划正常完成（卡片行没有混进 LLM 的 messages）。
 
 ```bash
 git add CMakeLists.txt src/core/agent/AskReply.h src/core/agent/AskReply.cpp \
@@ -4018,7 +4495,9 @@ git add CMakeLists.txt src/core/agent/AskReply.h src/core/agent/AskReply.cpp \
   src/core/coreapp/CoreApp.h src/core/coreapp/CoreApp.cpp \
   src/core/store/SessionStore.h src/core/store/SessionStore.cpp \
   tests/tst_ask_reply.cpp tests/tst_summarizer.cpp tests/tst_session_store.cpp \
-  web/src/components/ChatPanel.vue web/src/components/DraftCard.vue web/src/chat/history.ts
+  tests/tst_headless_ws.cpp \
+  web/src/components/ChatPanel.vue web/src/components/DraftCard.vue web/src/components/PlanCard.vue web/src/chat/history.ts \
+  web/src/chat/history.test.ts web/src/components/ChatPanel.test.ts
 ```
 
 Commit（`feat: 讨论/执行双模式与统一草稿卡`）。
@@ -4034,6 +4513,8 @@ Commit（`feat: 讨论/执行双模式与统一草稿卡`）。
 - [ ] 草稿卡点执行按有无资产分流：有资产直接 `modify`，无资产进 `plan()`；无 `.blend` 源文件时返回 `no-blend-source` 且不动 Blender
 - [ ] `draft.regenerate` 按资产有无选择 `modify` / `lowpoly` 模板，并把讨论结论注入 system
 - [ ] 草稿卡落库在 `messages.meta`（不再用 `drafts` 表）：刷新/重启后按 `id` 原位恢复；手动编辑失焦即存；点执行后同一行转成 `role='user'`（历史不重复），取消后变灰只读
+- [ ] 计划卡落库在 `messages`（`role='plan'`，`meta={taskId,state}`）：刷新/重启后按 `id` 原位恢复；`pending` 可继续确认（应用未重启），`started` / `cancelled` 只读；坏 JSON 跳过不拖垮历史
+- [ ] `recentMessages` 只放行 `user` / `assistant`：`draft` / `plan` 行不会进入 `plan()` / `execute()` / `ask` 的 LLM 历史（`tst_headless_ws` 用注入的 `mock_mcp_server` 覆盖）
 - [ ] `tst_ask_reply`（4 用例：无标记 / 正常切分 / 未闭合 / 空块）与 `tst_summarizer`（6 用例，含 modify 模板不串新建骨架、讨论结论已注入）全绿
 - [ ] 规划解析失败自动降级默认四分组，流程不中断；`plan.cancel` 正确取消任务
 - [ ] 每个新建任务开始前确定性清场（MCP 直调，不经 LLM）：连做两个任务，第二个 `.blend` 里不含第一个任务的物体；清场失败以 `clear-scene-failed` 终止，不带着旧场景继续建
@@ -4051,3 +4532,26 @@ Commit（`feat: 讨论/执行双模式与统一草稿卡`）。
 - [ ] glb 自带的物体关键帧动画全部自动循环播放，底部动画条显示播放 / 暂停与各段时长，无动画时不显示；相机按包围球自动定位
 - [ ] 预览区右上角常驻「完整材质、动画与特效请在 Blender 中查看」
 - [ ] 修改资产后原可导出动效仍在（导出命令带 `export_animations=True` 且 agent 未删关键帧）
+
+---
+
+## P4 Task 4 手工验证后的修复批次（2026-10-25）
+
+真实 Blender + DeepSeek 跑通后按实测体验补的改动，与上面各 Task 的原始安排有少量提前/调整：
+
+- **顶栏灰灯**：`conn.status` 只在状态变化时广播，页面晚于桥接加载就永远收不到。`WsServer` 新增 `clientConnected`，`CoreApp::broadcastStatusSnapshot()` 在每条新连接上补发当前 `m_status/m_hints`。
+- **文件树提前落地**（Task 5 的后端 + 树体部分）：新增 `assets.list`，`FileTree.vue` 改由它聚合目录树并平铺 glb/fbx/blend；目录以 `kind=dir` 条目下发，空文件夹也能显示；`folderPick.mkdir` 成功即广播 `fileTree.changed`，`fs.operate` 成功后前端再拉一次，新建文件夹立刻可见。Task 5 剩余 `file.read`、three.js 预览、修改入口与点击语义。
+- **对话区可读性**：新增 `web/src/chat/markdown.ts`（marked + DOMPurify，带单测）；`task.progress` 带 `groupIndex` 时插分组分隔条；`busy` 且无流式气泡时显示三点转圈。
+- **摘要篇幅**：`summarizer.md` 增加 1800~2200 字（上限 2400）的硬约束。
+- **步数预算**：按上文 30×组数（封顶 200）调整，`tst_orchestrator` 断言同步（2 组 60 / 4 组 120 / 6 组 180 / 7 组以上 200）。
+- **步数耗尽可续跑**：不再把 `max-steps-exceeded` 当终局。失败时保留 `m_messages/m_plan/m_groupIndex` 并置 `m_resumable`，`error.card` 带 `resumable/steps/maxSteps`；前端错误卡出现「继续工作」，走新增 `chat.continue` → `AgentOrchestrator::resume()`：不清场、不重发分组指令，按 `min(30×剩余组数+20, 200)` 追加预算后接着对话。
+- **对话按轮收口并入库**：新增 `AgentOrchestrator::turnFinished(area,text)`，在工具调用前、进入自检/下一组/导出前把本轮文字收口；CoreApp 将每轮文字 `appendMessage` 落库并广播 `chat.turn`，前端收到后结束当前流式气泡（任务仍保持 busy），下一轮 delta 另起气泡；group 2 的话不会再续到 group 1 气泡里。图片仍只走 `chat.image` 实时展示，暂不入库。
+- **中文与施工节奏**：`blenderSystemPrompt` 增加硬要求：全程简体中文（对象名/代码/路径除外）；每轮先用 1~2 句说明要做什么，再调工具；截图返回后先看图，再用中文说明结果与下一步。
+- **转圈时机**：`folderPick` 确认成功时带 `started=true` 关闭弹窗，`ChatPanel` 立刻置 busy 显示三点动画（清场与首次请求期间也有反馈）；点「停止」时同步收口流式气泡，避免下次发送被残留的 streaming 气泡挡住转圈。
+- **合理补充与真实尺度**：`summarizer.md` 的场景主体允许车辆、路牌、摊贩等主题内合理补充，只禁止与主题无关的杂物；规划器同步允许主题内补充、禁止无关物体；建模 system prompt 新增「底座按真实尺度反推」，不得为了压缩画面把主体、门窗或道具做小。
+- **真实光源与特效边界**：摘要模板与建模 prompt 要求照明必须来自真实光源（街灯 / 店招灯 / 室内顶灯等），室内每个空间至少一盏；光粒子、光雾可以保留作为氛围特效，但必须有真实光源支撑，不能拿特效当照明；不默认生成飞虫、湿地面、积水，用户明确要求时才用粒子 / 着色器，不得用几何体或贴图冒充。
+- **流式光标收口**：`streaming` 指向的气泡改为 `reactive` 代理；之前持有裸对象，改 `streaming=false` 不触发重渲染，任务结束后光标会留在气泡里。
+- **导出只执行一次**：导出脚本临时关闭 `save_version`，避免覆盖保存产生 `.blend1`；提示词要求同一任务只导出一次、不得改名重复保存。
+- **聊天区跟随与回底按钮**：`scrollToBottom(force)` 只在贴底（距底 32px 内）时跟随新输出，用户往上翻后不再抢视图；聊天区底部正中心出现圆形向下箭头，点击回底并恢复跟随；自己发消息、确认草稿、继续工作走 `force` 强制贴底。
+- **历史上翻分页**：接上 `session.load` 的 `beforeId` 游标，距顶 40px 内自动拉上一页（每页 30 条）；插入列表头部后按高度差补偿 `scrollTop`，当前阅读位置不跳；`loadingOlder` 防重复请求，`hasMore=false` 后停止；顶部显示「加载更早的消息…」。
+- **测试注入口**：`CoreOptions.libraryRoot` 为空时仍用 Documents 下的 ModelLibrary；`tst_headless_ws` 用临时目录注入资产库，避免碰真实模型库。
