@@ -33,7 +33,7 @@ src/core/agent/AgentOrchestrator.h/.cpp      ← plan() 规划调用 + execute()
 src/core/assets/AssetLibrary.h/.cpp          ← 资产库根扫描/落盘/导出 GLB 编排
 src/resources/prompts/summarizer.md          ← 总结 agent system prompt（骨架来自规格附录）
 web/src/components/DraftCard.vue             ← 草稿卡（双击编辑 + 发送）
-web/src/components/PlanCard.vue              ← 建造计划卡（分组/清单/验收标准 + 开始/取消）
+web/src/components/PlanCard.vue              ← 建造计划卡（布局约束/分组/清单/摆放/验收标准 + 开始/取消）
 web/src/components/ChatPanel.vue             ← Modify：draft/plan 消息卡 + 修改资产目标 chip（Task 6）
 web/src/components/FolderPicker.vue          ← 存放位置确认弹窗
 web/src/components/PreviewPane.vue           ← three.js GLB 预览（升级 Task 5）
@@ -1122,18 +1122,33 @@ Commit（`feat: BlenderGate 会话互斥租约`）。
 - 计划结构：
 
 ```cpp
-struct BuildGroup { QString title; QStringList items; QString acceptance; };
-struct BuildPlan { QVector<BuildGroup> groups; int maxSteps = 50; };
+struct BuildPlacement { QString name; QString where; };
+struct BuildGroup {
+    QString title;
+    QStringList items;
+    QVector<BuildPlacement> placements;   // 每个 item 一条：相对谁、朝哪、离地多少
+    QString acceptance;
+};
+struct BuildPlan {
+    QVector<BuildGroup> groups;
+    QStringList rules;                    // 本任务特有的跨组布局约束
+    int maxSteps = 50;
+};
 ```
 
+布局信息分三层，不得混用：
+1. **全局纪律**（`blenderSystemPrompt()` 固定文本）：贴地、不重叠、朝向基准、常用尺寸。每条任务都有，planner 不重复生成。
+2. **任务约束**（`BuildPlan::rules`）：planner 从提示词里抽出的、跨组生效的特殊要求，如「树不遮挡招牌」「路灯沿人行道每 8 米一盏」。只写本任务特有，不写通用规则。
+3. **物体摆放**（`BuildGroup::placements`）：逐物体描述相对关系与朝向，如「商店主体 → 底座组路面北侧边缘，正门朝 -Y」。**只允许相对描述，不允许绝对坐标**：LLM 算不准坐标，执行时由 agent 查已有物体的包围盒自行推算。
+
 - `class AgentOrchestrator : QObject`
-  - `void plan(const QString& taskId, TaskManager* tm, const QString& prompt, const QString& area);`：一次**纯文本**调用（不传 tools），解析 JSON；失败重试 1 次，仍失败降级默认四分组。
+  - `void plan(const QString& taskId, TaskManager* tm, const QString& prompt, const QString& area);`：一次**纯文本**调用（不传 tools），解析 JSON（含 `rules` 与每组 `placements`）；失败重试 1 次，仍失败降级默认四分组（`rules` 与 `placements` 为空，交给全局纪律兜底）。
     - `void execute(const QString& taskId, TaskManager* tm, const QJsonArray& tools, const BuildPlan& plan, const QString& prompt, const QString& targetFolder, const QString& area);`：按组「建造 → 自检」状态机执行。`tools` 必须是 **OpenAI tools 格式**，由 CoreApp 调用前用 `ToolBridge::mcpToolsToOpenAi(m_blenderTools)` 转换；编排层不感知 MCP `inputSchema`。
   - 信号：`planReady(area, taskId, QJsonObject plan)`、`groupProgress(area, int index, int count, QString title)`、`finalText(area, QString)`、`failed(area, QString)`、`toolStep(area, tool, status)`、`delta(area, text)`、`imageReceived(area, taskId, dataUrl, caption)`、`artifactsReady(area, QStringList absoluteGlbs)`（结束时扫描目标目录新 GLB，供 CoreApp 广播 `asset.created` / `fileTree.changed`）。
   - `void setBlenderGate(BlenderGate* gate)` — 仅注入给 blender orchestrator（unity orchestrator 不注入）。`execute()` 在 `area=="blender"` 时以 owner `"blender-agent"` 获取租约，持有到 `finishOk/finishCancelled/fail`；忙则直接 `failed("blender-busy")`，不碰 LLM / MCP。
   - `void setToolCallHook(std::function<void(const QString& name, bool running)> hook)` — P6 注入：工具调用前 running=true（进入抑制窗口），回调返回后 running=false（结束抑制）。
   - `void setConversationHistory(const QJsonArray& history)` — 规格 8.4 上下文组装：`system + 本区最近 20 条纯文本历史 + 本次任务指令`；CoreApp 在每次 `plan()/execute()` 前用 `m_sessions->recentMessages(area, 20)` 注入（成员 `QJsonArray m_history`）。
-- 事件：`plan.created {area, taskId, groups, totalSteps}`；`task.progress {area, groupIndex, groupCount, title}`；`tool.step` 沿用；结束时 `asset.created`（Task 4 编排）。
+- 事件：`plan.created {area, taskId, rules, groups, totalSteps}`（每组含 `placements`）；`task.progress {area, groupIndex, groupCount, title}`；`tool.step` 沿用；结束时 `asset.created`（Task 4 编排）。
 - 状态机：`GroupPhase { Build, SelfCheck }`。Build 阶段 LLM 无工具调用 → 注入本组验收标准进入 SelfCheck；SelfCheck 无工具调用 → 本组完成 → 下一组 Build 或 `finishOk`。
 - CoreApp 暂存 `m_pendingPlans[area]`（planReady 的 JSON）与 `m_planPrompts[area]`（已确认提示词）；`plan.confirm` → 转 `BuildPlan` 存入 `m_pendingPicks[area]` 并发 `folderPick.open`（Task 4 Step 1）；`plan.cancel` → 置 `m_planCancelled` + `error.card {reason:"user-cancelled"}`。
 
@@ -1158,8 +1173,9 @@ class TaskManager;
 class McpClient;
 class BlenderGate;
 
-struct BuildGroup { QString title; QStringList items; QString acceptance; };
-struct BuildPlan { QVector<BuildGroup> groups; int maxSteps = 50; };
+struct BuildPlacement { QString name; QString where; };
+struct BuildGroup { QString title; QStringList items; QVector<BuildPlacement> placements; QString acceptance; };
+struct BuildPlan { QVector<BuildGroup> groups; QStringList rules; int maxSteps = 50; };
 
 class AgentOrchestrator : public QObject
 {
@@ -1236,11 +1252,20 @@ private:
 - [ ] **Step 1: 规划阶段测试（红）**
 
 ```cpp
-void plannerParsesGroups()
+void plannerParsesGroupsAndLayout()
 {
-    MockLlmServer server({textChunk(R"({"groups":[
-        {"title":"底座与环境","items":["底座","井盖"],"acceptance":"俯视截图：底座完整"},
-        {"title":"建筑外观","items":["墙体","招牌"],"acceptance":"街角截图：主体齐全"}]})")});
+    MockLlmServer server({textChunk(R"({"rules":["树不遮挡招牌"],
+        "groups":[
+        {"title":"底座与环境","items":["底座","路牌"],
+         "placements":[
+            {"name":"底座","where":"场景中心，沿 X 轴展开"},
+            {"name":"路牌","where":"商店右前方 2 米，正面朝 -Y"}],
+         "acceptance":"俯视截图：底座完整"},
+        {"title":"建筑外观","items":["墙体","招牌"],
+         "placements":[
+            {"name":"墙体","where":"底座北侧边缘"},
+            {"name":"招牌","where":"正门上方，离地 2.8 米"}],
+         "acceptance":"街角截图：主体齐全"}]})")});
     LlmGateway llm;                              // 真实网关，禁止子类重写 chatStream
     AgentOrchestrator orch(&llm, nullptr, nullptr);
     orch.setModelConfig(server.config());        // baseUrl 指向本地假服务端
@@ -1252,6 +1277,12 @@ void plannerParsesGroups()
     const QJsonObject plan = ready.first().at(2).toJsonObject();
     QCOMPARE(plan.value("groups").toArray().size(), 2);
     QCOMPARE(plan.value("totalSteps").toInt(), 26);   // 8*2+10
+    QCOMPARE(plan.value("rules").toArray().size(), 1);
+    const QJsonObject first = plan.value("groups").toArray().at(0).toObject();
+    const QJsonArray placements = first.value("placements").toArray();
+    QCOMPARE(placements.size(), 2);
+    QCOMPARE(placements.at(1).toObject().value("name").toString(), QStringLiteral("路牌"));
+    QVERIFY(placements.at(1).toObject().value("where").toString().contains("右前方"));
 }
 
 void plannerFallsBackToDefaults()
@@ -1279,9 +1310,16 @@ void plannerFallsBackToDefaults()
 ```cpp
 static const char* kPlanSystemPrompt =
     "你是低模场景建造的规划器。只输出一个 JSON 对象，不要任何解释或代码块围栏，格式："
-    "{\"groups\":[{\"title\":\"分组名\",\"items\":[\"物体1\",\"物体2\"],\"acceptance\":\"自检时截图检查什么\"}]}。"
+    "{\"rules\":[\"本任务特有的跨组约束\"],\"groups\":[{\"title\":\"分组名\","
+    "\"items\":[\"物体1\"],"
+    "\"placements\":[{\"name\":\"物体1\",\"where\":\"相对位置与朝向\"}],"
+    "\"acceptance\":\"自检时截图检查什么\"}]}。"
     "要求：3~6 组，覆盖用户提示词中全部必须独立的物体与数量下限；按施工顺序排列"
-    "（底座环境 → 建筑外观 → 室内陈设 → 灯光特效）。";
+    "（底座环境 → 建筑外观 → 室内陈设 → 灯光特效）。"
+    "items 里的每个物体必须在 placements 里有一条同名条目；where 只写相对关系不写绝对坐标"
+    "（如「商店北侧边缘，正门朝 -Y」「招牌在正门上方，离地 2.8 米」）。"
+    "rules 只写本任务特有、跨组生效的约束（如「树不遮挡招牌」「路灯每 8 米一盏」），"
+    "不要重复贴地、不重叠、单位这类通用规则。";
 
 static int planBudget(int groupCount)
 {
@@ -1296,12 +1334,22 @@ static BuildPlan parsePlan(const QString& text)
     if (start < 0 || end <= start)
         return plan;                       // 空计划 = 解析失败
     const QJsonObject obj = QJsonDocument::fromJson(text.mid(start, end - start + 1).toUtf8()).object();
+    for (const QJsonValue& rule : obj.value("rules").toArray())
+        plan.rules << rule.toString();
     for (const QJsonValue& value : obj.value("groups").toArray()) {
         const QJsonObject item = value.toObject();
         BuildGroup group;
         group.title = item.value("title").toString();
         for (const QJsonValue& name : item.value("items").toArray())
             group.items << name.toString();
+        for (const QJsonValue& entry : item.value("placements").toArray()) {
+            const QJsonObject entryObj = entry.toObject();
+            BuildPlacement placement;
+            placement.name = entryObj.value("name").toString();
+            placement.where = entryObj.value("where").toString();
+            if (!placement.name.isEmpty() && !placement.where.isEmpty())
+                group.placements.push_back(placement);
+        }
         group.acceptance = item.value("acceptance").toString();
         if (!group.title.isEmpty())
             plan.groups.push_back(group);
@@ -1314,10 +1362,10 @@ static BuildPlan defaultPlan()
 {
     BuildPlan plan;
     plan.groups = {
-        {"底座环境", {}, "俯视截图：底座完整、路面/标线齐全、无悬空凹陷"},
-        {"建筑外观", {}, "街角视角截图：主体、招牌、门窗齐全，比例协调"},
-        {"店内陈设", {}, "透过橱窗截图：按提示词店内清单逐项核对"},
-        {"灯光特效", {}, "夜景截图：招牌自发光、路灯、雨水粒子均已生效"},
+        {"底座环境", {}, {}, "俯视截图：底座完整、路面/标线齐全、无悬空凹陷"},
+        {"建筑外观", {}, {}, "街角视角截图：主体、招牌、门窗齐全，比例协调"},
+        {"店内陈设", {}, {}, "透过橱窗截图：按提示词店内清单逐项核对"},
+        {"灯光特效", {}, {}, "夜景截图：招牌自发光、路灯、雨水粒子均已生效"},
     };
     plan.maxSteps = planBudget(plan.groups.size());
     return plan;
@@ -1356,13 +1404,20 @@ void AgentOrchestrator::attemptPlan(int attempt)
             if (plan.groups.isEmpty())
                 plan = defaultPlan();          // 仍失败 → 降级默认分组
             QJsonArray groups;
-            for (const BuildGroup& g : plan.groups)
+            for (const BuildGroup& g : plan.groups) {
+                QJsonArray placements;
+                for (const BuildPlacement& p : g.placements)
+                    placements.append(QJsonObject{{"name", p.name}, {"where", p.where}});
                 groups.append(QJsonObject{{"title", g.title},
                                           {"items", QJsonArray::fromStringList(g.items)},
+                                          {"placements", placements},
                                           {"acceptance", g.acceptance}});
+            }
             m_planning.remove(m_area);
             emit planReady(m_area, m_taskId,
-                           QJsonObject{{"taskId", m_taskId}, {"groups", groups},
+                           QJsonObject{{"taskId", m_taskId},
+                                       {"rules", QJsonArray::fromStringList(plan.rules)},
+                                       {"groups", groups},
                                        {"totalSteps", plan.maxSteps}});
         }});
 }
@@ -1402,7 +1457,13 @@ void executorBuildThenSelfChecks()
     AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
     orch.setModelConfig(server.config());
     BuildPlan plan;
-    plan.groups = {{"底座与环境", {"底座"}, "俯视截图检查底座完整"}};
+    BuildGroup group;
+    group.title = "底座与环境";
+    group.items = {"底座"};
+    group.placements = {{"底座", "场景中心，沿 X 轴展开"}};
+    group.acceptance = "俯视截图检查底座完整";
+    plan.groups = {group};
+    plan.rules = {"树不遮挡招牌"};
     plan.maxSteps = 18;
     QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
 
@@ -1411,7 +1472,9 @@ void executorBuildThenSelfChecks()
 
     QTRY_COMPARE(finalSpy.count(), 1);
     QCOMPARE(server.requestCount(), 4);                  // 建造 → 自检 → 导出 → 收尾
+    QVERIFY(server.requestAt(0).contains("沿 X 轴展开"));   // 组内摆放已注入建造指令
     QVERIFY(server.requestAt(1).contains("验收标准"));    // 自检指令已注入
+    QVERIFY(server.requestAt(1).contains("树不遮挡招牌")); // 任务约束注入自检
     QVERIFY(server.requestAt(3).contains("export_scene")); // 导出指令已注入
 }
 
@@ -1427,7 +1490,7 @@ void executorAdvancesGroups()
     AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
     orch.setModelConfig(server.config());
     BuildPlan plan;
-    plan.groups = {{"底座与环境", {}, "检查底座"}, {"建筑外观", {}, "检查建筑"}};
+    plan.groups = {{"底座与环境", {}, {}, "检查底座"}, {"建筑外观", {}, {}, "检查建筑"}};
     QSignalSpy progress(&orch, &AgentOrchestrator::groupProgress);
     QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
 
@@ -1449,7 +1512,7 @@ void executorRefusesWhenBlenderGateBusy()
     QVERIFY(gate.tryAcquire(QStringLiteral("unity-convert")));
     orch.setBlenderGate(&gate);
     BuildPlan plan;
-    plan.groups = {{"底座与环境", {}, "检查底座"}};
+    plan.groups = {{"底座与环境", {}, {}, "检查底座"}};
     QSignalSpy failed(&orch, &AgentOrchestrator::failed);
 
     orch.execute("t1", nullptr, {}, plan, "p", "/tmp/out", "blender");
@@ -1472,7 +1535,7 @@ void executorReleasesGateOnFinish()
     BlenderGate gate;
     orch.setBlenderGate(&gate);
     BuildPlan plan;
-    plan.groups = {{"底座与环境", {}, "检查底座"}};
+    plan.groups = {{"底座与环境", {}, {}, "检查底座"}};
     plan.maxSteps = 18;
     QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
 
@@ -1493,10 +1556,16 @@ static QString blenderSystemPrompt()
     return QStringLiteral("你是 SynthForge Studio 的 Blender 建模 agent。使用提供的 MCP 工具"
                           "（execute_blender_code 等）完成低模场景：先清场再分组建造，"
                           "必要时截图查看结果并修正；全部完成后按规范导出并落盘。\n"
-                          "硬性约束（P6.5 场景拼装依赖这三条，不得违反）：\n"
+                          "硬性约束（Unity 导入与跨工具复用依赖这三条，不得违反）：\n"
                           "1. 场景单位为米：1 Blender 单位 = 1 米（门高约 2.1，楼层约 3，人眼高 1.65）。\n"
                           "2. 每个道具的 origin 落在包围盒底部中心，摆到平面上不悬空。\n"
-                          "3. 贴图必须打包进 .blend（导出前 pack_all），不得引用外部图片。");
+                          "3. 贴图必须打包进 .blend（导出前 pack_all），不得引用外部图片。\n"
+                          "布局纪律（逐条执行，不得违反）：\n"
+                          "4. 所有物体落地：object.location.z = 0，禁止悬空或埋地。\n"
+                          "5. 建每个新物体前，先用 execute_blender_code 遍历 bpy.data.objects，"
+                          "读出已有物体的 location 与 dimensions；新物体的水平投影不得与它们交叠。\n"
+                          "6. 场景中心在原点，主建筑正面朝 -Y，人行道沿 X 轴展开。\n"
+                          "7. 常用尺寸（米）：树 4~6，路灯 5，路牌 2.5，门 2.1，楼层 3，人 1.75。");
 }
 
 QJsonArray AgentOrchestrator::initialMessages(const QString& system, const QString& user) const
@@ -1582,14 +1651,21 @@ void AgentOrchestrator::startGroup()
 {
     const BuildGroup& group = m_plan.groups[m_groupIndex];
     emit groupProgress(m_area, m_groupIndex + 1, m_plan.groups.size(), group.title);
-    m_messages.append(QJsonObject{
-        {"role", "user"},
-        {"content", QStringLiteral("开始第 %1/%2 组「%3」。本组对象：%4。完成后停止调用工具。")
-                        .arg(m_groupIndex + 1)
-                        .arg(m_plan.groups.size())
-                        .arg(group.title,
-                             group.items.isEmpty() ? QStringLiteral("按提示词清单执行")
-                                                   : group.items.join(QStringLiteral("、")))}});
+    QString content = QStringLiteral("开始第 %1/%2 组「%3」。本组对象：%4。")
+                          .arg(m_groupIndex + 1)
+                          .arg(m_plan.groups.size())
+                          .arg(group.title,
+                               group.items.isEmpty() ? QStringLiteral("按提示词清单执行")
+                                                     : group.items.join(QStringLiteral("、")));
+    if (!group.placements.isEmpty()) {
+        QStringList lines;
+        for (const BuildPlacement& p : group.placements)
+            lines << QStringLiteral("- %1：%2").arg(p.name, p.where);
+        content += QStringLiteral("\n摆放要求（相对关系优先，具体坐标自行根据已有物体的包围盒推算）：\n%1")
+                       .arg(lines.join('\n'));
+    }
+    content += QStringLiteral("\n放置前先查询场景中已有物体的位置与尺寸，避免重叠。完成后停止调用工具。");
+    m_messages.append(QJsonObject{{"role", "user"}, {"content", content}});
     m_stream.clear();
     tick();
 }
@@ -1599,12 +1675,15 @@ void AgentOrchestrator::onTurnFinished()   // 一轮 LLM 无工具调用时进�
     if (m_phase == GroupPhase::Build) {
         m_phase = GroupPhase::SelfCheck;
         const BuildGroup& group = m_plan.groups[m_groupIndex];
-        m_messages.append(QJsonObject{
-            {"role", "user"},
-            {"content", QStringLiteral("第 %1 组建造结束。请对照验收标准：%2。调用截图工具检查本组结果，"
-                                       "缺漏或明显偏差立即补建修正；确认无误后停止调用工具。")
-                            .arg(m_groupIndex + 1)
-                            .arg(group.acceptance)}});
+        QString content = QStringLiteral("第 %1 组建造结束。请对照验收标准：%2。")
+                              .arg(m_groupIndex + 1)
+                              .arg(group.acceptance);
+        if (!m_plan.rules.isEmpty())
+            content += QStringLiteral("\n本任务布局约束（逐条核对，不满足则修正后再结束）：\n- %1")
+                           .arg(m_plan.rules.join(QStringLiteral("\n- ")));
+        content += QStringLiteral("\n调用截图工具检查本组结果，缺漏、悬空、穿过其他物体或明显偏差"
+                                  "立即补建修正；确认无误后停止调用工具。");
+        m_messages.append(QJsonObject{{"role", "user"}, {"content", content}});
         m_stream.clear();
         tick();
         return;
@@ -1880,6 +1959,7 @@ connect(m_orch, &AgentOrchestrator::planReady, this,
             m_pendingPlans.insert(area, plan);
             m_ws->broadcastEvent("plan.created",
                                  {{"area", area}, {"taskId", taskId},
+                                  {"rules", plan.value("rules")},
                                   {"groups", plan.value("groups")},
                                   {"totalSteps", plan.value("totalSteps")}});
         });
@@ -1926,7 +2006,12 @@ import type { WsClient } from "../ws";
 const props = defineProps<{
   client: WsClient;
   area: string;
-  plan: { taskId: string; groups: { title: string; items: string[]; acceptance: string }[]; totalSteps: number };
+  plan: {
+    taskId: string;
+    rules: string[];
+    groups: { title: string; items: string[]; placements: { name: string; where: string }[]; acceptance: string }[];
+    totalSteps: number;
+  };
 }>();
 const decided = ref<"pending" | "started" | "cancelled">("pending");
 const error = ref("");
@@ -1955,10 +2040,17 @@ function cancel() {
   <div class="plan-card">
     <div class="plan-hint">建造计划 · 预估 {{ plan.totalSteps }} 步</div>
     <div class="plan-warn">开始后会先清空 Blender 当前场景（未保存的手工修改会丢失）</div>
+    <div v-if="plan.rules?.length" class="plan-rules">
+      <div class="rules-title">布局约束</div>
+      <ul><li v-for="(r, i) in plan.rules" :key="i">{{ r }}</li></ul>
+    </div>
     <ol>
       <li v-for="(g, i) in plan.groups" :key="i">
         <div class="group-title">{{ i + 1 }}. {{ g.title }}</div>
         <div v-if="g.items.length" class="group-items">{{ g.items.join(" / ") }}</div>
+        <ul v-if="g.placements?.length" class="group-placements">
+          <li v-for="(p, j) in g.placements" :key="j">{{ p.name }}：{{ p.where }}</li>
+        </ul>
         <div class="group-accept">验收：{{ g.acceptance }}</div>
       </li>
     </ol>
@@ -1974,11 +2066,11 @@ function cancel() {
 </template>
 ```
 
-样式里补 `.plan-warn { font-size: 12px; color: #d97706; margin: 2px 0 8px; }`。
+样式里补 `.plan-warn { font-size: 12px; color: #d97706; margin: 2px 0 8px; }`、`.plan-rules { font-size: 12px; color: #475569; margin: 0 0 8px; }`、`.group-placements { margin: 2px 0 4px; padding-left: 18px; font-size: 12px; color: #64748b; list-style: disc; }`。
 
 `ChatPanel.vue` 新增订阅 `plan.created` → 追加计划卡并 `busy.value = false`（等待用户决策）；计划卡 `start` 等待 `plan.confirm` 返回，`ok:false` 时保持 pending 并显示错误（`blender-busy` 时计划卡保留，可稍后再点）；`cancel` → `client.request("plan.cancel", {area, taskId})`；收到 `folderPick.open`（Task 4）后弹存放位置。
 
-- [ ] **Step 6: CMake + 跑测试 + Commit**（`tst_orchestrator` 6 用例：规划解析 / 降级 / 单组执行 / 多组推进 / 门禁忙拒绝 / 成功释放门禁；target 写成 `add_executable(tst_orchestrator tests/tst_orchestrator.cpp tests/mock/MockLlmServer.cpp)` + `target_include_directories(tst_orchestrator PRIVATE tests)`，脚本经真实 HTTP+SSE 由 `MockLlmServer` 喂入；`feat: Planner→Executor 两阶段主循环（计划卡/分组自检）`）
+- [ ] **Step 6: CMake + 跑测试 + Commit**（`tst_orchestrator` 6 用例：规划解析（含布局与约束）/ 降级 / 单组执行（含摆放与约束注入）/ 多组推进 / 门禁忙拒绝 / 成功释放门禁；target 写成 `add_executable(tst_orchestrator tests/tst_orchestrator.cpp tests/mock/MockLlmServer.cpp)` + `target_include_directories(tst_orchestrator PRIVATE tests)`，脚本经真实 HTTP+SSE 由 `MockLlmServer` 喂入；`feat: Planner→Executor 两阶段主循环（计划卡/分组自检/布局约束）`）
 
 ---
 
