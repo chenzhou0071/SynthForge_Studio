@@ -1,13 +1,20 @@
 export type ChatRole = "user" | "assistant" | "error" | "image" | "draft" | "plan";
 
+export interface PlanPlacement {
+  name: string;
+  where: string;
+}
+
 export interface PlanGroup {
   title: string;
   items: string[];
+  placements: PlanPlacement[];
   acceptance: string;
 }
 
 export interface PlanData {
   taskId: string;
+  rules: string[];
   groups: PlanGroup[];
   totalSteps: number;
 }

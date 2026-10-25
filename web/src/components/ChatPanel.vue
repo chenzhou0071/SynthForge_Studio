@@ -124,6 +124,7 @@ onMounted(() => {
       const payload = data as {
         area?: string;
         taskId?: string;
+        rules?: string[];
         groups?: PlanGroup[];
         totalSteps?: number;
       };
@@ -134,6 +135,7 @@ onMounted(() => {
         role: "plan",
         plan: {
           taskId: payload.taskId ?? "",
+          rules: payload.rules ?? [],
           groups: payload.groups ?? [],
           totalSteps: payload.totalSteps ?? 0,
         },

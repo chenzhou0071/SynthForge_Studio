@@ -127,6 +127,7 @@ bool CoreApp::start()
                 m_ws->broadcastEvent(QStringLiteral("plan.created"),
                                      QJsonObject{{"area", area},
                                                  {"taskId", taskId},
+                                                 {"rules", plan.value("rules")},
                                                  {"groups", plan.value("groups")},
                                                  {"totalSteps", plan.value("totalSteps")}});
             });

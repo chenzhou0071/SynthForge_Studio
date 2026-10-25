@@ -41,11 +41,18 @@ class OrchestratorTest : public QObject
     Q_OBJECT
 
 private slots:
-    void plannerParsesGroups()
+    void plannerParsesGroupsAndLayout()
     {
         MockLlmServer server({textTurn(QStringLiteral(
-            R"({"groups":[{"title":"底座与环境","items":["底座","井盖"],"acceptance":"俯视截图：底座完整"},)"
-            R"({"title":"建筑外观","items":["墙体","招牌"],"acceptance":"街角截图：主体齐全"}]})"))});
+            R"({"rules":["树不遮挡招牌"],"groups":[)"
+            R"({"title":"底座与环境","items":["底座","路牌"],)"
+            R"("placements":[{"name":"底座","where":"场景中心，沿 X 轴展开"},)"
+            R"({"name":"路牌","where":"商店右前方 2 米，正面朝 -Y"}],)"
+            R"("acceptance":"俯视截图：底座完整"},)"
+            R"({"title":"建筑外观","items":["墙体","招牌"],)"
+            R"("placements":[{"name":"墙体","where":"底座北侧边缘"},)"
+            R"({"name":"招牌","where":"正门上方，离地 2.8 米"}],)"
+            R"("acceptance":"街角截图：主体齐全"}]})"))});
         QVERIFY(server.listen());
         LlmGateway llm; // 真实网关，禁止子类重写 chatStream
         AgentOrchestrator orch(&llm, nullptr, nullptr);
@@ -59,6 +66,18 @@ private slots:
         const QJsonObject plan = ready.first().at(2).toJsonObject();
         QCOMPARE(plan.value(QStringLiteral("groups")).toArray().size(), 2);
         QCOMPARE(plan.value(QStringLiteral("totalSteps")).toInt(), 26); // 8*2+10
+        QCOMPARE(plan.value(QStringLiteral("rules")).toArray().size(), 1);
+        const QJsonArray placements = plan.value(QStringLiteral("groups"))
+                                          .toArray()
+                                          .at(0)
+                                          .toObject()
+                                          .value(QStringLiteral("placements"))
+                                          .toArray();
+        QCOMPARE(placements.size(), 2);
+        QCOMPARE(placements.at(1).toObject().value(QStringLiteral("name")).toString(),
+                 QStringLiteral("路牌"));
+        QVERIFY(placements.at(1).toObject().value(QStringLiteral("where")).toString().contains(
+            QStringLiteral("右前方")));
     }
 
     void plannerFallsBackToDefaults()
@@ -93,9 +112,13 @@ private slots:
         AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
         orch.setModelConfig(server.config());
         BuildPlan plan;
-        plan.groups = {{QStringLiteral("底座与环境"),
-                        {QStringLiteral("底座")},
-                        QStringLiteral("俯视截图检查底座完整")}};
+        BuildGroup group;
+        group.title = QStringLiteral("底座与环境");
+        group.items = {QStringLiteral("底座")};
+        group.placements = {{QStringLiteral("底座"), QStringLiteral("场景中心，沿 X 轴展开")}};
+        group.acceptance = QStringLiteral("俯视截图检查底座完整");
+        plan.groups = {group};
+        plan.rules = {QStringLiteral("树不遮挡招牌")};
         plan.maxSteps = 18;
         QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
 
@@ -105,7 +128,9 @@ private slots:
 
         QTRY_COMPARE_WITH_TIMEOUT(finalSpy.count(), 1, 5000);
         QCOMPARE(server.requestCount(), 4); // 建造 → 自检 → 导出 → 收尾
-        QVERIFY(server.requestAt(2).contains(QStringLiteral("验收标准")));   // 自检指令已注入
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("沿 X 轴展开"))); // 组内摆放已注入
+        QVERIFY(server.requestAt(2).contains(QStringLiteral("验收标准")));    // 自检指令已注入
+        QVERIFY(server.requestAt(2).contains(QStringLiteral("树不遮挡招牌"))); // 任务约束注入自检
         QVERIFY(server.requestAt(3).contains(QStringLiteral("export_scene"))); // 导出指令已注入
     }
 
@@ -124,8 +149,8 @@ private slots:
         AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
         orch.setModelConfig(server.config());
         BuildPlan plan;
-        plan.groups = {{QStringLiteral("底座与环境"), {}, QStringLiteral("检查底座")},
-                       {QStringLiteral("建筑外观"), {}, QStringLiteral("检查建筑")}};
+        plan.groups = {{QStringLiteral("底座与环境"), {}, {}, QStringLiteral("检查底座")},
+                       {QStringLiteral("建筑外观"), {}, {}, QStringLiteral("检查建筑")}};
         QSignalSpy progress(&orch, &AgentOrchestrator::groupProgress);
         QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
 
@@ -148,7 +173,7 @@ private slots:
         QVERIFY(gate.tryAcquire(QStringLiteral("unity-convert")));
         orch.setBlenderGate(&gate);
         BuildPlan plan;
-        plan.groups = {{QStringLiteral("底座与环境"), {}, QStringLiteral("检查底座")}};
+        plan.groups = {{QStringLiteral("底座与环境"), {}, {}, QStringLiteral("检查底座")}};
         QSignalSpy failed(&orch, &AgentOrchestrator::failed);
 
         orch.execute(QStringLiteral("t1"), nullptr, {}, plan, QStringLiteral("p"),
@@ -174,7 +199,7 @@ private slots:
         BlenderGate gate;
         orch.setBlenderGate(&gate);
         BuildPlan plan;
-        plan.groups = {{QStringLiteral("底座与环境"), {}, QStringLiteral("检查底座")}};
+        plan.groups = {{QStringLiteral("底座与环境"), {}, {}, QStringLiteral("检查底座")}};
         plan.maxSteps = 18;
         QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
 

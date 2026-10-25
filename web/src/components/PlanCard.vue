@@ -5,7 +5,17 @@ import type { WsClient } from "../ws/WsClient";
 const props = defineProps<{
   client: WsClient;
   area: string;
-  plan: { taskId: string; groups: { title: string; items: string[]; acceptance: string }[]; totalSteps: number };
+  plan: {
+    taskId: string;
+    rules: string[];
+    groups: {
+      title: string;
+      items: string[];
+      placements: { name: string; where: string }[];
+      acceptance: string;
+    }[];
+    totalSteps: number;
+  };
 }>();
 const decided = ref<"pending" | "started" | "cancelled">("pending");
 const error = ref("");
@@ -42,10 +52,19 @@ function cancel() {
   <div class="plan-card">
     <div class="plan-hint">建造计划 · 预估 {{ plan.totalSteps }} 步</div>
     <div class="plan-warn">开始后会先清空 Blender 当前场景（未保存的手工修改会丢失）</div>
+    <div v-if="plan.rules?.length" class="plan-rules">
+      <div class="rules-title">布局约束</div>
+      <ul>
+        <li v-for="(rule, i) in plan.rules" :key="i">{{ rule }}</li>
+      </ul>
+    </div>
     <ol>
       <li v-for="(g, i) in plan.groups" :key="i">
         <div class="group-title">{{ i + 1 }}. {{ g.title }}</div>
         <div v-if="g.items.length" class="group-items">{{ g.items.join(" / ") }}</div>
+        <ul v-if="g.placements?.length" class="group-placements">
+          <li v-for="(p, j) in g.placements" :key="j">{{ p.name }}：{{ p.where }}</li>
+        </ul>
         <div class="group-accept">验收：{{ g.acceptance }}</div>
       </li>
     </ol>
@@ -78,6 +97,31 @@ function cancel() {
   font-size: 12px;
   color: #d97706;
   margin: 2px 0 8px;
+}
+
+.plan-rules {
+  margin: 0 0 8px;
+}
+
+.rules-title {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.plan-rules ul {
+  margin: 2px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  list-style: disc;
+}
+
+.group-placements {
+  margin: 2px 0 4px;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  list-style: disc;
 }
 
 ol {

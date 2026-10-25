@@ -1473,8 +1473,8 @@ void executorBuildThenSelfChecks()
     QTRY_COMPARE(finalSpy.count(), 1);
     QCOMPARE(server.requestCount(), 4);                  // 建造 → 自检 → 导出 → 收尾
     QVERIFY(server.requestAt(0).contains("沿 X 轴展开"));   // 组内摆放已注入建造指令
-    QVERIFY(server.requestAt(1).contains("验收标准"));    // 自检指令已注入
-    QVERIFY(server.requestAt(1).contains("树不遮挡招牌")); // 任务约束注入自检
+    QVERIFY(server.requestAt(2).contains("验收标准"));    // 自检指令已注入
+    QVERIFY(server.requestAt(2).contains("树不遮挡招牌")); // 任务约束注入自检
     QVERIFY(server.requestAt(3).contains("export_scene")); // 导出指令已注入
 }
 

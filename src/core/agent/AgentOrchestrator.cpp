@@ -16,10 +16,16 @@ namespace {
 
 const char* kPlanSystemPrompt =
     "你是低模场景建造的规划器。只输出一个 JSON 对象，不要任何解释或代码块围栏，格式："
-    "{\"groups\":[{\"title\":\"分组名\",\"items\":[\"物体1\",\"物体2\"],"
+    "{\"rules\":[\"本任务特有的跨组约束\"],\"groups\":[{\"title\":\"分组名\","
+    "\"items\":[\"物体1\"],"
+    "\"placements\":[{\"name\":\"物体1\",\"where\":\"相对位置与朝向\"}],"
     "\"acceptance\":\"自检时截图检查什么\"}]}。"
     "要求：3~6 组，覆盖用户提示词中全部必须独立的物体与数量下限；按施工顺序排列"
-    "（底座环境 → 建筑外观 → 室内陈设 → 灯光特效）。";
+    "（底座环境 → 建筑外观 → 室内陈设 → 灯光特效）。"
+    "items 里的每个物体必须在 placements 里有一条同名条目；where 只写相对关系不写绝对坐标"
+    "（如「商店北侧边缘，正门朝 -Y」「招牌在正门上方，离地 2.8 米」）。"
+    "rules 只写本任务特有、跨组生效的约束（如「树不遮挡招牌」「路灯每 8 米一盏」），"
+    "不要重复贴地、不重叠、单位这类通用规则。";
 
 int planBudget(int groupCount)
 {
@@ -35,12 +41,22 @@ BuildPlan parsePlan(const QString& text)
         return plan; // 空计划 = 解析失败
     const QJsonObject obj =
         QJsonDocument::fromJson(text.mid(start, end - start + 1).toUtf8()).object();
+    for (const QJsonValue& rule : obj.value(QStringLiteral("rules")).toArray())
+        plan.rules << rule.toString();
     for (const QJsonValue& value : obj.value(QStringLiteral("groups")).toArray()) {
         const QJsonObject item = value.toObject();
         BuildGroup group;
         group.title = item.value(QStringLiteral("title")).toString();
         for (const QJsonValue& name : item.value(QStringLiteral("items")).toArray())
             group.items << name.toString();
+        for (const QJsonValue& entry : item.value(QStringLiteral("placements")).toArray()) {
+            const QJsonObject entryObj = entry.toObject();
+            BuildPlacement placement;
+            placement.name = entryObj.value(QStringLiteral("name")).toString();
+            placement.where = entryObj.value(QStringLiteral("where")).toString();
+            if (!placement.name.isEmpty() && !placement.where.isEmpty())
+                group.placements.push_back(placement);
+        }
         group.acceptance = item.value(QStringLiteral("acceptance")).toString();
         if (!group.title.isEmpty())
             plan.groups.push_back(group);
@@ -53,10 +69,10 @@ BuildPlan defaultPlan()
 {
     BuildPlan plan;
     plan.groups = {
-        {QStringLiteral("底座环境"), {}, QStringLiteral("俯视截图：底座完整、路面/标线齐全、无悬空凹陷")},
-        {QStringLiteral("建筑外观"), {}, QStringLiteral("街角视角截图：主体、招牌、门窗齐全，比例协调")},
-        {QStringLiteral("店内陈设"), {}, QStringLiteral("透过橱窗截图：按提示词店内清单逐项核对")},
-        {QStringLiteral("灯光特效"), {}, QStringLiteral("夜景截图：招牌自发光、路灯、雨水粒子均已生效")},
+        {QStringLiteral("底座环境"), {}, {}, QStringLiteral("俯视截图：底座完整、路面/标线齐全、无悬空凹陷")},
+        {QStringLiteral("建筑外观"), {}, {}, QStringLiteral("街角视角截图：主体、招牌、门窗齐全，比例协调")},
+        {QStringLiteral("店内陈设"), {}, {}, QStringLiteral("透过橱窗截图：按提示词店内清单逐项核对")},
+        {QStringLiteral("灯光特效"), {}, {}, QStringLiteral("夜景截图：招牌自发光、路灯、雨水粒子均已生效")},
     };
     plan.maxSteps = planBudget(plan.groups.size());
     return plan;
@@ -71,7 +87,13 @@ QString blenderSystemPrompt()
         "硬性约束（Unity 导入与跨工具复用依赖这三条，不得违反）：\n"
         "1. 场景单位为米：1 Blender 单位 = 1 米（门高约 2.1，楼层约 3，人眼高 1.65）。\n"
         "2. 每个道具的 origin 落在包围盒底部中心，摆到平面上不悬空。\n"
-        "3. 贴图必须打包进 .blend（导出前 pack_all），不得引用外部图片。");
+        "3. 贴图必须打包进 .blend（导出前 pack_all），不得引用外部图片。\n"
+        "布局纪律（逐条执行，不得违反）：\n"
+        "4. 所有物体落地：object.location.z = 0，禁止悬空或埋地。\n"
+        "5. 建每个新物体前，先用 execute_blender_code 遍历 bpy.data.objects，"
+        "读出已有物体的 location 与 dimensions；新物体的水平投影不得与它们交叠。\n"
+        "6. 场景中心在原点，主建筑正面朝 -Y，人行道沿 X 轴展开。\n"
+        "7. 常用尺寸（米）：树 4~6，路灯 5，路牌 2.5，门 2.1，楼层 3，人 1.75。");
 }
 
 // 截图为 image content 时压成 JPEG base64：同一份结果既回喂模型又给前端展示
@@ -178,15 +200,21 @@ void AgentOrchestrator::attemptPlan(int attempt)
                  if (plan.groups.isEmpty())
                      plan = defaultPlan(); // 仍失败 → 降级默认分组
                  QJsonArray groups;
-                 for (const BuildGroup& g : plan.groups)
+                 for (const BuildGroup& g : plan.groups) {
+                     QJsonArray placements;
+                     for (const BuildPlacement& p : g.placements)
+                         placements.append(QJsonObject{{"name", p.name}, {"where", p.where}});
                      groups.append(QJsonObject{
                          {"title", g.title},
                          {"items", QJsonArray::fromStringList(g.items)},
+                         {"placements", placements},
                          {"acceptance", g.acceptance},
                      });
+                 }
                  m_planning.remove(m_area);
                  emit planReady(m_area, m_taskId,
                                 QJsonObject{{"taskId", m_taskId},
+                                            {"rules", QJsonArray::fromStringList(plan.rules)},
                                             {"groups", groups},
                                             {"totalSteps", plan.maxSteps}});
              }});
@@ -306,14 +334,22 @@ void AgentOrchestrator::startGroup()
 {
     const BuildGroup& group = m_plan.groups[m_groupIndex];
     emit groupProgress(m_area, m_groupIndex + 1, m_plan.groups.size(), group.title);
-    m_messages.append(QJsonObject{
-        {"role", "user"},
-        {"content",
-         QStringLiteral("开始第 %1/%2 组「%3」。本组对象：%4。完成后停止调用工具。")
-             .arg(m_groupIndex + 1)
-             .arg(m_plan.groups.size())
-             .arg(group.title, group.items.isEmpty() ? QStringLiteral("按提示词清单执行")
-                                                     : group.items.join(QStringLiteral("、")))}});
+    QString content =
+        QStringLiteral("开始第 %1/%2 组「%3」。本组对象：%4。")
+            .arg(m_groupIndex + 1)
+            .arg(m_plan.groups.size())
+            .arg(group.title, group.items.isEmpty() ? QStringLiteral("按提示词清单执行")
+                                                    : group.items.join(QStringLiteral("、")));
+    if (!group.placements.isEmpty()) {
+        QStringList lines;
+        for (const BuildPlacement& p : group.placements)
+            lines << QStringLiteral("- %1：%2").arg(p.name, p.where);
+        content +=
+            QStringLiteral("\n摆放要求（相对关系优先，具体坐标自行根据已有物体的包围盒推算）：\n%1")
+                .arg(lines.join('\n'));
+    }
+    content += QStringLiteral("\n放置前先查询场景中已有物体的位置与尺寸，避免重叠。完成后停止调用工具。");
+    m_messages.append(QJsonObject{{"role", "user"}, {"content", content}});
     m_stream.clear();
     tick();
 }
@@ -323,13 +359,16 @@ void AgentOrchestrator::onTurnFinished() // 一轮 LLM 无工具调用时进入
     if (m_phase == GroupPhase::Build) {
         m_phase = GroupPhase::SelfCheck;
         const BuildGroup& group = m_plan.groups[m_groupIndex];
-        m_messages.append(QJsonObject{
-            {"role", "user"},
-            {"content",
-             QStringLiteral("第 %1 组建造结束。请对照验收标准：%2。调用截图工具检查本组结果，"
-                            "缺漏或明显偏差立即补建修正；确认无误后停止调用工具。")
-                 .arg(m_groupIndex + 1)
-                 .arg(group.acceptance)}});
+        QString content = QStringLiteral("第 %1 组建造结束。请对照验收标准：%2。")
+                              .arg(m_groupIndex + 1)
+                              .arg(group.acceptance);
+        if (!m_plan.rules.isEmpty())
+            content +=
+                QStringLiteral("\n本任务布局约束（逐条核对，不满足则修正后再结束）：\n- %1")
+                    .arg(m_plan.rules.join(QStringLiteral("\n- ")));
+        content += QStringLiteral("\n调用截图工具检查本组结果，缺漏、悬空、穿过其他物体或明显偏差"
+                                  "立即补建修正；确认无误后停止调用工具。");
+        m_messages.append(QJsonObject{{"role", "user"}, {"content", content}});
         m_stream.clear();
         tick();
         return;

@@ -16,16 +16,24 @@ class TaskManager;
 class McpClient;
 class BlenderGate;
 
+struct BuildPlacement
+{
+    QString name;
+    QString where;
+};
+
 struct BuildGroup
 {
     QString title;
     QStringList items;
+    QVector<BuildPlacement> placements;   // 每个 item 一条：相对谁、朝哪、离地多少
     QString acceptance;
 };
 
 struct BuildPlan
 {
     QVector<BuildGroup> groups;
+    QStringList rules;                    // 本任务特有的跨组布局约束
     int maxSteps = 50;
 };
 
