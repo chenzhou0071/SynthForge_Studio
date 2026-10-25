@@ -6,6 +6,7 @@
 #include "core/agent/AgentOrchestrator.h"
 #include "core/llm/LlmGateway.h"
 #include "core/mcp/BlenderGate.h"
+#include "core/tasks/TaskManager.h"
 #include "mock/MockLlmServer.h"
 #include "mock/MockMcpHarness.h"
 
@@ -192,11 +193,55 @@ private slots:
         QVERIFY(server.requestAt(0).contains(QStringLiteral("飞虫"))); // 不默认生成飞虫/湿地面
         QVERIFY(server.requestAt(0).contains(QStringLiteral("光粒子"))); // 光粒子等特效可以保留
         QVERIFY(server.requestAt(0).contains(QStringLiteral("沿 X 轴展开"))); // 组内摆放已注入
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("不要复述截图里的细节"))); // 截图后只说结论
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("中间轮次不要写验收报告"))); // 组结束别写小作文
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("只回 1 句结果"))); // 组完成只报结果
         QVERIFY(server.requestAt(2).contains(QStringLiteral("验收标准")));    // 自检指令已注入
         QVERIFY(server.requestAt(2).contains(QStringLiteral("树不遮挡招牌"))); // 任务约束注入自检
+        QVERIFY(server.requestAt(2).contains(QStringLiteral("只做一次自检"))); // 不反复体检
+        QVERIFY(server.requestAt(2).contains(QStringLiteral("不要逐项复述"))); // 不复述坐标间隙
+        QVERIFY(server.requestAt(2).contains(QStringLiteral("不要复述本条要求"))); // 别把提示词抄一遍
         QVERIFY(server.requestAt(3).contains(QStringLiteral("export_scene"))); // 导出指令已注入
+        QVERIFY(server.requestAt(3).contains(QStringLiteral("不要再做场景体检"))); // 导出前不再重复校验
         QVERIFY(server.requestAt(3).contains(QStringLiteral("save_version = 0"))); // 不生成 .blend1 备份
         QVERIFY(server.requestAt(3).contains(QStringLiteral("只执行一次"))); // 避免换名重复导出
+        QVERIFY(server.requestAt(3).contains(QStringLiteral("不要复述本条要求或脚本内容"))); // 别复述导出指令
+        QVERIFY(server.requestAt(3).contains(QStringLiteral("最终回复保持简短"))); // 收尾别写小作文
+        QVERIFY(server.requestAt(3).contains(QStringLiteral("最多 5 条清单")));   // 清单保留
+    }
+
+    // 修改已有资产：导出必须覆盖同名文件，不能再走“撞名加序号”
+    void executorModifyOverwritesExistingBase()
+    {
+        MockLlmServer server({toolTurn(QStringLiteral("execute_blender_code")),
+                              textTurn(QStringLiteral("已改短，动画保留")),
+                              textTurn(QStringLiteral("自检通过")),
+                              textTurn(QStringLiteral("已覆盖导出"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+        orch.setModelConfig(server.config());
+        BuildPlan plan;
+        BuildGroup group;
+        group.title = QStringLiteral("修改资产");
+        group.acceptance = QStringLiteral("剑更短且动画仍在");
+        plan.groups = {group};
+        plan.maxSteps = 20;
+        plan.targetBase = QStringLiteral("sword_01");
+        QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
+
+        orch.execute(QStringLiteral("t-modify"), nullptr, openAiTools(), plan,
+                     QStringLiteral("打开 .blend 源文件 /tmp/out/sword_01.blend。要求：把剑改短一点。"),
+                     QStringLiteral("/tmp/out"), QStringLiteral("blender"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(finalSpy.count(), 1, 5000);
+        const QString exportRequest = server.requestAt(3);
+        QVERIFY(exportRequest.contains(QStringLiteral("sword_01"))); // 基名来自目标资产
+        QVERIFY(exportRequest.contains(QStringLiteral("覆盖")));     // 明确覆盖同名文件
+        QVERIFY(!exportRequest.contains(QStringLiteral("while os.path.exists"))); // 不再加序号
+        QVERIFY(exportRequest.contains(QStringLiteral("最终回复保持简短"))); // 收尾别写小作文
+        QVERIFY(exportRequest.contains(QStringLiteral("最多 5 条清单")));   // 清单保留
     }
 
     void executorAdvancesGroups()
@@ -261,6 +306,36 @@ private slots:
         QCOMPARE(turns.at(0).at(1).toString(), QStringLiteral("先检查场景"));
         QCOMPARE(turns.at(1).at(1).toString(), QStringLiteral("组1建造完成"));
         QCOMPARE(turns.at(2).at(1).toString(), QStringLiteral("组1自检通过"));
+    }
+
+    // 停止修改任务必须断掉在途流：只打 cancelled 标记，卡在 stall 的请求会一直占着 UI
+    void cancelAbortsInFlightStream()
+    {
+        MockLlmServer server({MockLlmServer::Turn{
+            .frames = {MockLlm::textChunk(QStringLiteral("正在修改…"))},
+            .stallAfterFrames = true}});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        AgentOrchestrator orch(&llm, nullptr, nullptr);
+        orch.setModelConfig(server.config());
+        TaskManager tm;
+        BuildPlan plan;
+        plan.groups = {{QStringLiteral("修改资产"), {}, {}, QStringLiteral("改完")}};
+        QSignalSpy finished(&tm, &TaskManager::finished);
+
+        tm.enqueue(Task{QStringLiteral("t1"), QStringLiteral("blender"), QString(),
+                        [&orch, &plan](const QString& tid, TaskManager* manager) {
+                            orch.execute(tid, manager, openAiTools(), plan, QStringLiteral("p"),
+                                         QStringLiteral("/tmp/out"), QStringLiteral("blender"));
+                        }});
+        QTRY_COMPARE_WITH_TIMEOUT(server.requestCount(), 1, 3000);
+
+        // 与 CoreApp::chat.cancel 一致：先标记，再按区断网
+        tm.cancelArea(QStringLiteral("blender"));
+        llm.abortTag(QStringLiteral("blender"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 2000);
+        QCOMPARE(finished.first().at(1).toBool(), true);
     }
 
     void executorRefusesWhenBlenderGateBusy()

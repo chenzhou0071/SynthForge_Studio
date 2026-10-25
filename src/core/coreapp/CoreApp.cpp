@@ -682,6 +682,56 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
 
     m_lastSend.insert(area, params);
 
+    // 修改已有资产：不进草稿/计划/选目录，单组计划直接执行
+    if (mode == QLatin1String("modify")) {
+        const QString asset = params.value(QStringLiteral("asset")).toString();
+        const QString request = text.trimmed();
+        // 修改锚点统一是 .blend：传 glb/fbx 时自动找同目录同名源文件
+        QFileInfo info;
+        if (!asset.isEmpty()) {
+            info = QFileInfo(m_library->absoluteFor(asset));
+            if (info.suffix().compare(QLatin1String("blend"), Qt::CaseInsensitive) != 0)
+                info = QFileInfo(info.dir().filePath(info.completeBaseName()
+                                                     + QStringLiteral(".blend")));
+        }
+        const QString blendRelative =
+            info.exists() ? m_library->relativeFor(info.absoluteFilePath()) : QString();
+        // 没有同名 .blend（云API 高模/外部导入）或指令为空：前端据此提示只能重新生成
+        if (request.isEmpty() || blendRelative.isEmpty()
+            || !m_library->isValidTarget(blendRelative))
+            return QJsonValue(QJsonObject{{"accepted", false}, {"error", "no-blend-source"}});
+        if (appendUser) {
+            m_sessions->appendMessage(area, QStringLiteral("user"), request);
+            m_ws->broadcastEvent(
+                QStringLiteral("chat.message"),
+                QJsonObject{{"area", area}, {"role", "user"}, {"content", request}});
+        }
+        BuildPlan plan;
+        BuildGroup group;
+        group.title = QStringLiteral("修改资产");
+        group.acceptance = QStringLiteral("修改意图达成；同名 GLB/FBX/blend 已覆盖");
+        plan.groups = {group};
+        plan.maxSteps = 50;
+        plan.targetBase = info.completeBaseName(); // 导出回合据此覆盖同名文件
+        const QString prompt =
+            QStringLiteral("打开 .blend 源文件 %1。要求：%2。"
+                           "保留场景里已有的可导出动效（物体关键帧），不要删除或覆盖。"
+                           "完成后覆盖导出同名 GLB/FBX 并保存 .blend。")
+                .arg(info.absoluteFilePath(), request);
+        const QString targetFolder = info.absolutePath();
+        const QString taskId = QStringLiteral("chat-%1").arg(++m_seq);
+        m_tasks->enqueue(Task{
+            taskId, area, QString(),
+            [this, plan, prompt, targetFolder, request, area](const QString& tid,
+                                                            TaskManager* tm) {
+                m_orch->setModelConfig(primaryAgentConfig());
+                m_orch->setConversationHistory(historyForPrompt(area, request, 20));
+                m_orch->execute(tid, tm, ToolBridge::mcpToolsToOpenAi(m_blenderTools), plan,
+                                prompt, targetFolder, area);
+            }});
+        return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
+    }
+
     // 低模模式：先落库用户需求，再交给总结 agent 改写草稿（规格 5.2）
     if (mode == QLatin1String("lowpoly")) {
         if (appendUser) {

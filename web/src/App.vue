@@ -140,6 +140,8 @@ onBeforeUnmount(() => {
           area="blender"
           :client="client"
           :settings-version="settingsVersion"
+          :selected-asset="modifyTarget ?? undefined"
+          @clear-asset="modifyTarget = null"
         />
         <ChatPanel
           v-show="active === 'unity'"

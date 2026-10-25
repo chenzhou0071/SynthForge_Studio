@@ -280,6 +280,12 @@ button {
   white-space: normal;
 }
 
+/* 流式气泡不做 markdown 解析，保留换行与空白即可 */
+.bubble .md.stream-plain {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .md > :first-child {
   margin-top: 0;
 }

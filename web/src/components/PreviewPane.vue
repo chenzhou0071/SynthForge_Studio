@@ -133,6 +133,8 @@ function ensureViewer() {
   resize();
   const loop = () => {
     frame = requestAnimationFrame(loop);
+    // 非模型页 / 窗口在后台时不为空场景持续跑 60fps，避免白占 CPU 和 WebEngine 合成
+    if (!isModel.value || document.hidden) return;
     const delta = Math.min(clock.getDelta(), 0.1); // 切标签页回来不跳帧
     if (mixer && playing.value)
       mixer.update(delta);
@@ -312,6 +314,17 @@ onBeforeUnmount(() => {
   flex: none;
   padding: 2px 10px;
   font-size: 12px;
+  border: 1px solid rgba(106, 170, 214, 0.45);
+  border-radius: 3px;
+  background: rgba(14, 99, 156, 0.22);
+  color: #a9d2ee;
+  cursor: pointer;
+}
+
+.modify-btn:hover {
+  background: rgba(17, 119, 187, 0.34);
+  border-color: rgba(140, 198, 238, 0.7);
+  color: #cfe8fa;
 }
 
 .close-btn {

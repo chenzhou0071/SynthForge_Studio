@@ -12,12 +12,23 @@ import PlanCard from "./PlanCard.vue";
 
 type Area = "blender" | "unity";
 
-const props = defineProps<{ area: Area; client: WsClient; settingsVersion?: number }>();
+const props = defineProps<{
+  area: Area;
+  client: WsClient;
+  settingsVersion?: number;
+  selectedAsset?: string;
+}>();
+// [修改此资产] / 右键菜单设定的目标；提交一条修改指令后清空
+const emit = defineEmits<{ clearAsset: [] }>();
 
 const messages = ref<ChatItem[]>([]);
 const draft = ref("");
 const mode = ref<"lowpoly" | "cloud3d">("lowpoly");
 const cloudConfigured = ref(false);
+// 目标资产 chip：只显示文件名，去掉目录与 .blend 后缀
+const assetName = computed(
+  () => (props.selectedAsset ?? "").split("/").pop()?.replace(/\.blend$/i, "") ?? "",
+);
 // 每区一个常驻实例：busy 属于本实例，切区只 v-show，状态不会串区
 const busy = ref(false);
 const scroller = ref<HTMLElement | null>(null);
@@ -35,6 +46,8 @@ const showPending = computed(() => busy.value && !messages.value.some((item) => 
 const pick = ref<{ requestId: string; rootName: string; tree: FolderNode } | null>(null);
 const unsubscribers: Array<() => void> = [];
 let streaming: ChatItem | null = null; // 指向 messages 里的流式气泡；必须是 reactive 代理，否则收口不触发重渲染
+// 用户已点停止：abort 前发出的帧可能晚到，不能让它们把 busy/气泡重新拉起来
+let cancelRequested = false;
 
 function reasonText(reason: string, steps?: number, maxSteps?: number) {
   if (reason === "agent-not-configured") {
@@ -177,6 +190,7 @@ onMounted(() => {
     props.client.on("chat.delta", (data) => {
       const delta = data as { area?: string; text?: string };
       if (delta.area !== props.area) return;
+      if (cancelRequested) return; // 取消后不再显示迟到片段
       if (!streaming) {
         // 裸对象改 streaming 不会触发渲染，光标会留在气泡里；必须持有 reactive 代理
         const item = reactive<ChatItem>({ role: "assistant", content: "", streaming: true });
@@ -327,12 +341,29 @@ onBeforeUnmount(() => {
 async function send() {
   const text = draft.value.trim();
   if (!text || busy.value) return;
+  cancelRequested = false;
   draft.value = "";
   busy.value = true;
+  // modifyTarget 只由 [修改此资产] / 右键菜单设定，点文件不会触发修改
+  const modify = props.area === "blender" && !!props.selectedAsset;
   try {
     const params: Record<string, unknown> = { area: props.area, text };
-    if (props.area === "blender") params.mode = mode.value;
-    const result = await props.client.request<{ accepted?: boolean }>("chat.send", params);
+    if (modify) {
+      params.mode = "modify";
+      params.asset = props.selectedAsset;
+    } else if (props.area === "blender") {
+      params.mode = mode.value;
+    }
+    const result = await props.client.request<{ accepted?: boolean; error?: string }>(
+      "chat.send",
+      params,
+    );
+    if (result?.error === "no-blend-source") {
+      window.alert("无法修改此资产：源文件已不存在，请重新选择。");
+      emit("clearAsset");
+    } else if (result?.accepted !== false && modify) {
+      emit("clearAsset"); // 一次修改一条指令
+    }
     if (result?.accepted === false) busy.value = false;
   } catch (error) {
     busy.value = false;
@@ -347,6 +378,7 @@ function removeDraft(item: ChatItem) {
 
 async function sendDraft(item: ChatItem, text: string) {
   if (busy.value) return;
+  cancelRequested = false;
   busy.value = true;
   try {
     const result = await props.client.request<{ accepted?: boolean }>("draft.send", {
@@ -376,9 +408,11 @@ async function cancelDraft(item: ChatItem) {
 }
 
 async function cancelTask() {
+  cancelRequested = true;
   try {
     await props.client.request("chat.cancel", { area: props.area });
   } catch (error) {
+    cancelRequested = false; // 取消没送达：任务可能还在跑，别把后续输出吞掉
     pushError(error instanceof Error ? error.message : "停止失败");
   } finally {
     // 取消后不收口会留下永久 streaming 气泡，下一次发送就看不到转圈
@@ -393,12 +427,16 @@ async function cancelTask() {
 // 选完目录已开工：清场/首次请求期间也要转圈，不能等 task.progress 才有反馈
 function onPickClosed(started?: boolean) {
   pick.value = null;
-  if (started) busy.value = true;
+  if (started) {
+    cancelRequested = false;
+    busy.value = true;
+  }
 }
 
 // 步数耗尽的失败卡：不清场续跑，旧会话与分组位置都在后端
 async function resumeWork(item: ChatItem) {
   if (busy.value) return;
+  cancelRequested = false;
   busy.value = true;
   try {
     const result = await props.client.request<{ ok?: boolean; error?: string }>("chat.continue", {
@@ -497,7 +535,9 @@ function onKeydown(event: KeyboardEvent) {
             <span>第 {{ message.groupIndex }}/{{ message.groupCount }} 组 · {{ message.title }}</span>
           </div>
           <div v-else class="bubble" :class="[message.role, { streaming: message.streaming }]">
-            <div class="md" v-html="renderMarkdown(message.content ?? '')" />
+            <!-- 流式期间按纯文本渲染：每个 token 全量 markdown parse+sanitize 会拖死 UI -->
+            <div v-if="message.streaming" class="md stream-plain">{{ message.content }}</div>
+            <div v-else class="md" v-html="renderMarkdown(message.content ?? '')" />
             <i v-if="message.streaming" class="caret" />
           </div>
         </template>
@@ -524,10 +564,18 @@ function onKeydown(event: KeyboardEvent) {
     </div>
 
     <footer class="chat-input">
+      <div v-if="selectedAsset" class="asset-chip">
+        <span>目标资产：{{ assetName }}</span>
+        <button type="button" title="取消修改目标" @click="emit('clearAsset')">✕</button>
+      </div>
       <textarea
         v-model="draft"
         rows="3"
-        placeholder="输入消息，Enter 发送，Shift+Enter 换行"
+        :placeholder="
+          selectedAsset
+            ? '描述要怎么修改这个资产，Enter 发送'
+            : '输入消息，Enter 发送，Shift+Enter 换行'
+        "
         @keydown="onKeydown"
       />
       <div class="chat-actions">
@@ -687,6 +735,39 @@ function onKeydown(event: KeyboardEvent) {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+/* 输入框上方的修改目标，提交成功后由 App 清空 */
+.asset-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.asset-chip button {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.asset-chip button:hover {
+  color: var(--text);
+  border-color: var(--muted);
 }
 
 .group-divider {

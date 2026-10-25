@@ -66,9 +66,12 @@ QString blenderSystemPrompt()
         "（execute_blender_code 等）完成低模场景：先清场再分组建造，"
         "必要时截图查看结果并修正；全部完成后按规范导出并落盘。\n"
         "沟通方式（必须遵守）：全程用简体中文（对象名、代码、文件路径除外），"
-        "不要用英文写进度说明或最终回复。每一轮先用 1~2 句中文说明这一步要做什么、"
-        "依据是什么，再调用工具，不要只发工具调用不解释；工具返回截图后，先看图，"
-        "再用中文说明看到了什么、是否达标、下一步怎么改。\n"
+        "不要用英文写进度说明或最终回复。每一轮先用 1 句中文说明这一步要做什么、"
+        "依据是什么，再调用工具，不要只发工具调用不解释；工具返回截图后，"
+        "只看关键问题，用中文说明是否达标、下一步怎么改，不要复述截图里的细节。"
+        "中间轮次不要写验收报告：每组建造完成时最多 2 句（做了什么、是否完成），"
+        "不要列坐标、顶点误差、BVH/包围盒、材质或动作通道等测量数据；"
+        "不要复述系统消息或用户消息里的指令原文，例如“按提示词要求”“按你给的脚本”。\n"
         "硬性约束（Unity 导入与跨工具复用依赖这三条，不得违反）：\n"
         "1. 场景单位为米：1 Blender 单位 = 1 米（门高约 2.1，楼层约 3，人眼高 1.65）。\n"
         "2. 每个道具的 origin 落在包围盒底部中心，摆到平面上不悬空。\n"
@@ -400,7 +403,8 @@ void AgentOrchestrator::startGroup()
             QStringLiteral("\n摆放要求（相对关系优先，具体坐标自行根据已有物体的包围盒推算）：\n%1")
                 .arg(lines.join('\n'));
     }
-    content += QStringLiteral("\n放置前先查询场景中已有物体的位置与尺寸，避免重叠。完成后停止调用工具。");
+    content += QStringLiteral("\n放置前先查询场景中已有物体的位置与尺寸，避免重叠。"
+                              "完成后停止调用工具；本组结束只回 1 句结果，不写验收报告。");
     m_messages.append(QJsonObject{{"role", "user"}, {"content", content}});
     m_stream.clear();
     tick();
@@ -428,8 +432,9 @@ void AgentOrchestrator::onTurnFinished() // 一轮 LLM 无工具调用时进入
             content +=
                 QStringLiteral("\n本任务布局约束（逐条核对，不满足则修正后再结束）：\n- %1")
                     .arg(m_plan.rules.join(QStringLiteral("\n- ")));
-        content += QStringLiteral("\n调用截图工具检查本组结果，缺漏、悬空、穿过其他物体或明显偏差"
-                                  "立即补建修正；确认无误后停止调用工具。");
+        content += QStringLiteral("\n只做一次自检：最多截图 1 次，只对照验收标准检查；发现问题才修，"
+                                  "修完最多再截 1 次确认。不要逐项复述物体坐标、间隙或贴图状态；"
+                                  "确认无误就回一句“自检通过”并立即停止调用工具；不要复述本条要求。");
         m_messages.append(QJsonObject{{"role", "user"}, {"content", content}});
         m_stream.clear();
         tick();
@@ -445,36 +450,57 @@ void AgentOrchestrator::onTurnFinished() // 一轮 LLM 无工具调用时进入
     if (!m_exporting) {
         finishTurnText();
         m_exporting = true; // 最后一轮：按规格 5.5 导出三件套并保存源文件
-        m_messages.append(QJsonObject{
-            {"role", "user"},
-            {"content",
-             QStringLiteral(
-                 "全部组已完成。现在执行导出（execute_blender_code），把下面脚本原样执行，"
-                 "只把 <BASENAME> 换成草稿命名清单里的英文基名；基名撞车会自动加序号，不要改逻辑：\n"
-                 "import bpy, os\n"
-                 "folder = r\"%1\"\n"
-                 "name = \"<BASENAME>\"\n"
-                 "base, n = name, 1\n"
-                 "while os.path.exists(os.path.join(folder, base + \".blend\")):\n"
-                 "    n += 1\n"
-                 "    base = name + \"_\" + str(n)\n"
-                 "bpy.ops.export_scene.gltf(filepath=os.path.join(folder, base + \".glb\"),\n"
-                 "                          export_format='GLB', export_animations=True,\n"
-                 "                          export_animation_mode='ACTIONS', export_frame_range=True)\n"
-                 "bpy.ops.export_scene.fbx(filepath=os.path.join(folder, base + \".fbx\"))\n"
-                 "bpy.ops.file.pack_all()\n"
-                 "prefs = bpy.context.preferences.filepaths\n"
-                 "old_save_version = prefs.save_version\n"
-                 "prefs.save_version = 0\n"
-                 "try:\n"
-                 "    bpy.ops.wm.save_as_mainfile(filepath=os.path.join(folder, base + \".blend\"))\n"
-                 "finally:\n"
-                 "    prefs.save_version = old_save_version\n"
-                 "print('EXPORTED_BASE=' + base)\n"
-                 "不要删除场景里已有的关键帧动画（导出时它们会作为 GLB 动画保留）。"
-                 "三个文件必须同基名；如果 base 和 name 不同（加了序号），在最终回复里告诉用户实际文件名；"
-                 "本次任务只执行一次导出，不要改名或再次保存；导出完成后停止调用工具。")
-                 .arg(m_targetFolder)}});
+        // 修改任务已有目标基名：直接覆盖，不能让“撞名加序号”把修改变成新建
+        const bool overwrite = !m_plan.targetBase.isEmpty();
+        const QString baseHint =
+            overwrite ? QStringLiteral(" \"%1\"（覆盖同名文件，不要加序号）").arg(m_plan.targetBase)
+                      : QStringLiteral("草稿命名清单里的英文基名");
+        QString prompt =
+            QStringLiteral("全部组已完成。不要再做场景体检、不要截图，也不要重复前面已确认的结论；"
+                           "现在执行导出（execute_blender_code），把下面脚本原样执行，"
+                           "只把 <BASENAME> 换成%1，不要改逻辑：\n"
+                           "import bpy, os\n"
+                           "folder = r\"%2\"\n"
+                           "name = \"<BASENAME>\"\n")
+                .arg(baseHint, m_targetFolder);
+        if (overwrite) {
+            prompt += QStringLiteral("base = name\n");
+        } else {
+            prompt += QStringLiteral("base, n = name, 1\n"
+                                     "while os.path.exists(os.path.join(folder, base + \".blend\")):\n"
+                                     "    n += 1\n"
+                                     "    base = name + \"_\" + str(n)\n");
+        }
+        prompt += QStringLiteral(
+            "bpy.ops.export_scene.gltf(filepath=os.path.join(folder, base + \".glb\"),\n"
+            "                          export_format='GLB', export_animations=True,\n"
+            "                          export_animation_mode='ACTIONS', export_frame_range=True)\n"
+            "bpy.ops.export_scene.fbx(filepath=os.path.join(folder, base + \".fbx\"))\n"
+            "bpy.ops.file.pack_all()\n"
+            "prefs = bpy.context.preferences.filepaths\n"
+            "old_save_version = prefs.save_version\n"
+            "prefs.save_version = 0\n"
+            "try:\n"
+            "    bpy.ops.wm.save_as_mainfile(filepath=os.path.join(folder, base + \".blend\"))\n"
+            "finally:\n"
+            "    prefs.save_version = old_save_version\n"
+            "print('EXPORTED_BASE=' + base)\n");
+        prompt += overwrite
+                      ? QStringLiteral("不要删除场景里已有的关键帧动画（导出时它们会作为 GLB 动画保留）。"
+                                       "三个文件必须同基名并覆盖原文件；本次任务只执行一次导出，"
+                                       "不要改名或再次保存；导出完成后停止调用工具。")
+                      : QStringLiteral(
+                            "不要删除场景里已有的关键帧动画（导出时它们会作为 GLB 动画保留）。"
+                            "三个文件必须同基名；如果 base 和 name 不同（加了序号），"
+                            "在最终回复里告诉用户实际文件名；"
+                            "本次任务只执行一次导出，不要改名或再次保存；导出完成后停止调用工具。");
+        // 收尾只留结论与清单，别把工具日志/警告/文件大小全复述一遍
+        prompt += QStringLiteral(
+            "最终回复保持简短：先给一句结论，再用最多 5 条清单列出改了什么或产出了什么；"
+            "不要复述本条要求或脚本内容；"
+            "不要罗列文件大小、节点/材质数量、工具日志、警告或备份文件；"
+            "只有失败、改名或需要用户处理时才补充一句说明。");
+        m_messages.append(QJsonObject{{"role", "user"}, {"content", prompt}});
         m_stream.clear();
         tick();
         return;
@@ -505,7 +531,8 @@ void AgentOrchestrator::tick()
              [this]() {
                  if (m_pendingToolCalls == 0 && !m_awaitingTools)
                      onTurnFinished();
-             }});
+             }},
+        m_area); // tag = 区名，chat.cancel 才能真正断掉在途流
 }
 
 void AgentOrchestrator::executeToolCalls(const QJsonArray& calls)

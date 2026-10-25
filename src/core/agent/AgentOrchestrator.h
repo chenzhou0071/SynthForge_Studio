@@ -35,6 +35,8 @@ struct BuildPlan
     QVector<BuildGroup> groups;
     QStringList rules;                    // 本任务特有的跨组布局约束
     int maxSteps = 50;
+    // 修改已有资产：导出时以此基名覆盖同名 glb/fbx/blend，不走“撞名加序号”
+    QString targetBase;
 };
 
 // planReady 的 JSON → BuildPlan（plan.confirm 选完目录后交给 execute）

@@ -4,10 +4,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import ChatPanel from "./ChatPanel.vue";
 import { FakeClient } from "../testing/fakeClient";
 
-function mountPanel(area: "blender" | "unity" = "blender", setup?: (client: FakeClient) => void) {
+function mountPanel(
+  area: "blender" | "unity" = "blender",
+  setup?: (client: FakeClient) => void,
+  props: Record<string, unknown> = {},
+) {
   const client = new FakeClient();
   setup?.(client);
-  const wrapper = mount(ChatPanel, { props: { area, client: client.asClient() } });
+  const wrapper = mount(ChatPanel, { props: { area, client: client.asClient(), ...props } });
   return { client, wrapper };
 }
 
@@ -66,6 +70,21 @@ describe("ChatPanel", () => {
     expect(wrapper.find(".bubble.streaming").exists()).toBe(false);
     expect(wrapper.text()).toContain("你好呀");
     expect(wrapper.text().match(/你好呀/g)).toHaveLength(1);
+  });
+
+  it("renders streaming text literally until the turn is finalized", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+
+    client.emit("chat.delta", { area: "blender", text: "**粗体**" });
+    await flushPromises();
+    // 流式期间不做 markdown 解析：每个 token 全量 parse + sanitize 会把渲染线程压死
+    expect(wrapper.find(".bubble.streaming .md").text()).toContain("**粗体**");
+    expect(wrapper.find(".bubble.streaming .md strong").exists()).toBe(false);
+
+    client.emit("chat.turn", { area: "blender", content: "**粗体**" });
+    await flushPromises();
+    expect(wrapper.find(".bubble .md strong").text()).toBe("粗体");
   });
 
   it("stops the streaming caret even when busy was already false", async () => {
@@ -174,6 +193,26 @@ describe("ChatPanel", () => {
     expect(wrapper.find(".bubble.pending").exists()).toBe(true);
   });
 
+  it("keeps the stop button hidden when a late delta arrives after cancel", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.results.set("chat.send", { accepted: true });
+    await wrapper.find("textarea").setValue("长任务");
+    await wrapper.find("button.primary").trigger("click");
+    await flushPromises();
+
+    client.emit("chat.delta", { area: "blender", text: "半截" });
+    await flushPromises();
+    await wrapper.find("button.stop").trigger("click");
+    await flushPromises();
+
+    // abort 已经在路上，但取消前发出的帧可能晚到；不能把 busy/气泡重新拉起来
+    client.emit("chat.delta", { area: "blender", text: "迟到" });
+    await flushPromises();
+    expect(wrapper.find("button.stop").exists()).toBe(false);
+    expect(wrapper.find(".bubble.streaming").exists()).toBe(false);
+  });
+
   it("inserts a divider for every build group", async () => {
     const { client, wrapper } = mountPanel("blender");
     await flushPromises();
@@ -239,6 +278,64 @@ describe("ChatPanel", () => {
 
     wrapper.unmount();
     unity.wrapper.unmount();
+  });
+
+  it("shows the modify target chip and clears it on request", async () => {
+    const { wrapper } = mountPanel("blender", undefined, {
+      selectedAsset: "Props/chair/chair.blend",
+    });
+    await flushPromises();
+
+    const chip = wrapper.find(".asset-chip");
+    expect(chip.exists()).toBe(true);
+    expect(chip.text()).toContain("chair");
+    await chip.find("button").trigger("click");
+
+    expect(wrapper.emitted("clearAsset")).toHaveLength(1);
+  });
+
+  it("sends modify mode with the blend asset and clears the chip after acceptance", async () => {
+    const { client, wrapper } = mountPanel(
+      "blender",
+      (fake) => {
+        fake.results.set("chat.send", { accepted: true });
+      },
+      { selectedAsset: "Props/chair/chair.blend" },
+    );
+    await flushPromises();
+
+    await wrapper.find("textarea").setValue("把椅子改短一点");
+    await wrapper.find("button.primary").trigger("click");
+    await flushPromises();
+
+    expect(client.callsOf("chat.send")[0].params).toMatchObject({
+      area: "blender",
+      mode: "modify",
+      asset: "Props/chair/chair.blend",
+      text: "把椅子改短一点",
+    });
+    expect(wrapper.emitted("clearAsset")).toHaveLength(1); // 一次修改一条指令
+  });
+
+  it("alerts and clears the target when the blend source disappeared", async () => {
+    const alert = vi.spyOn(window, "alert").mockImplementation(() => {});
+    const { client, wrapper } = mountPanel(
+      "blender",
+      (fake) => {
+        fake.results.set("chat.send", { accepted: false, error: "no-blend-source" });
+      },
+      { selectedAsset: "Props/chair/chair.blend" },
+    );
+    await flushPromises();
+
+    await wrapper.find("textarea").setValue("改短一点");
+    await wrapper.find("button.primary").trigger("click");
+    await flushPromises();
+
+    expect(alert).toHaveBeenCalled();
+    expect(wrapper.emitted("clearAsset")).toHaveLength(1);
+    expect(wrapper.find("button.stop").exists()).toBe(false); // 被拒绝，不进入进行中
+    expect(client.callsOf("chat.send")).toHaveLength(1);
   });
 
   it("shows a stop button while busy and cancels through chat.cancel", async () => {
