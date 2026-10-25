@@ -291,6 +291,123 @@ private slots:
         QCOMPARE(item.value(QStringLiteral("kind")).toString(), QStringLiteral("dir"));
     }
 
+    void fileReadServesTextImagesAndModels()
+    {
+        QTemporaryDir dir;
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library + QStringLiteral("/Props")));
+        QFile note(library + QStringLiteral("/Props/notes.json"));
+        QVERIFY(note.open(QIODevice::WriteOnly));
+        note.write("{\"ok\":true}");
+        note.close();
+        QFile png(library + QStringLiteral("/Props/shot.png"));
+        QVERIFY(png.open(QIODevice::WriteOnly));
+        png.write("\x89PNG\r\n\x1a\n");
+        png.close();
+        QFile glb(library + QStringLiteral("/Props/chair.glb"));
+        QVERIFY(glb.open(QIODevice::WriteOnly));
+        glb.write("glTF");
+        glb.close();
+        QFile blend(library + QStringLiteral("/Props/chair.blend"));
+        QVERIFY(blend.open(QIODevice::WriteOnly));
+        blend.write("BLENDER");
+        blend.close();
+        QFile fbx(library + QStringLiteral("/Props/table.fbx")); // 没有同名 .blend：只能显示信息卡
+        QVERIFY(fbx.open(QIODevice::WriteOnly));
+        fbx.write("FBX");
+        fbx.close();
+
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        const QJsonObject text = client.request(QStringLiteral("file.read"),
+                                                {{"area", "blender"},
+                                                 {"path", "Props/notes.json"}})
+                                     .value(QStringLiteral("result"))
+                                     .toObject();
+        QCOMPARE(text.value(QStringLiteral("ok")).toBool(), true);
+        QCOMPARE(text.value(QStringLiteral("kind")).toString(), QStringLiteral("text"));
+        QCOMPARE(text.value(QStringLiteral("content")).toString(), QStringLiteral("{\"ok\":true}"));
+        QCOMPARE(text.value(QStringLiteral("language")).toString(), QStringLiteral("json"));
+
+        const QJsonObject image = client.request(QStringLiteral("file.read"),
+                                                 {{"area", "blender"},
+                                                  {"path", "Props/shot.png"}})
+                                      .value(QStringLiteral("result"))
+                                      .toObject();
+        QCOMPARE(image.value(QStringLiteral("kind")).toString(), QStringLiteral("image"));
+        QVERIFY(image.value(QStringLiteral("dataUrl"))
+                    .toString()
+                    .startsWith(QStringLiteral("data:image/png;base64,")));
+
+        // glb 回可直接给 three.js 的地址，并带上同基名 .blend 供修改入口判定
+        const QJsonObject model = client.request(QStringLiteral("file.read"),
+                                                 {{"area", "blender"},
+                                                  {"path", "Props/chair.glb"}})
+                                      .value(QStringLiteral("result"))
+                                      .toObject();
+        QCOMPARE(model.value(QStringLiteral("kind")).toString(), QStringLiteral("model"));
+        QVERIFY(model.value(QStringLiteral("dataUrl"))
+                    .toString()
+                    .startsWith(QStringLiteral("file://")));
+        QCOMPARE(model.value(QStringLiteral("blendPath")).toString(),
+                 QStringLiteral("Props/chair.blend"));
+
+        const QJsonObject blendInfo = client.request(QStringLiteral("file.read"),
+                                                     {{"area", "blender"},
+                                                      {"path", "Props/chair.blend"}})
+                                          .value(QStringLiteral("result"))
+                                          .toObject();
+        QCOMPARE(blendInfo.value(QStringLiteral("kind")).toString(), QStringLiteral("info"));
+        QVERIFY(blendInfo.value(QStringLiteral("size")).toDouble() > 0);
+        QCOMPARE(blendInfo.value(QStringLiteral("blendPath")).toString(),
+                 QStringLiteral("Props/chair.blend"));
+
+        const QJsonObject fbxInfo = client.request(QStringLiteral("file.read"),
+                                                   {{"area", "blender"},
+                                                    {"path", "Props/table.fbx"}})
+                                        .value(QStringLiteral("result"))
+                                        .toObject();
+        QCOMPARE(fbxInfo.value(QStringLiteral("kind")).toString(), QStringLiteral("info"));
+        QCOMPARE(fbxInfo.value(QStringLiteral("blendPath")).toString(), QString());
+    }
+
+    void fileReadRejectsBadPaths()
+    {
+        QTemporaryDir dir;
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library));
+
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        const QJsonObject escape = client.request(QStringLiteral("file.read"),
+                                                  {{"area", "blender"},
+                                                   {"path", "../outside.txt"}})
+                                       .value(QStringLiteral("result"))
+                                       .toObject();
+        QCOMPARE(escape.value(QStringLiteral("error")).toString(),
+                 QStringLiteral("invalid-path"));
+
+        const QJsonObject missing = client.request(QStringLiteral("file.read"),
+                                                   {{"area", "blender"},
+                                                    {"path", "nope.glb"}})
+                                        .value(QStringLiteral("result"))
+                                        .toObject();
+        QCOMPARE(missing.value(QStringLiteral("error")).toString(), QStringLiteral("not-found"));
+
+        const QJsonObject unity = client.request(QStringLiteral("file.read"),
+                                                 {{"area", "unity"}, {"path", "a.glb"}})
+                                      .value(QStringLiteral("result"))
+                                      .toObject();
+        QCOMPARE(unity.value(QStringLiteral("error")).toString(),
+                 QStringLiteral("area-not-supported"));
+    }
+
     void mkdirFromFolderPickerBroadcastsTreeChange()
     {
         QTemporaryDir dir;

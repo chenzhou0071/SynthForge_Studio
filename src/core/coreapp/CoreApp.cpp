@@ -16,11 +16,13 @@
 #include "core/ws/WsServer.h"
 
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QStandardPaths>
+#include <QUrl>
 
 #include <cstdio>
 #include <memory>
@@ -395,6 +397,79 @@ bool CoreApp::start()
         }
         return QJsonValue(items);
     });
+    m_router->registerHandler(
+        QStringLiteral("file.read"), [this](const QJsonObject& params) {
+            const QString area = params.value("area").toString(QStringLiteral("blender"));
+            if (area != QLatin1String("blender")) // unity 工程内文件由 P6 接管
+                return QJsonValue(
+                    QJsonObject{{"ok", false}, {"error", "area-not-supported"}});
+            const QString path = params.value("path").toString();
+            if (!m_library->isValidTarget(path))
+                return QJsonValue(QJsonObject{{"ok", false}, {"error", "invalid-path"}});
+            const QString abs = m_library->absoluteFor(path);
+            const QFileInfo info(abs);
+            if (!info.exists() || info.isDir())
+                return QJsonValue(QJsonObject{{"ok", false}, {"error", "not-found"}});
+            const QString suffix = info.suffix().toLower();
+            if (QStringList{QStringLiteral("png"), QStringLiteral("jpg"),
+                            QStringLiteral("jpeg"), QStringLiteral("webp")}
+                    .contains(suffix)) {
+                QFile file(abs);
+                if (!file.open(QIODevice::ReadOnly))
+                    return QJsonValue(QJsonObject{{"ok", false}, {"error", "io-error"}});
+                QString mime = QStringLiteral("image/jpeg");
+                if (suffix == QLatin1String("png"))
+                    mime = QStringLiteral("image/png");
+                else if (suffix == QLatin1String("webp"))
+                    mime = QStringLiteral("image/webp");
+                return QJsonValue(
+                    QJsonObject{{"ok", true},
+                                {"kind", "image"},
+                                {"dataUrl", QStringLiteral("data:%1;base64,").arg(mime)
+                                                + QString::fromLatin1(file.readAll().toBase64())}});
+            }
+            if (suffix == QLatin1String("glb")) {
+                // 模型三种格式都回 blendPath：修改入口据此判断有没有可编辑源文件
+                const QFileInfo blend(info.dir().filePath(info.completeBaseName()
+                                                          + QStringLiteral(".blend")));
+                return QJsonValue(QJsonObject{
+                    {"ok", true},
+                    {"kind", "model"},
+                    {"dataUrl", QUrl::fromLocalFile(abs).toString()},
+                    {"blendPath", blend.exists()
+                                      ? m_library->relativeFor(blend.absoluteFilePath())
+                                      : QString()}});
+            }
+            // fbx / blend 不读内容（可能几十 MB），只回文件信息卡
+            if (suffix == QLatin1String("fbx") || suffix == QLatin1String("blend")) {
+                const QFileInfo blend =
+                    suffix == QLatin1String("blend")
+                        ? info
+                        : QFileInfo(info.dir().filePath(info.completeBaseName()
+                                                        + QStringLiteral(".blend")));
+                return QJsonValue(QJsonObject{
+                    {"ok", true},
+                    {"kind", "info"},
+                    {"size", static_cast<double>(info.size())},
+                    {"modified", info.lastModified().toString(Qt::ISODate)},
+                    {"blendPath", blend.exists()
+                                      ? m_library->relativeFor(blend.absoluteFilePath())
+                                      : QString()}});
+            }
+            QFile file(abs);
+            if (!file.open(QIODevice::ReadOnly))
+                return QJsonValue(QJsonObject{{"ok", false}, {"error", "io-error"}});
+            if (file.size() > 2 * 1024 * 1024)
+                return QJsonValue(QJsonObject{{"ok", false}, {"error", "too-large"}});
+            const QString language = suffix == QLatin1String("cs") ? QStringLiteral("csharp")
+                                     : suffix == QLatin1String("lua") ? QStringLiteral("lua")
+                                     : suffix == QLatin1String("json") ? QStringLiteral("json")
+                                                                       : QStringLiteral("typescript");
+            return QJsonValue(QJsonObject{{"ok", true},
+                                          {"kind", "text"},
+                                          {"content", QString::fromUtf8(file.readAll())},
+                                          {"language", language}});
+        });
     m_router->registerHandler(QStringLiteral("fs.operate"),
                               [this](const QJsonObject& params) {
                                   const QString area =

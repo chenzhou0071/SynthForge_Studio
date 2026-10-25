@@ -119,6 +119,57 @@ describe("FileTree", () => {
     expect(client.callsOf("assets.list")).toHaveLength(2);
   });
 
+  it("selects a file when its row is clicked", async () => {
+    const { wrapper } = mountTree("blender", (fake) => {
+      fake.results.set("assets.list", [
+        { name: "chair", relativePath: "Props/chair.glb", kind: "glb" },
+      ]);
+    });
+    await flushPromises();
+
+    await wrapper.find(".tree-file").trigger("click");
+    expect(wrapper.emitted("select")?.[0]).toEqual(["Props/chair.glb"]);
+  });
+
+  it("does not treat a folder click as a file selection", async () => {
+    const { wrapper } = mountTree("blender", (fake) => {
+      fake.results.set("assets.list", [
+        { name: "Empty", relativePath: "Empty", kind: "dir" },
+      ]);
+    });
+    await flushPromises();
+
+    await wrapper.find(".tree-dir").trigger("click");
+    expect(wrapper.emitted("select")).toBeUndefined();
+  });
+
+  it("offers 修改此资产 on file rows but not on folders", async () => {
+    const { wrapper } = mountTree("blender", (fake) => {
+      fake.results.set("assets.list", [
+        { name: "chair", relativePath: "Props/chair.blend", kind: "blend" },
+      ]);
+    });
+    await flushPromises();
+
+    await wrapper.findAll(".tree-dir")[0].trigger("contextmenu", { clientX: 20, clientY: 30 });
+    expect(menuItems(wrapper).map((item) => item.text())).not.toContain("修改此资产");
+
+    await wrapper.find(".tree-file").trigger("contextmenu", { clientX: 20, clientY: 50 });
+    const items = menuItems(wrapper);
+    expect(items.map((item) => item.text())).toEqual([
+      "新建文件夹",
+      "重命名",
+      "删除",
+      "在资源管理器中显示",
+      "刷新",
+      "修改此资产",
+    ]);
+
+    await items[5].trigger("click");
+    expect(wrapper.emitted("modify")?.[0]).toEqual(["Props/chair.blend"]);
+    expect(wrapper.find(".ctx-menu").exists()).toBe(false);
+  });
+
   it("opens the five-item context menu on the tree body", async () => {
     const { wrapper } = mountTree();
     expect(wrapper.find(".ctx-menu").exists()).toBe(false);

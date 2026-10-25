@@ -28,6 +28,7 @@ interface Row {
 }
 
 const props = defineProps<{ area: Area; client: WsClient }>();
+const emit = defineEmits<{ select: [path: string]; modify: [path: string] }>();
 
 const menu = ref<{ x: number; y: number; path: string; isEntry: boolean; isDir: boolean } | null>(
   null,
@@ -120,6 +121,19 @@ function toggleDir(row: Row) {
   if (row.kind !== "dir") return;
   if (collapsed.value.has(row.path)) collapsed.value.delete(row.path);
   else collapsed.value.add(row.path);
+}
+
+// 点目录折叠/展开，点文件只预览；是否进入修改流程由右键菜单或预览区按钮决定
+function onRowClick(row: Row) {
+  if (row.kind === "dir") toggleDir(row);
+  else emit("select", row.path);
+}
+
+function openModify() {
+  const target = menu.value;
+  if (!target || target.isDir) return;
+  closeMenu();
+  emit("modify", target.path);
 }
 
 function openMenu(event: MouseEvent, path: string, isEntry: boolean, isDir = false) {
@@ -237,7 +251,7 @@ async function runOp(op: Op) {
           :class="row.kind === 'dir' ? 'tree-dir' : 'tree-file'"
           :style="{ paddingLeft: 6 + row.depth * 14 + 'px' }"
           :data-path="row.path"
-          @click="toggleDir(row)"
+          @click="onRowClick(row)"
           @contextmenu.prevent.stop="openRowMenu($event, row)"
         >
           <span class="tree-icon">{{ row.kind === "dir" ? (collapsed.has(row.path) ? "▸" : "▾") : "" }}</span>
@@ -274,6 +288,7 @@ async function runOp(op: Op) {
       <li :class="{ disabled: !menu.isEntry }" @click="runOp('delete')">删除</li>
       <li @click="runOp('reveal')">在资源管理器中显示</li>
       <li @click="runOp('refresh')">刷新</li>
+      <li v-if="menu.isEntry && !menu.isDir" @click="openModify">修改此资产</li>
     </ul>
   </aside>
 </template>

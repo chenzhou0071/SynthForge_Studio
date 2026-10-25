@@ -1,4 +1,4 @@
-export type PreviewKind = "text" | "image" | "info";
+export type PreviewKind = "text" | "image" | "info" | "model";
 
 // 预览区的数据契约：P4 的 asset.created / file.read 负责填充，kind=model 由 P4 接管
 export interface PreviewFile {
@@ -7,4 +7,7 @@ export interface PreviewFile {
   content?: string;
   dataUrl?: string;
   language?: string;
+  size?: number; // info：字节数
+  modified?: string; // info：ISO 时间
+  blendPath?: string; // 模型文件同名 .blend 相对路径，无则为空
 }
