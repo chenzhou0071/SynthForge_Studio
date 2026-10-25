@@ -1,4 +1,6 @@
+#include <QDir>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QHostAddress>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -216,6 +218,113 @@ private slots:
 
         const QJsonObject unknown = client.request(QStringLiteral("no.such.method"), {});
         QVERIFY(unknown.contains("error"));
+    }
+
+    void newClientReceivesConnStatusSnapshot()
+    {
+        QTemporaryDir dir;
+        CoreApp app({dir.path(), true, dir.filePath(QStringLiteral("library"))});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        // 页面晚于桥接加载：快照必须在连接建立时补发，否则顶栏永远灰灯
+        client.request(QStringLiteral("assets.list"), {}); // 抽干队列里的帧
+        QVERIFY(client.eventsSince(0).contains(QStringLiteral("conn.status")));
+    }
+
+    void assetsListScansLibraryFiles()
+    {
+        QTemporaryDir dir;
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library + QStringLiteral("/Props")));
+        QFile glb(library + QStringLiteral("/Props/chair.glb"));
+        QVERIFY(glb.open(QIODevice::WriteOnly));
+        glb.write("glTF");
+        glb.close();
+
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        const QJsonArray items = client.request(QStringLiteral("assets.list"), {})
+                                     .value(QStringLiteral("result"))
+                                     .toArray();
+        QCOMPARE(items.size(), 2); // Props 目录 + chair.glb
+        QJsonObject item;
+        bool sawDir = false;
+        for (const QJsonValue& value : items) {
+            const QJsonObject entry = value.toObject();
+            if (entry.value(QStringLiteral("kind")).toString() == QLatin1String("dir")) {
+                sawDir = entry.value(QStringLiteral("relativePath")).toString()
+                         == QLatin1String("Props");
+            } else {
+                item = entry;
+            }
+        }
+        QVERIFY(sawDir);
+        QCOMPARE(item.value(QStringLiteral("relativePath")).toString(),
+                 QStringLiteral("Props/chair.glb"));
+        QCOMPARE(item.value(QStringLiteral("kind")).toString(), QStringLiteral("glb"));
+        QCOMPARE(item.value(QStringLiteral("name")).toString(), QStringLiteral("chair"));
+    }
+
+    // 用户新建的空文件夹可能一个模型都没有，也必须出现在 assets.list 里
+    void assetsListIncludesEmptyFolders()
+    {
+        QTemporaryDir dir;
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library + QStringLiteral("/test1")));
+
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        const QJsonArray items = client.request(QStringLiteral("assets.list"), {})
+                                     .value(QStringLiteral("result"))
+                                     .toArray();
+        QCOMPARE(items.size(), 1);
+        const QJsonObject item = items.first().toObject();
+        QCOMPARE(item.value(QStringLiteral("relativePath")).toString(), QStringLiteral("test1"));
+        QCOMPARE(item.value(QStringLiteral("kind")).toString(), QStringLiteral("dir"));
+    }
+
+    void mkdirFromFolderPickerBroadcastsTreeChange()
+    {
+        QTemporaryDir dir;
+        const QString library = dir.filePath(QStringLiteral("library"));
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        const int mark = client.mark();
+        const QJsonObject result = client.request(QStringLiteral("folderPick.mkdir"),
+                                                  {{"path", ""}, {"name", "Props"}})
+                                       .value(QStringLiteral("result"))
+                                       .toObject();
+        QCOMPARE(result.value(QStringLiteral("ok")).toBool(), true);
+        QVERIFY(QDir(library + QStringLiteral("/Props")).exists());
+        QVERIFY(client.eventsSince(mark).contains(QStringLiteral("fileTree.changed")));
+    }
+
+    // 没有可续跑的执行现场时必须明确拒绝，而不是静默入队或崩溃
+    void continueWithoutFailureIsRejected()
+    {
+        QTemporaryDir dir;
+        CoreApp app({dir.path(), true, dir.filePath(QStringLiteral("library"))});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        const QJsonObject result =
+            client.request(QStringLiteral("chat.continue"), {{"area", "blender"}})
+                .value(QStringLiteral("result"))
+                .toObject();
+        QCOMPARE(result.value(QStringLiteral("error")).toString(),
+                 QStringLiteral("nothing-to-resume"));
     }
 
     void retryAndClearRoundTrip()

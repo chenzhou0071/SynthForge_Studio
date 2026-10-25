@@ -22,6 +22,8 @@ const char* kPlanSystemPrompt =
     "\"acceptance\":\"自检时截图检查什么\"}]}。"
     "要求：3~6 组，覆盖用户提示词中全部必须独立的物体与数量下限；按施工顺序排列"
     "（底座环境 → 建筑外观 → 室内陈设 → 灯光特效）。"
+    "可以在主题内合理补充道具（车辆、路牌、摊贩等），但不得添加与主题无关的物体，"
+    "也不得为凑组数拆出杂物组；留白优先于堆砌。"
     "items 里的每个物体必须在 placements 里有一条同名条目；where 只写相对关系不写绝对坐标"
     "（如「商店北侧边缘，正门朝 -Y」「招牌在正门上方，离地 2.8 米」）。"
     "rules 只写本任务特有、跨组生效的约束（如「树不遮挡招牌」「路灯每 8 米一盏」），"
@@ -29,40 +31,19 @@ const char* kPlanSystemPrompt =
 
 int planBudget(int groupCount)
 {
-    return qMin(8 * groupCount + 10, 60);
+    // 一组通常要对着 5~7 个物体反复建/截图/修正，一次工具调用不算一步，但一轮对话算一步：
+    // 30/组留足重试余量（4 组 120 步），封顶 200 防止计划器拆组过多时无限膨胀。
+    return qMin(30 * groupCount, 200);
 }
 
 BuildPlan parsePlan(const QString& text)
 {
-    BuildPlan plan;
     const int start = text.indexOf('{');
     const int end = text.lastIndexOf('}');
     if (start < 0 || end <= start)
-        return plan; // 空计划 = 解析失败
-    const QJsonObject obj =
-        QJsonDocument::fromJson(text.mid(start, end - start + 1).toUtf8()).object();
-    for (const QJsonValue& rule : obj.value(QStringLiteral("rules")).toArray())
-        plan.rules << rule.toString();
-    for (const QJsonValue& value : obj.value(QStringLiteral("groups")).toArray()) {
-        const QJsonObject item = value.toObject();
-        BuildGroup group;
-        group.title = item.value(QStringLiteral("title")).toString();
-        for (const QJsonValue& name : item.value(QStringLiteral("items")).toArray())
-            group.items << name.toString();
-        for (const QJsonValue& entry : item.value(QStringLiteral("placements")).toArray()) {
-            const QJsonObject entryObj = entry.toObject();
-            BuildPlacement placement;
-            placement.name = entryObj.value(QStringLiteral("name")).toString();
-            placement.where = entryObj.value(QStringLiteral("where")).toString();
-            if (!placement.name.isEmpty() && !placement.where.isEmpty())
-                group.placements.push_back(placement);
-        }
-        group.acceptance = item.value(QStringLiteral("acceptance")).toString();
-        if (!group.title.isEmpty())
-            plan.groups.push_back(group);
-    }
-    plan.maxSteps = planBudget(plan.groups.size());
-    return plan;
+        return {}; // 空计划 = 解析失败
+    return buildPlanFromJson(
+        QJsonDocument::fromJson(text.mid(start, end - start + 1).toUtf8()).object());
 }
 
 BuildPlan defaultPlan()
@@ -84,6 +65,10 @@ QString blenderSystemPrompt()
         "你是 SynthForge Studio 的 Blender 建模 agent。使用提供的 MCP 工具"
         "（execute_blender_code 等）完成低模场景：先清场再分组建造，"
         "必要时截图查看结果并修正；全部完成后按规范导出并落盘。\n"
+        "沟通方式（必须遵守）：全程用简体中文（对象名、代码、文件路径除外），"
+        "不要用英文写进度说明或最终回复。每一轮先用 1~2 句中文说明这一步要做什么、"
+        "依据是什么，再调用工具，不要只发工具调用不解释；工具返回截图后，先看图，"
+        "再用中文说明看到了什么、是否达标、下一步怎么改。\n"
         "硬性约束（Unity 导入与跨工具复用依赖这三条，不得违反）：\n"
         "1. 场景单位为米：1 Blender 单位 = 1 米（门高约 2.1，楼层约 3，人眼高 1.65）。\n"
         "2. 每个道具的 origin 落在包围盒底部中心，摆到平面上不悬空。\n"
@@ -93,7 +78,15 @@ QString blenderSystemPrompt()
         "5. 建每个新物体前，先用 execute_blender_code 遍历 bpy.data.objects，"
         "读出已有物体的 location 与 dimensions；新物体的水平投影不得与它们交叠。\n"
         "6. 场景中心在原点，主建筑正面朝 -Y，人行道沿 X 轴展开。\n"
-        "7. 常用尺寸（米）：树 4~6，路灯 5，路牌 2.5，门 2.1，楼层 3，人 1.75。");
+        "7. 常用尺寸（米）：树 4~6，路灯 5，路牌 2.5，门 2.1，楼层 3，人 1.75。\n"
+        "8. 底座边长按真实尺度反推：必须放得下主体完整立面、入口前至少 2 米人行道"
+        "与近景道具；不得为了压缩画面把主体、门窗或道具做小。\n"
+        "9. 不得添加与主题无关的物体；贴合主题的合理补充（车辆、路牌、摊贩等）"
+        "可作为独立物体加入，并在说明里交代。\n"
+        "10. 灯光必须是真实光源对象（AREA/POINT/SPOT/SUN），室内每个空间至少一盏；"
+        "不要用自发光平面、光雾、飞虫、湿地面或贴图冒充照明。光粒子、光雾可以用粒子/着色器"
+        "增强氛围，但必须有真实光源支撑；不要默认生成飞虫、湿地面、积水等元素，用户明确要求时"
+        "才做，且不得用几何体冒充。");
 }
 
 // 截图为 image content 时压成 JPEG base64：同一份结果既回喂模型又给前端展示
@@ -143,6 +136,35 @@ QJsonObject toolResultMessage(const QString& callId, const QJsonValue& result,
 
 } // namespace
 
+// 规划器输出与 planReady 下发用同一套字段名；plan.confirm 靠它还原成可执行计划
+BuildPlan buildPlanFromJson(const QJsonObject& json)
+{
+    BuildPlan plan;
+    for (const QJsonValue& rule : json.value(QStringLiteral("rules")).toArray())
+        plan.rules << rule.toString();
+    for (const QJsonValue& value : json.value(QStringLiteral("groups")).toArray()) {
+        const QJsonObject item = value.toObject();
+        BuildGroup group;
+        group.title = item.value(QStringLiteral("title")).toString();
+        for (const QJsonValue& name : item.value(QStringLiteral("items")).toArray())
+            group.items << name.toString();
+        for (const QJsonValue& entry : item.value(QStringLiteral("placements")).toArray()) {
+            const QJsonObject entryObj = entry.toObject();
+            BuildPlacement placement;
+            placement.name = entryObj.value(QStringLiteral("name")).toString();
+            placement.where = entryObj.value(QStringLiteral("where")).toString();
+            if (!placement.name.isEmpty() && !placement.where.isEmpty())
+                group.placements.push_back(placement);
+        }
+        group.acceptance = item.value(QStringLiteral("acceptance")).toString();
+        if (!group.title.isEmpty())
+            plan.groups.push_back(group);
+    }
+    const int totalSteps = json.value(QStringLiteral("totalSteps")).toInt(); // 规划阶段已封顶
+    plan.maxSteps = totalSteps > 0 ? totalSteps : planBudget(plan.groups.size());
+    return plan;
+}
+
 AgentOrchestrator::AgentOrchestrator(LlmGateway* llm, McpClient* mcp, QObject* parent)
     : QObject(parent)
     , m_llm(llm)
@@ -167,6 +189,7 @@ void AgentOrchestrator::plan(const QString& taskId, TaskManager* tm, const QStri
     m_tm = tm;
     m_prompt = prompt;
     m_area = area;
+    m_resumable = false; // 新指令作废旧的续跑现场
     m_planning.insert(area);
     attemptPlan(0);
 }
@@ -236,6 +259,7 @@ void AgentOrchestrator::execute(const QString& taskId, TaskManager* tm, const QJ
     m_targetFolder = targetFolder;
     m_startedAt = QDateTime::currentDateTime();
     m_exporting = false;
+    m_resumable = false;
     if (m_plan.groups.isEmpty()) {
         fail(QStringLiteral("empty-plan"));
         return;
@@ -284,6 +308,30 @@ for coll in (bpy.data.meshes, bpy.data.materials, bpy.data.images,
                     });
 }
 
+void AgentOrchestrator::resume(const QString& taskId, TaskManager* tm)
+{
+    if (!m_resumable || m_plan.groups.isEmpty()) {
+        if (tm)
+            tm->finish(taskId); // 没现场可续：别把任务挂在队列里
+        return;
+    }
+    m_taskId = taskId;
+    m_tm = tm;
+    if (m_gate && m_area == QLatin1String("blender")) {
+        if (!m_gate->tryAcquire(QStringLiteral("blender-agent"))) {
+            fail(QStringLiteral("blender-busy")); // 忙：保留续跑资格，稍后可再点
+            return;
+        }
+        m_gateHeld = true;
+    }
+    m_resumable = false;
+    // 用户显式授权继续：跟主预算同档（30/组），加上收尾余量，单次最多 200 步
+    const int remaining = qMax(1, m_plan.groups.size() - m_groupIndex);
+    m_maxSteps += qMin(30 * remaining + 20, 200);
+    m_stream.clear();
+    tick(); // 不清场、不重发分组指令：接着上一轮的会话往下跑
+}
+
 QJsonArray AgentOrchestrator::initialMessages(const QString& system, const QString& user) const
 {
     QJsonArray messages{QJsonObject{{"role", "system"}, {"content", system}}};
@@ -303,6 +351,7 @@ void AgentOrchestrator::releaseGate()
 void AgentOrchestrator::finishCancelled()
 {
     m_planning.remove(m_area);
+    m_resumable = false;
     releaseGate();
     if (m_tm)
         m_tm->finish(m_taskId); // TaskManager 已记录取消，finished(cancelled=true)
@@ -323,6 +372,9 @@ void AgentOrchestrator::fail(const QString& reason)
     const QString normalized = reason == QLatin1String("max steps exceeded")
                                    ? QStringLiteral("max-steps-exceeded")
                                    : reason;
+    // 只有步数耗尽值得续跑；busy 是暂时的，不清掉已攒下的续跑资格
+    m_resumable = normalized == QLatin1String("max-steps-exceeded")
+                  || (m_resumable && normalized == QLatin1String("blender-busy"));
     emit failed(m_area, normalized);
     releaseGate();
     if (m_tm)
@@ -354,9 +406,19 @@ void AgentOrchestrator::startGroup()
     tick();
 }
 
+void AgentOrchestrator::finishTurnText()
+{
+    // 文字只属于当前这一轮：先收口再进入工具/下一组，避免下一轮的话续到上一个气泡
+    const QString text = m_stream;
+    m_stream.clear();
+    if (!text.trimmed().isEmpty())
+        emit turnFinished(m_area, text);
+}
+
 void AgentOrchestrator::onTurnFinished() // 一轮 LLM 无工具调用时进入
 {
     if (m_phase == GroupPhase::Build) {
+        finishTurnText();
         m_phase = GroupPhase::SelfCheck;
         const BuildGroup& group = m_plan.groups[m_groupIndex];
         QString content = QStringLiteral("第 %1 组建造结束。请对照验收标准：%2。")
@@ -374,12 +436,14 @@ void AgentOrchestrator::onTurnFinished() // 一轮 LLM 无工具调用时进入
         return;
     }
     if (m_groupIndex + 1 < m_plan.groups.size()) {
+        finishTurnText();
         ++m_groupIndex;
         m_phase = GroupPhase::Build;
         startGroup();
         return;
     }
     if (!m_exporting) {
+        finishTurnText();
         m_exporting = true; // 最后一轮：按规格 5.5 导出三件套并保存源文件
         m_messages.append(QJsonObject{
             {"role", "user"},
@@ -399,11 +463,17 @@ void AgentOrchestrator::onTurnFinished() // 一轮 LLM 无工具调用时进入
                  "                          export_animation_mode='ACTIONS', export_frame_range=True)\n"
                  "bpy.ops.export_scene.fbx(filepath=os.path.join(folder, base + \".fbx\"))\n"
                  "bpy.ops.file.pack_all()\n"
-                 "bpy.ops.wm.save_as_mainfile(filepath=os.path.join(folder, base + \".blend\"))\n"
+                 "prefs = bpy.context.preferences.filepaths\n"
+                 "old_save_version = prefs.save_version\n"
+                 "prefs.save_version = 0\n"
+                 "try:\n"
+                 "    bpy.ops.wm.save_as_mainfile(filepath=os.path.join(folder, base + \".blend\"))\n"
+                 "finally:\n"
+                 "    prefs.save_version = old_save_version\n"
                  "print('EXPORTED_BASE=' + base)\n"
                  "不要删除场景里已有的关键帧动画（导出时它们会作为 GLB 动画保留）。"
                  "三个文件必须同基名；如果 base 和 name 不同（加了序号），在最终回复里告诉用户实际文件名；"
-                 "导出完成后停止调用工具。")
+                 "本次任务只执行一次导出，不要改名或再次保存；导出完成后停止调用工具。")
                  .arg(m_targetFolder)}});
         m_stream.clear();
         tick();
@@ -442,9 +512,12 @@ void AgentOrchestrator::executeToolCalls(const QJsonArray& calls)
 {
     m_awaitingTools = true;
     m_pendingToolCalls = calls.size();
+    // 先说话再干活：工具调用前的交代单独收口，截图回来后的下一段另起气泡
+    const QString turnText = m_stream;
+    finishTurnText();
     // calls 是 LlmGateway 的内部格式 {id,name,arguments(object)}；回灌历史必须转回 OpenAI wire format
     m_messages.append(QJsonObject{{"role", "assistant"},
-                                  {"content", m_stream},
+                                  {"content", turnText},
                                   {"tool_calls", ToolBridge::internalCallsToWire(calls)}});
     for (const QJsonValue& value : calls) {
         const QJsonObject call = value.toObject();
@@ -475,6 +548,7 @@ void AgentOrchestrator::executeToolCalls(const QJsonArray& calls)
 
 void AgentOrchestrator::finishOk(const QString& text)
 {
+    m_resumable = false;
     const QStringList glbs = collectNewGlbs();
     if (!glbs.isEmpty())
         emit artifactsReady(m_area, glbs); // 先报产出，再收尾对话

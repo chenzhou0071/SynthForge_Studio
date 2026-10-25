@@ -21,6 +21,10 @@ public:
     QString token() const { return m_token; }
     void broadcastEvent(const QString& event, const QJsonObject& data) const;
 
+signals:
+    // 通过 token 校验后触发：CoreApp 借此补发 conn.status 快照
+    void clientConnected();
+
 private:
     void onNewConnection();
     void onTextMessage(QWebSocket* socket, const QString& text);

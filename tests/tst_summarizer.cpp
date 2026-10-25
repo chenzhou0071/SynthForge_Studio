@@ -100,6 +100,57 @@ private slots:
         QVERIFY2(system.contains(QStringLiteral("产出模式：lowpoly")), "mode 未注入模板");
     }
 
+    // 主题内可以合理补充道具，只禁止与主题无关的物件
+    void templateAllowsThematicEnrichment()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("草稿"))});
+        QVERIFY(server.listen());
+        m_settings.setData(agentSettings(server.baseUrl(), QStringLiteral("k-primary"),
+                                         QStringLiteral("primary-model")));
+
+        SummarizerAgent agent(&m_llm, &m_sessions, &m_settings);
+        QSignalSpy ready(&agent, &SummarizerAgent::draftReady);
+        agent.generate(QStringLiteral("blender"), QStringLiteral("做一个雨夜便利店街角场景"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
+        const QJsonArray messages =
+            server.requestObjectAt(0).value(QStringLiteral("messages")).toArray();
+        const QString system =
+            messages.first().toObject().value(QStringLiteral("content")).toString();
+
+        QVERIFY2(system.contains(QStringLiteral("合理补充")), "缺少主题内合理发散的许可");
+        QVERIFY2(system.contains(QStringLiteral("车辆")), "车辆等街景道具不应被一刀切禁止");
+        QVERIFY2(system.contains(QStringLiteral("与主题无关")), "缺少只禁无关物件的边界");
+    }
+
+    // 照明必须来自真实光源；不要默认生成飞虫、光雾、湿地面这类氛围元素
+    void templateRequiresRealLightsOnly()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("草稿"))});
+        QVERIFY(server.listen());
+        m_settings.setData(agentSettings(server.baseUrl(), QStringLiteral("k-primary"),
+                                         QStringLiteral("primary-model")));
+
+        SummarizerAgent agent(&m_llm, &m_sessions, &m_settings);
+        QSignalSpy ready(&agent, &SummarizerAgent::draftReady);
+        agent.generate(QStringLiteral("blender"), QStringLiteral("做一个雨夜便利店街角场景"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
+        const QString system = server.requestObjectAt(0)
+                                   .value(QStringLiteral("messages"))
+                                   .toArray()
+                                   .first()
+                                   .toObject()
+                                   .value(QStringLiteral("content"))
+                                   .toString();
+
+        QVERIFY2(system.contains(QStringLiteral("真实光源")), "缺少真实光源要求");
+        QVERIFY2(system.contains(QStringLiteral("室内")), "缺少室内照明要求");
+        QVERIFY2(system.contains(QStringLiteral("飞虫")), "缺少禁止飞虫等氛围元素的说明");
+        QVERIFY2(system.contains(QStringLiteral("光粒子")), "光粒子等特效应允许保留");
+        QVERIFY2(system.contains(QStringLiteral("不要默认")), "缺少默认不生成氛围元素的约束");
+    }
+
     void summarizerConfigTakesPriority()
     {
         MockLlmServer server({textTurn(QStringLiteral("草稿"))});

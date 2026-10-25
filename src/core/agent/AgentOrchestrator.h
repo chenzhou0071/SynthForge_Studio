@@ -37,6 +37,9 @@ struct BuildPlan
     int maxSteps = 50;
 };
 
+// planReady 的 JSON → BuildPlan（plan.confirm 选完目录后交给 execute）
+BuildPlan buildPlanFromJson(const QJsonObject& json);
+
 // 两阶段主循环：plan() 只产计划（纯文本，不碰工具），execute() 按组「建造 → 自检」推进，
 // 最后一组结束再走一个导出回合。工具调用一律经 McpClient，编排层不区分 MCP/云。
 class AgentOrchestrator : public QObject
@@ -50,6 +53,14 @@ public:
     void execute(const QString& taskId, TaskManager* tm, const QJsonArray& tools,
                  const BuildPlan& plan, const QString& prompt, const QString& targetFolder,
                  const QString& area);
+    // 步数撞上限后的续跑：不清场、不重置分组，只追加预算并接着对话
+    void resume(const QString& taskId, TaskManager* tm);
+    bool canResume(const QString& area) const
+    {
+        return m_resumable && m_area == area && !m_plan.groups.isEmpty();
+    }
+    int stepCount() const { return qMin(m_steps, m_maxSteps); } // 撞上限那一步没发生，不计数
+    int stepBudget() const { return m_maxSteps; }
     void setBlenderGate(BlenderGate* gate) { m_gate = gate; }
     void setToolCallHook(std::function<void(const QString& name, bool running)> hook);
     void setConversationHistory(const QJsonArray& history);
@@ -62,6 +73,8 @@ signals:
     void failed(const QString& area, const QString& reason);
     void toolStep(const QString& area, const QString& tool, const QString& status);
     void delta(const QString& area, const QString& text);
+    // 一轮助手的文字说完（即将执行工具/进入下一组）：前端据此收口当前气泡
+    void turnFinished(const QString& area, const QString& text);
     void imageReceived(const QString& area, const QString& taskId, const QString& dataUrl,
                        const QString& caption);
     void artifactsReady(const QString& area, const QStringList& absoluteGlbs);
@@ -78,6 +91,7 @@ private:
     void startGroup();
     void tick();
     void onTurnFinished();
+    void finishTurnText();
     void executeToolCalls(const QJsonArray& calls);
     void finishOk(const QString& text);
     void finishCancelled();
@@ -104,6 +118,7 @@ private:
     int m_pendingToolCalls = 0;
     bool m_awaitingTools = false;
     bool m_exporting = false; // 最后一组的导出回合已发起
+    bool m_resumable = false; // 上次失败是步数耗尽：可续跑，保留 m_messages/m_plan
     GroupPhase m_phase = GroupPhase::Build;
     QSet<QString> m_planning; // 规划进行中的区（chat.cancel 可丢弃迟到结果）
     QDateTime m_startedAt;

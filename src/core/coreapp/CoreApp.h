@@ -12,6 +12,7 @@
 #include <memory>
 
 #include "core/agent/AgentOrchestrator.h"
+#include "core/assets/AssetLibrary.h"
 #include "core/llm/LlmGateway.h"
 #include "core/mcp/BlenderGate.h"
 
@@ -28,6 +29,16 @@ struct CoreOptions
 {
     QString dataDir;
     bool headless = false;
+    QString libraryRoot; // 空 = Documents/SynthForgeStudio/ModelLibrary；测试注入用
+};
+
+// 已确认、等用户选完存放目录就执行的任务
+struct PendingPick
+{
+    QString area;
+    QString mode;   // lowpoly | modify（cloud3d 在 chat.send 早拦，到不了这里）
+    QString prompt; // 草稿卡编辑后的提示词
+    BuildPlan plan;
 };
 
 class CoreApp : public QObject
@@ -48,7 +59,13 @@ public:
 private:
     QJsonValue handleChatSend(const QJsonObject& params, bool appendUser = true);
     void broadcastConnStatus(const QString& area, const QString& status, const QString& hint);
+    // 新客户端连上时补发当前状态：桥接先就绪、页面后加载也不会永远灰灯
+    void broadcastStatusSnapshot() const;
     LlmConfig primaryAgentConfig() const;
+    QJsonArray recentMessages(const QString& area, int limit) const;
+    // 规划/执行会把本次指令单独拼在末尾，历史里去掉同一条避免连续重复
+    QJsonArray historyForPrompt(const QString& area, const QString& prompt, int limit) const;
+    void openFolderPick(const QString& area);
 
     CoreOptions m_options;
     std::unique_ptr<SettingsStore> m_settings;
@@ -63,9 +80,12 @@ private:
     AgentOrchestrator* m_orch = nullptr;     // QObject child，析构由 parent 负责
     BlenderGate m_blenderGate; // Blender agent 任务与 unity 转换互斥
     QJsonArray m_blenderTools;
+    std::unique_ptr<AssetLibrary> m_library;    // 资产库根目录（ModelLibrary）
     QHash<QString, QJsonObject> m_pendingPlans; // area -> 计划卡 JSON
     QHash<QString, QString> m_planPrompts;      // area -> 已确认提示词
     QSet<QString> m_planCancelled;              // area -> 规划取消标记
+    QHash<QString, PendingPick> m_pendingPicks; // area -> 等待选目录的执行任务
+    QHash<QString, QString> m_pickRequests;     // requestId -> area
     QHash<QString, QString> m_status; // area -> off|reconnecting|ready
     QHash<QString, QString> m_hints;  // area -> 状态提示文案
     QSet<QString> m_everReady;        // 曾握手成功的区：之后的 off 才算桥接崩溃

@@ -2,7 +2,9 @@
 
 #include "core/agent/AgentOrchestrator.h"
 #include "core/agent/SummarizerAgent.h"
+#include "core/assets/AssetLibrary.h"
 #include "core/llm/LlmGateway.h"
+#include "core/llm/ToolBridge.h"
 #include "core/mcp/BridgeCommands.h"
 #include "core/mcp/McpRuntime.h"
 #include "core/mcp/StdioTransport.h"
@@ -13,9 +15,12 @@
 #include "core/ws/ProtocolRouter.h"
 #include "core/ws/WsServer.h"
 
+#include <QDir>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QStandardPaths>
 
 #include <cstdio>
 #include <memory>
@@ -33,6 +38,9 @@ CoreApp::CoreApp(const CoreOptions& options, QObject* parent)
     , m_ws(std::make_unique<WsServer>(m_router.get()))
     , m_llm(std::make_unique<LlmGateway>())
 {
+    // 页面晚于桥接加载时，ready 事件已经过去：新连接一律补发当前状态
+    connect(m_ws.get(), &WsServer::clientConnected, this,
+            &CoreApp::broadcastStatusSnapshot);
 }
 
 CoreApp::~CoreApp() = default;
@@ -42,6 +50,15 @@ bool CoreApp::start()
     m_settings->load();
     if (!m_sessions->open())
         return false;
+
+    // 资产库根目录：Documents/SynthForgeStudio/ModelLibrary（规格 5.5）
+    const QString libraryRoot =
+        m_options.libraryRoot.isEmpty()
+            ? QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)
+                  + QStringLiteral("/SynthForgeStudio/ModelLibrary")
+            : m_options.libraryRoot;
+    QDir().mkpath(libraryRoot);
+    m_library = std::make_unique<AssetLibrary>(libraryRoot);
 
     // Blender 桥接运行时：先建好再注册 handler，保证 chat.send 的前置检查有可用对象
     m_blender = new McpRuntime(
@@ -73,8 +90,7 @@ bool CoreApp::start()
                                      QJsonObject{{"area", area}, {"reason", reason}});
             });
 
-    // 编排器：计划卡与分组执行。plan() 由 draft.send 触发（Task 7），
-    // plan.confirm / plan.cancel 在 Task 4 接线；本轮先把信号接到前端。
+    // 编排器：计划卡与分组执行。draft.send → plan()，plan.confirm → 选目录 → execute()
     m_orch = new AgentOrchestrator(m_llm.get(), m_blender->client(), this);
     m_orch->setBlenderGate(&m_blenderGate); // 仅 blender 编排器持有租约
     connect(m_orch, &AgentOrchestrator::toolStep, this,
@@ -89,6 +105,15 @@ bool CoreApp::start()
                 m_ws->broadcastEvent(QStringLiteral("chat.delta"),
                                      QJsonObject{{"area", area}, {"text", text}});
             });
+    connect(m_orch, &AgentOrchestrator::turnFinished, this,
+            [this](const QString& area, const QString& text) {
+                if (text.trimmed().isEmpty())
+                    return;
+                // 中间轮次也要落库：刷新/崩溃后能看到每步说明，而不是只剩最后一句
+                m_sessions->appendMessage(area, QStringLiteral("assistant"), text);
+                m_ws->broadcastEvent(QStringLiteral("chat.turn"),
+                                     QJsonObject{{"area", area}, {"content", text}});
+            });
     connect(m_orch, &AgentOrchestrator::finalText, this,
             [this](const QString& area, const QString& text) {
                 m_sessions->appendMessage(area, QStringLiteral("assistant"), text);
@@ -99,8 +124,13 @@ bool CoreApp::start()
             });
     connect(m_orch, &AgentOrchestrator::failed, this,
             [this](const QString& area, const QString& reason) {
+                // 步数耗尽时前端给「继续工作」：带上用量，让用户知道还差多少
                 m_ws->broadcastEvent(QStringLiteral("error.card"),
-                                     QJsonObject{{"area", area}, {"reason", reason}});
+                                     QJsonObject{{"area", area},
+                                                 {"reason", reason},
+                                                 {"resumable", m_orch->canResume(area)},
+                                                 {"steps", m_orch->stepCount()},
+                                                 {"maxSteps", m_orch->stepBudget()}});
             });
     connect(m_orch, &AgentOrchestrator::groupProgress, this,
             [this](const QString& area, int index, int count, const QString& title) {
@@ -133,13 +163,36 @@ bool CoreApp::start()
             });
     connect(m_orch, &AgentOrchestrator::artifactsReady, this,
             [this](const QString& area, const QStringList& absoluteGlbs) {
-                // Task 5 接管：转相对路径 + asset.created 增量。当前只通知前端刷新树
-                if (area != QLatin1String("blender") || absoluteGlbs.isEmpty())
+                if (!m_library || area != QLatin1String("blender"))
                     return;
-                m_ws->broadcastEvent(QStringLiteral("fileTree.changed"),
-                                     QJsonObject{{"area", area},
-                                                 {"reason", "full"},
-                                                 {"paths", QJsonArray{}}});
+                // 每个 GLB 配同基名的 fbx/blend 兄弟文件（不存在的后缀不收录），供前端自动预览
+                QJsonArray changedDirs;
+                for (const QString& abs : absoluteGlbs) {
+                    const QString relative = m_library->relativeFor(abs);
+                    if (relative.isEmpty())
+                        continue; // 导出到了资产库外（用户手工改过路径）就不管
+                    const QString dir = QFileInfo(relative).path();
+                    const QString base = QFileInfo(relative).completeBaseName();
+                    QJsonObject paths{{"glb", relative}};
+                    for (const QString& suffix : {QStringLiteral("fbx"), QStringLiteral("blend")}) {
+                        const QString sibling =
+                            (dir == QLatin1String(".") ? QString() : dir + '/')
+                            + base + '.' + suffix;
+                        if (QFileInfo::exists(m_library->absoluteFor(sibling)))
+                            paths.insert(suffix, sibling);
+                    }
+                    m_ws->broadcastEvent(QStringLiteral("asset.created"),
+                                         QJsonObject{{"area", area},
+                                                     {"name", base},
+                                                     {"path", relative},
+                                                     {"paths", paths}});
+                    changedDirs.append(dir);
+                }
+                if (!changedDirs.isEmpty())
+                    m_ws->broadcastEvent(QStringLiteral("fileTree.changed"),
+                                         QJsonObject{{"area", area},
+                                                     {"reason", "incremental"},
+                                                     {"paths", changedDirs}});
             });
 
     m_router->registerHandler(QStringLiteral("settings.get"), [this](const QJsonObject&) {
@@ -180,8 +233,12 @@ bool CoreApp::start()
                                   if (area.isEmpty() || prompt.isEmpty())
                                       return QJsonValue(QJsonObject{
                                           {"accepted", false}, {"reason", "invalid-draft"}});
-                                  // 草稿确认后成为正式指令：落库 + 进历史（规格 5.2）；
-                                  // 规划阶段由 AgentOrchestrator 接管（Task 3）
+                                  const LlmConfig cfg = primaryAgentConfig();
+                                  if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty()
+                                      || cfg.model.isEmpty())
+                                      return QJsonValue(QJsonObject{
+                                          {"accepted", false}, {"reason", "agent-not-configured"}});
+                                  // 草稿确认后成为正式指令：落库 + 进历史（规格 5.2）
                                   m_sessions->saveDraft(area, prompt);
                                   m_sessions->appendMessage(area, QStringLiteral("user"), prompt);
                                   m_ws->broadcastEvent(
@@ -189,6 +246,13 @@ bool CoreApp::start()
                                       QJsonObject{{"area", area},
                                                   {"role", "user"},
                                                   {"content", prompt}});
+                                  // 规划用不含本次指令的历史，指令已由 plan() 拼在末尾
+                                  m_planPrompts.insert(area, prompt);
+                                  m_planCancelled.remove(area);
+                                  m_orch->setModelConfig(cfg);
+                                  m_orch->setConversationHistory(historyForPrompt(area, prompt, 20));
+                                  m_orch->plan(QStringLiteral("plan-%1").arg(++m_seq), nullptr,
+                                               prompt, area);
                                   return QJsonValue(QJsonObject{{"accepted", true}});
                               });
     m_router->registerHandler(QStringLiteral("draft.cancel"),
@@ -196,8 +260,177 @@ bool CoreApp::start()
                                   const QString area =
                                       params.value(QStringLiteral("area")).toString();
                                   // content 列 NOT NULL：清空用空串，不能传 null QString
-                                  if (!area.isEmpty())
+                                  if (!area.isEmpty()) {
                                       m_sessions->saveDraft(area, QStringLiteral(""));
+                                      m_planCancelled.insert(area);
+                                      m_pendingPlans.remove(area);
+                                      m_pendingPicks.remove(area);
+                                  }
+                                  return QJsonValue(QJsonObject{{"ok", true}});
+                              });
+    m_router->registerHandler(QStringLiteral("plan.confirm"),
+                              [this](const QJsonObject& params) {
+                                  const QString area =
+                                      params.value(QStringLiteral("area")).toString();
+                                  const QJsonObject json = m_pendingPlans.value(area);
+                                  if (json.isEmpty())
+                                      return QJsonValue(QJsonObject{
+                                          {"ok", false}, {"error", "plan-not-found"}});
+                                  if (m_blenderGate.isBusy()) {
+                                      // 忙时保留计划卡：用户等 Blender 空闲后可再点开始
+                                      m_ws->broadcastEvent(
+                                          QStringLiteral("error.card"),
+                                          QJsonObject{{"area", area}, {"reason", "blender-busy"}});
+                                      return QJsonValue(QJsonObject{
+                                          {"ok", false}, {"error", "blender-busy"}});
+                                  }
+                                  m_pendingPlans.remove(area);
+                                  m_pendingPicks.insert(
+                                      area, PendingPick{area, QStringLiteral("lowpoly"),
+                                                        m_planPrompts.value(area),
+                                                        buildPlanFromJson(json)});
+                                  openFolderPick(area);
+                                  return QJsonValue(QJsonObject{{"ok", true}});
+                              });
+    m_router->registerHandler(QStringLiteral("plan.cancel"),
+                              [this](const QJsonObject& params) {
+                                  const QString area =
+                                      params.value(QStringLiteral("area")).toString();
+                                  m_planCancelled.insert(area);
+                                  m_pendingPlans.remove(area);
+                                  m_pendingPicks.remove(area);
+                                  m_ws->broadcastEvent(
+                                      QStringLiteral("error.card"),
+                                      QJsonObject{{"area", area}, {"reason", "user-cancelled"}});
+                                  return QJsonValue(QJsonObject{{"ok", true}});
+                              });
+    m_router->registerHandler(QStringLiteral("folderPick.submit"),
+                              [this](const QJsonObject& params) {
+                                  const QString requestId =
+                                      params.value(QStringLiteral("requestId")).toString();
+                                  const QString area = m_pickRequests.value(requestId);
+                                  if (area.isEmpty() || !m_pendingPicks.contains(area))
+                                      return QJsonValue(QJsonObject{
+                                          {"ok", false}, {"error", "request-not-found"}});
+                                  const QString relative =
+                                      params.value(QStringLiteral("relativePath")).toString();
+                                  if (!m_library->isValidTarget(relative)
+                                      || !QDir(m_library->absoluteFor(relative)).exists())
+                                      return QJsonValue(QJsonObject{
+                                          {"ok", false}, {"error", "invalid-path"}});
+                                  const PendingPick pick = m_pendingPicks.value(area);
+                                  if (m_blenderGate.isBusy()) {
+                                      // 保留 requestId 与 pendingPick：弹窗不关，空闲后可再确认
+                                      m_ws->broadcastEvent(
+                                          QStringLiteral("error.card"),
+                                          QJsonObject{{"area", area}, {"reason", "blender-busy"}});
+                                      return QJsonValue(QJsonObject{
+                                          {"ok", false}, {"error", "blender-busy"}});
+                                  }
+                                  m_pickRequests.remove(requestId);
+                                  m_pendingPicks.remove(area);
+                                  const QString targetFolder = m_library->absoluteFor(relative);
+                                  const QString taskId = QStringLiteral("build-%1").arg(++m_seq);
+                                  m_tasks->enqueue(Task{
+                                      taskId, area, QString(),
+                                      [this, pick, targetFolder](const QString& tid,
+                                                                 TaskManager* tm) {
+                                          m_orch->setModelConfig(primaryAgentConfig());
+                                          m_orch->setConversationHistory(
+                                              historyForPrompt(pick.area, pick.prompt, 20));
+                                          m_orch->execute(
+                                              tid, tm, ToolBridge::mcpToolsToOpenAi(m_blenderTools),
+                                              pick.plan, pick.prompt, targetFolder, pick.area);
+                                      }});
+                                  return QJsonValue(
+                                      QJsonObject{{"ok", true}, {"taskId", taskId}});
+                              });
+    m_router->registerHandler(QStringLiteral("folderPick.cancel"),
+                              [this](const QJsonObject& params) {
+                                  const QString area =
+                                      m_pickRequests.take(params.value("requestId").toString());
+                                  if (area.isEmpty()) // 旧弹窗（requestId 已被取代）不报错卡
+                                      return QJsonValue(QJsonObject{{"ok", true}});
+                                  m_pendingPicks.remove(area);
+                                  m_ws->broadcastEvent(
+                                      QStringLiteral("error.card"),
+                                      QJsonObject{{"area", area}, {"reason", "user-cancelled"}});
+                                  return QJsonValue(QJsonObject{{"ok", true}});
+                              });
+    m_router->registerHandler(QStringLiteral("folderPick.mkdir"),
+                              [this](const QJsonObject& params) {
+                                  const QString parent = params.value("path").toString();
+                                  const QString error = m_library->makeFolder(
+                                      parent, params.value("name").toString());
+                                  if (!error.isEmpty())
+                                      return QJsonValue(
+                                          QJsonObject{{"ok", false}, {"error", error}});
+                                  // 左栏文件树立刻能看到新目录，不用等导出
+                                  m_ws->broadcastEvent(
+                                      QStringLiteral("fileTree.changed"),
+                                      QJsonObject{{"area", "blender"},
+                                                  {"reason", "incremental"},
+                                                  {"paths", QJsonArray{parent}}});
+                                  return QJsonValue(QJsonObject{{"ok", true},
+                                                                {"tree", m_library->folderTree()}});
+                              });
+    m_router->registerHandler(QStringLiteral("assets.list"), [this](const QJsonObject&) {
+        QJsonArray items;
+        // 先放目录（含空目录）：左栏树不能只靠模型文件反推目录，否则新建的空文件夹看不见
+        for (const QString& relative : m_library->scanFolders()) {
+            const QFileInfo info(m_library->absoluteFor(relative));
+            items.append(QJsonObject{{"name", info.fileName()},
+                                     {"relativePath", relative},
+                                     {"kind", "dir"},
+                                     {"size", 0},
+                                     {"modified", info.lastModified().toString(Qt::ISODate)}});
+        }
+        for (const QString& relative : m_library->scanAssets()) {
+            const QFileInfo info(m_library->absoluteFor(relative));
+            items.append(QJsonObject{{"name", info.completeBaseName()},
+                                     {"relativePath", relative},
+                                     {"kind", info.suffix().toLower()},
+                                     {"size", static_cast<double>(info.size())},
+                                     {"modified", info.lastModified().toString(Qt::ISODate)}});
+        }
+        return QJsonValue(items);
+    });
+    m_router->registerHandler(QStringLiteral("fs.operate"),
+                              [this](const QJsonObject& params) {
+                                  const QString area =
+                                      params.value("area").toString(QStringLiteral("blender"));
+                                  if (area != QLatin1String("blender")) // unity 区由 P6 接管
+                                      return QJsonValue(QJsonObject{
+                                          {"ok", false}, {"error", "area-not-supported"}});
+                                  const QString op = params.value("op").toString();
+                                  const QString path = params.value("path").toString();
+                                  QString error;
+                                  if (op == QLatin1String("mkdir"))
+                                      error = m_library->makeFolder(
+                                          path, params.value("name").toString());
+                                  else if (op == QLatin1String("rename"))
+                                      error = m_library->renameEntry(
+                                          path, params.value("name").toString());
+                                  else if (op == QLatin1String("delete"))
+                                      error = m_library->deleteEntry(path);
+                                  else if (op == QLatin1String("reveal")) {
+                                      if (!m_library->revealEntry(path))
+                                          error = QStringLiteral("not-found");
+                                  } else if (op != QLatin1String("refresh"))
+                                      error = QStringLiteral("unknown-op");
+                                  if (!error.isEmpty())
+                                      return QJsonValue(
+                                          QJsonObject{{"ok", false}, {"error", error}});
+                                  if (op != QLatin1String("reveal")) // 打开资源管理器不改树
+                                      m_ws->broadcastEvent(
+                                          QStringLiteral("fileTree.changed"),
+                                          QJsonObject{{"area", "blender"},
+                                                      {"reason", op == QLatin1String("refresh")
+                                                                     ? "full"
+                                                                     : "incremental"},
+                                                      {"paths", op == QLatin1String("refresh")
+                                                                    ? QJsonArray{}
+                                                                    : QJsonArray{path}}});
                                   return QJsonValue(QJsonObject{{"ok", true}});
                               });
     m_router->registerHandler(QStringLiteral("chat.retry"),
@@ -218,7 +451,31 @@ bool CoreApp::start()
                                   // 先打标记再断网络：abort 触发的 onError 必须能查到 cancelled
                                   m_tasks->cancelArea(area);
                                   m_llm->abortTag(area);
+                                  if (m_orch->isPlanning(area)) { // 规划不在 TaskManager 队列，需单独丢结果
+                                      m_planCancelled.insert(area);
+                                      m_pendingPlans.remove(area);
+                                  }
                                   return QJsonValue(QJsonObject{{"ok", true}});
+                              });
+    m_router->registerHandler(QStringLiteral("chat.continue"),
+                              [this](const QJsonObject& params) {
+                                  const QString area =
+                                      params.value(QStringLiteral("area")).toString();
+                                  if (!m_orch->canResume(area))
+                                      return QJsonValue(QJsonObject{{"ok", false},
+                                                                    {"error", "nothing-to-resume"}});
+                                  if (m_blenderGate.isBusy()) // 稍后再点，现场还在
+                                      return QJsonValue(QJsonObject{{"ok", false},
+                                                                    {"error", "blender-busy"}});
+                                  const QString taskId = QStringLiteral("resume-%1").arg(++m_seq);
+                                  m_tasks->enqueue(Task{
+                                      taskId, area, QString(),
+                                      [this](const QString& tid, TaskManager* tm) {
+                                          m_orch->setModelConfig(primaryAgentConfig());
+                                          m_orch->resume(tid, tm);
+                                      }});
+                                  return QJsonValue(
+                                      QJsonObject{{"ok", true}, {"taskId", taskId}});
                               });
     m_router->registerHandler(QStringLiteral("chat.clear"),
                               [this](const QJsonObject& params) {
@@ -268,14 +525,7 @@ void CoreApp::broadcastConnStatus(const QString& area, const QString& status,
     else
         m_hints.insert(area, hint);
 
-    QJsonObject hints;
-    for (auto it = m_hints.constBegin(); it != m_hints.constEnd(); ++it)
-        hints.insert(it.key(), it.value());
-
-    m_ws->broadcastEvent(QStringLiteral("conn.status"),
-                         QJsonObject{{"blender", m_status.value(QStringLiteral("blender"), "off")},
-                                     {"unity", m_status.value(QStringLiteral("unity"), "off")},
-                                     {"hints", hints}});
+    broadcastStatusSnapshot();
 
     if (status == QLatin1String("ready")) {
         m_everReady.insert(area);
@@ -290,6 +540,18 @@ void CoreApp::broadcastConnStatus(const QString& area, const QString& status,
     }
 }
 
+void CoreApp::broadcastStatusSnapshot() const
+{
+    QJsonObject hints;
+    for (auto it = m_hints.constBegin(); it != m_hints.constEnd(); ++it)
+        hints.insert(it.key(), it.value());
+
+    m_ws->broadcastEvent(QStringLiteral("conn.status"),
+                         QJsonObject{{"blender", m_status.value(QStringLiteral("blender"), "off")},
+                                     {"unity", m_status.value(QStringLiteral("unity"), "off")},
+                                     {"hints", hints}});
+}
+
 LlmConfig CoreApp::primaryAgentConfig() const
 {
     const QJsonObject data = m_settings->data();
@@ -299,6 +561,29 @@ LlmConfig CoreApp::primaryAgentConfig() const
                                    .toObject();
     return {resolveAgentBaseUrl(primary, data), primary.value(QStringLiteral("apiKey")).toString(),
             primary.value(QStringLiteral("model")).toString()};
+}
+
+QJsonArray CoreApp::recentMessages(const QString& area, int limit) const
+{
+    QJsonArray history;
+    for (const QJsonValue& value : m_sessions->messagePage(area, limit).messages) {
+        const QJsonObject message = value.toObject();
+        history.append(QJsonObject{{"role", message.value(QStringLiteral("role"))},
+                                   {"content", message.value(QStringLiteral("content"))}});
+    }
+    return history;
+}
+
+QJsonArray CoreApp::historyForPrompt(const QString& area, const QString& prompt, int limit) const
+{
+    QJsonArray history = recentMessages(area, limit + 1);
+    if (!history.isEmpty()) {
+        const QJsonObject last = history.last().toObject();
+        if (last.value(QStringLiteral("role")).toString() == QLatin1String("user")
+            && last.value(QStringLiteral("content")).toString() == prompt)
+            history.removeLast();
+    }
+    return history;
 }
 
 QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
@@ -371,12 +656,7 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
     }
 
     // 规格 8.4：只带本区最近 20 条纯文本历史（含刚落库的本次 user 消息）
-    QJsonArray history;
-    for (const QJsonValue& value : m_sessions->messagePage(area, 20).messages) {
-        const QJsonObject message = value.toObject();
-        history.append(QJsonObject{{"role", message.value(QStringLiteral("role"))},
-                                   {"content", message.value(QStringLiteral("content"))}});
-    }
+    const QJsonArray history = recentMessages(area, 20);
 
     const QString taskId = QStringLiteral("chat-%1").arg(++m_seq);
     m_tasks->enqueue(Task{
@@ -429,4 +709,22 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         }});
 
     return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
+}
+
+void CoreApp::openFolderPick(const QString& area)
+{
+    // 清掉该区未被消费的旧 requestId，旧弹窗若仍开着再提交会得到 request-not-found
+    for (auto it = m_pickRequests.begin(); it != m_pickRequests.end();) {
+        if (it.value() == area)
+            it = m_pickRequests.erase(it);
+        else
+            ++it;
+    }
+    const QString requestId = QStringLiteral("pick-%1").arg(++m_seq);
+    m_pickRequests.insert(requestId, area);
+    m_ws->broadcastEvent(QStringLiteral("folderPick.open"),
+                         QJsonObject{{"area", area},
+                                     {"requestId", requestId},
+                                     {"rootName", "ModelLibrary"},
+                                     {"tree", m_library->folderTree()}});
 }

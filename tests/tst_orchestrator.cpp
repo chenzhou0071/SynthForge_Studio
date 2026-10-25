@@ -21,6 +21,13 @@ MockLlmServer::Turn toolTurn(const QString& name)
     return MockLlmServer::Turn{.frames = {MockLlm::toolCallChunk(name), MockLlm::doneChunk()}};
 }
 
+// 先说话再干活：同一轮里既有交代文字，又发起工具调用
+MockLlmServer::Turn textThenToolTurn(const QString& text, const QString& name)
+{
+    return MockLlmServer::Turn{.frames = {MockLlm::textChunk(text), MockLlm::toolCallChunk(name),
+                                          MockLlm::doneChunk()}};
+}
+
 // 与 CoreApp 传 execute 的格式一致：OpenAI tools，而不是 MCP 原始 tools
 QJsonArray openAiTools()
 {
@@ -65,7 +72,9 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
         const QJsonObject plan = ready.first().at(2).toJsonObject();
         QCOMPARE(plan.value(QStringLiteral("groups")).toArray().size(), 2);
-        QCOMPARE(plan.value(QStringLiteral("totalSteps")).toInt(), 26); // 8*2+10
+        QCOMPARE(plan.value(QStringLiteral("totalSteps")).toInt(), 60); // 30*2
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("合理补充"))); // 主题内可以发散
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("与主题无关"))); // 只禁无关物件
         QCOMPARE(plan.value(QStringLiteral("rules")).toArray().size(), 1);
         const QJsonArray placements = plan.value(QStringLiteral("groups"))
                                           .toArray()
@@ -78,6 +87,54 @@ private slots:
                  QStringLiteral("路牌"));
         QVERIFY(placements.at(1).toObject().value(QStringLiteral("where")).toString().contains(
             QStringLiteral("右前方")));
+    }
+
+    // plan.confirm 收到的是 planReady 的 JSON，必须原样还原成 BuildPlan（含布局）
+    void planJsonRestoresBuildPlan()
+    {
+        const QJsonObject json{
+            {"totalSteps", 26},
+            {"rules", QJsonArray{QStringLiteral("树不遮挡招牌")}},
+            {"groups",
+             QJsonArray{
+                 QJsonObject{{"title", QStringLiteral("底座与环境")},
+                             {"items", QJsonArray{QStringLiteral("底座"), QStringLiteral("路牌")}},
+                             {"placements",
+                              QJsonArray{QJsonObject{{"name", QStringLiteral("路牌")},
+                                                     {"where", QStringLiteral("商店右前方 2 米")}}}},
+                             {"acceptance", QStringLiteral("俯视截图：底座完整")}},
+                 QJsonObject{{"title", QStringLiteral("建筑外观")},
+                             {"items", QJsonArray{QStringLiteral("招牌")}},
+                             {"placements", QJsonArray{}},
+                             {"acceptance", QStringLiteral("街角截图：主体齐全")}}}},
+        };
+
+        const BuildPlan plan = buildPlanFromJson(json);
+
+        QCOMPARE(plan.maxSteps, 26);
+        QCOMPARE(plan.rules.size(), 1);
+        QCOMPARE(plan.groups.size(), 2);
+        QCOMPARE(plan.groups.at(0).placements.size(), 1);
+        QCOMPARE(plan.groups.at(0).placements.at(0).name, QStringLiteral("路牌"));
+        QVERIFY(plan.groups.at(0).placements.at(0).where.contains(QStringLiteral("右前方")));
+        QCOMPARE(plan.groups.at(1).items.first(), QStringLiteral("招牌"));
+        QCOMPARE(plan.groups.at(1).acceptance, QStringLiteral("街角截图：主体齐全"));
+    }
+
+    // 预算按组数线性给，封顶 200：2/4/6 组分别 60/120/180，7 组以上不再涨
+    void planBudgetScalesWithGroupCount()
+    {
+        const auto planWith = [](int groupCount) {
+            QJsonArray groups;
+            for (int i = 0; i < groupCount; ++i)
+                groups.append(QJsonObject{{"title", QStringLiteral("组%1").arg(i + 1)}});
+            return buildPlanFromJson(QJsonObject{{"groups", groups}});
+        };
+
+        QCOMPARE(planWith(2).maxSteps, 60);
+        QCOMPARE(planWith(4).maxSteps, 120);
+        QCOMPARE(planWith(6).maxSteps, 180);
+        QCOMPARE(planWith(7).maxSteps, 200);
     }
 
     void plannerFallsBackToDefaults()
@@ -96,7 +153,7 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
         const QJsonObject plan = ready.first().at(2).toJsonObject();
         QCOMPARE(plan.value(QStringLiteral("groups")).toArray().size(), 4); // 默认四分组
-        QCOMPARE(plan.value(QStringLiteral("totalSteps")).toInt(), 42);
+        QCOMPARE(plan.value(QStringLiteral("totalSteps")).toInt(), 120); // 30*4
         QCOMPARE(server.requestCount(), 2); // 解析失败重试 1 次
     }
 
@@ -128,10 +185,18 @@ private slots:
 
         QTRY_COMPARE_WITH_TIMEOUT(finalSpy.count(), 1, 5000);
         QCOMPARE(server.requestCount(), 4); // 建造 → 自检 → 导出 → 收尾
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("简体中文"))); // 面向用户的话必须是中文
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("底座边长按真实尺度反推"))); // 不能把主体做小
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("与主题无关"))); // 合理补充也有限度
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("真实光源"))); // 灯光必须是真实光源
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("飞虫"))); // 不默认生成飞虫/湿地面
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("光粒子"))); // 光粒子等特效可以保留
         QVERIFY(server.requestAt(0).contains(QStringLiteral("沿 X 轴展开"))); // 组内摆放已注入
         QVERIFY(server.requestAt(2).contains(QStringLiteral("验收标准")));    // 自检指令已注入
         QVERIFY(server.requestAt(2).contains(QStringLiteral("树不遮挡招牌"))); // 任务约束注入自检
         QVERIFY(server.requestAt(3).contains(QStringLiteral("export_scene"))); // 导出指令已注入
+        QVERIFY(server.requestAt(3).contains(QStringLiteral("save_version = 0"))); // 不生成 .blend1 备份
+        QVERIFY(server.requestAt(3).contains(QStringLiteral("只执行一次"))); // 避免换名重复导出
     }
 
     void executorAdvancesGroups()
@@ -152,6 +217,7 @@ private slots:
         plan.groups = {{QStringLiteral("底座与环境"), {}, {}, QStringLiteral("检查底座")},
                        {QStringLiteral("建筑外观"), {}, {}, QStringLiteral("检查建筑")}};
         QSignalSpy progress(&orch, &AgentOrchestrator::groupProgress);
+        QSignalSpy turns(&orch, &AgentOrchestrator::turnFinished);
         QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
 
         orch.execute(QStringLiteral("t1"), nullptr, openAiTools(), plan, QStringLiteral("p"),
@@ -160,6 +226,41 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(finalSpy.count(), 1, 8000);
         QCOMPARE(progress.count(), 2);             // 两组各一次进度
         QCOMPARE(progress.at(1).at(1).toInt(), 2); // 第二组 index
+        // 每轮文字在进入下一步前收口：第 2 组的话不能续在第 1 组气泡里
+        QCOMPARE(turns.count(), 4);
+        QCOMPARE(turns.at(0).at(1).toString(), QStringLiteral("组1建造完成"));
+        QCOMPARE(turns.at(1).at(1).toString(), QStringLiteral("组1自检通过"));
+        QCOMPARE(turns.at(2).at(1).toString(), QStringLiteral("组2建造完成"));
+        QCOMPARE(turns.at(3).at(1).toString(), QStringLiteral("组2自检通过"));
+    }
+
+    // 工具调用前的交代也要单独成气泡：先说话 → 再干活 → 看截图 → 再说下一段
+    void turnFinishedSplitsEachAssistantTurn()
+    {
+        MockLlmServer server({textThenToolTurn(QStringLiteral("先检查场景"),
+                                               QStringLiteral("execute_blender_code")),
+                              textTurn(QStringLiteral("组1建造完成")),
+                              textTurn(QStringLiteral("组1自检通过")),
+                              textTurn(QStringLiteral("已导出 glb/fbx/blend"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+        orch.setModelConfig(server.config());
+        BuildPlan plan;
+        plan.groups = {{QStringLiteral("底座与环境"), {}, {}, QStringLiteral("检查底座")}};
+        plan.maxSteps = 18;
+        QSignalSpy turns(&orch, &AgentOrchestrator::turnFinished);
+        QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
+
+        orch.execute(QStringLiteral("t1"), nullptr, openAiTools(), plan, QStringLiteral("p"),
+                     QStringLiteral("/tmp/out"), QStringLiteral("blender"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(finalSpy.count(), 1, 8000);
+        QCOMPARE(turns.count(), 3);
+        QCOMPARE(turns.at(0).at(1).toString(), QStringLiteral("先检查场景"));
+        QCOMPARE(turns.at(1).at(1).toString(), QStringLiteral("组1建造完成"));
+        QCOMPARE(turns.at(2).at(1).toString(), QStringLiteral("组1自检通过"));
     }
 
     void executorRefusesWhenBlenderGateBusy()
@@ -183,6 +284,47 @@ private slots:
         QCOMPARE(failed.first().at(1).toString(), QStringLiteral("blender-busy"));
         QCOMPARE(server.requestCount(), 0);                      // 门禁失败不碰 LLM / MCP
         QCOMPARE(gate.owner(), QStringLiteral("unity-convert")); // 不释放他人租约
+    }
+
+    // 步数撞上限不该把整场景判死：保留会话与分组位置，用户点「继续工作」接着跑
+    void executorResumesAfterMaxSteps()
+    {
+        MockLlmServer server({toolTurn(QStringLiteral("execute_blender_code")),
+                              textTurn(QStringLiteral("组1建造完成")),
+                              textTurn(QStringLiteral("组1自检通过")),
+                              textTurn(QStringLiteral("已导出 glb/fbx/blend"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+        orch.setModelConfig(server.config());
+        BlenderGate gate;
+        orch.setBlenderGate(&gate);
+        BuildPlan plan;
+        plan.groups = {{QStringLiteral("底座与环境"), {}, {}, QStringLiteral("检查底座")}};
+        plan.maxSteps = 1;
+        QVERIFY(!orch.canResume(QStringLiteral("blender"))); // 没跑过不能续
+        QSignalSpy failed(&orch, &AgentOrchestrator::failed);
+        QSignalSpy progress(&orch, &AgentOrchestrator::groupProgress);
+        QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
+
+        orch.execute(QStringLiteral("t1"), nullptr, openAiTools(), plan, QStringLiteral("p"),
+                     QStringLiteral("/tmp/out"), QStringLiteral("blender"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 5000);
+        QCOMPARE(failed.first().at(1).toString(), QStringLiteral("max-steps-exceeded"));
+        QVERIFY(orch.canResume(QStringLiteral("blender")));
+        QCOMPARE(orch.stepCount(), 1); // 撞上限的那一步没发生，不记在用户头上
+        QVERIFY(!gate.isBusy());       // 失败必须让出 Blender
+
+        orch.resume(QStringLiteral("t2"), nullptr);
+
+        QCOMPARE(orch.stepBudget(), 51); // 1 + min(30*1+20, 200)：续跑追加预算
+        QTRY_COMPARE_WITH_TIMEOUT(finalSpy.count(), 1, 8000);
+        QVERIFY(server.requestAt(1).contains(QStringLiteral("\"role\":\"tool\""))); // 原会话还在
+        QCOMPARE(progress.count(), 1); // 续跑不重复插入分组分隔条
+        QVERIFY(!orch.canResume(QStringLiteral("blender")));
+        QVERIFY(!gate.isBusy());
     }
 
     void executorReleasesGateOnFinish()

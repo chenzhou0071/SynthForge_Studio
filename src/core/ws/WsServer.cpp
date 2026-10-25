@@ -45,6 +45,7 @@ void WsServer::onNewConnection()
             m_clients.removeAll(socket);
             socket->deleteLater();
         });
+        emit clientConnected();
     }
 }
 
