@@ -23,7 +23,9 @@ export class FakeClient {
     this.calls.push({ method, params: params as Record<string, unknown> });
     const failure = this.failures.get(method);
     if (failure) return Promise.reject(new Error(failure));
-    return Promise.resolve(this.results.get(method) as T);
+    const result = this.results.get(method);
+    // 允许按参数返回不同结果：分页接口同一次测试里要区分首次页和更早页
+    return Promise.resolve((typeof result === "function" ? result(params) : result) as T);
   }
 
   emit(event: string, data: unknown): void {

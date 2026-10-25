@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { isCloudConfigured } from "../chat/cloud";
 import { toChatItems } from "../chat/history";
 import type { ChatItem, PlanGroup } from "../chat/history";
+import { renderMarkdown } from "../chat/markdown";
 import type { WsClient } from "../ws/WsClient";
 import DraftCard from "./DraftCard.vue";
+import FolderPicker from "./FolderPicker.vue";
+import type { FolderNode } from "./FolderPicker.vue";
 import PlanCard from "./PlanCard.vue";
 
 type Area = "blender" | "unity";
@@ -18,24 +21,67 @@ const cloudConfigured = ref(false);
 // 每区一个常驻实例：busy 属于本实例，切区只 v-show，状态不会串区
 const busy = ref(false);
 const scroller = ref<HTMLElement | null>(null);
+// 只有贴底时才跟随新输出；用户往上翻后不再抢视图
+const atBottom = ref(true);
+const STICK_THRESHOLD = 32; // 距底 32px 内都算贴底，避免像素级抖动
+const TOP_THRESHOLD = 40; // 距顶 40px 内触发向前翻页
+const PAGE_SIZE = 30; // 每页消息行数，首屏与上翻一致
+const hasMore = ref(false);
+const nextCursor = ref(0);
+const loadingOlder = ref(false); // 翻页请求在飞，防止连续触顶叠请求
+// 等第一段文字（或工具结果）之前先给个转圈，别让人盯着空列表
+const showPending = computed(() => busy.value && !messages.value.some((item) => item.streaming));
+// 计划已确认、等选存放位置：folderPick.open 下发根目录树
+const pick = ref<{ requestId: string; rootName: string; tree: FolderNode } | null>(null);
 const unsubscribers: Array<() => void> = [];
-let streaming: ChatItem | null = null; // 指向 messages 里的流式气泡，非响应式引用
+let streaming: ChatItem | null = null; // 指向 messages 里的流式气泡；必须是 reactive 代理，否则收口不触发重渲染
 
-function reasonText(reason: string) {
+function reasonText(reason: string, steps?: number, maxSteps?: number) {
   if (reason === "agent-not-configured") {
     return "未配置 Agent：请先在设置中填写服务商、模型与密钥。";
+  }
+  if (reason === "max-steps-exceeded") {
+    const usage =
+      typeof steps === "number" && typeof maxSteps === "number"
+        ? `（已用 ${steps} / 上限 ${maxSteps} 步）`
+        : "";
+    return `步数预算用完了${usage}。前面的成果还在 Blender 场景里，点「继续工作」接着干，不会重新清场。`;
+  }
+  if (reason === "blender-busy") return "Blender 正忙，等当前任务结束后再试一次。";
+  if (reason === "nothing-to-resume") {
+    return "这份任务的现场已经不在了（可能已有新任务开始），请重新发指令。";
   }
   return reason;
 }
 
-function scrollToBottom() {
+function onScroll() {
+  const el = scroller.value;
+  if (!el) return;
+  atBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_THRESHOLD;
+  if (el.scrollTop <= TOP_THRESHOLD) void loadOlder();
+}
+
+function scrollToBottom(force = false) {
+  if (!force && !atBottom.value) return;
+  atBottom.value = true;
   void nextTick(() => {
     if (scroller.value) scroller.value.scrollTop = scroller.value.scrollHeight;
   });
 }
 
-function pushError(reason: string) {
-  messages.value.push({ role: "error", content: reasonText(reason) });
+function jumpToBottom() {
+  scrollToBottom(true);
+}
+
+function pushError(
+  reason: string,
+  options: { resumable?: boolean; steps?: number; maxSteps?: number } = {},
+) {
+  messages.value.push({
+    role: "error",
+    content: reasonText(reason, options.steps, options.maxSteps),
+    resumable: options.resumable === true,
+  });
 }
 
 async function refreshCloudBadge() {
@@ -48,17 +94,64 @@ async function refreshCloudBadge() {
   }
 }
 
+function pageMeta(page: unknown) {
+  const raw = page as { hasMore?: unknown; nextCursor?: unknown } | null | undefined;
+  return {
+    hasMore: raw?.hasMore === true,
+    nextCursor: typeof raw?.nextCursor === "number" ? raw.nextCursor : 0,
+  };
+}
+
 async function loadHistory() {
   messages.value = [];
   streaming = null;
+  hasMore.value = false;
+  nextCursor.value = 0;
   try {
-    // 先用 50 条覆盖常见会话；更早的分页留给 P4 的“加载更多”
-    const page = await props.client.request<unknown>("session.load", { area: props.area, limit: 50 });
+    // 先用一页覆盖常见会话；更早的往上翻再拉
+    const page = await props.client.request<unknown>("session.load", {
+      area: props.area,
+      limit: PAGE_SIZE,
+    });
     messages.value = toChatItems(page);
+    const meta = pageMeta(page);
+    hasMore.value = meta.hasMore;
+    nextCursor.value = meta.nextCursor;
   } catch (error) {
     pushError(error instanceof Error ? error.message : "读取历史失败");
   }
   scrollToBottom();
+}
+
+// 触顶向前翻页：插到列表头部后补回高度差，当前看的这段不会跳
+async function loadOlder() {
+  const el = scroller.value;
+  if (!el || !hasMore.value || loadingOlder.value) return;
+  const beforeHeight = el.scrollHeight;
+  const beforeTop = el.scrollTop;
+  loadingOlder.value = true;
+  try {
+    const page = await props.client.request<unknown>("session.load", {
+      area: props.area,
+      limit: PAGE_SIZE,
+      beforeId: nextCursor.value,
+    });
+    const meta = pageMeta(page);
+    hasMore.value = meta.hasMore;
+    if (meta.nextCursor > 0) nextCursor.value = meta.nextCursor;
+    const older = toChatItems(page);
+    if (older.length === 0) return;
+    messages.value = [...older, ...messages.value];
+    await nextTick();
+    const node = scroller.value;
+    if (!node) return;
+    const added = node.scrollHeight - beforeHeight;
+    if (added > 0) node.scrollTop = beforeTop + added;
+  } catch (error) {
+    pushError(error instanceof Error ? error.message : "读取更早消息失败");
+  } finally {
+    loadingOlder.value = false;
+  }
 }
 
 onMounted(() => {
@@ -85,11 +178,27 @@ onMounted(() => {
       const delta = data as { area?: string; text?: string };
       if (delta.area !== props.area) return;
       if (!streaming) {
-        streaming = { role: "assistant", content: "", streaming: true };
-        messages.value.push(streaming);
+        // 裸对象改 streaming 不会触发渲染，光标会留在气泡里；必须持有 reactive 代理
+        const item = reactive<ChatItem>({ role: "assistant", content: "", streaming: true });
+        messages.value.push(item);
+        streaming = item;
       }
       streaming.content += delta.text ?? "";
       busy.value = true; // 重试等非 send 路径也要能显示“停止”
+      scrollToBottom();
+    }),
+    props.client.on("chat.turn", (data) => {
+      // 一轮说完：收口当前气泡但任务还在跑，下一段 delta 会另起气泡
+      const turn = data as { area?: string; content?: string };
+      if (turn.area !== props.area) return;
+      const content = turn.content ?? "";
+      if (streaming) {
+        streaming.content = content;
+        streaming.streaming = false;
+        streaming = null;
+      } else {
+        messages.value.push({ role: "assistant", content });
+      }
       scrollToBottom();
     }),
     props.client.on("chat.image", (data) => {
@@ -99,9 +208,24 @@ onMounted(() => {
       scrollToBottom();
     }),
     props.client.on("task.progress", (data) => {
-      const progress = data as { area?: string; state?: string };
+      const progress = data as {
+        area?: string;
+        state?: string;
+        groupIndex?: number;
+        groupCount?: number;
+        title?: string;
+      };
       if (progress.area !== props.area) return;
       // 低模分组进度没有 state；云任务 progress 带终态
+      if (typeof progress.groupIndex === "number" && typeof progress.groupCount === "number") {
+        messages.value.push({
+          role: "group",
+          groupIndex: progress.groupIndex,
+          groupCount: progress.groupCount,
+          title: progress.title ?? "",
+        });
+        scrollToBottom();
+      }
       busy.value = progress.state !== "success" && progress.state !== "failed";
     }),
     props.client.on("asset.created", (data) => {
@@ -142,15 +266,45 @@ onMounted(() => {
       });
       scrollToBottom();
     }),
+    props.client.on("folderPick.open", (data) => {
+      const payload = data as {
+        area?: string;
+        requestId?: string;
+        rootName?: string;
+        tree?: FolderNode;
+      };
+      if (payload.area !== props.area || !payload.requestId || !payload.tree) return;
+      busy.value = false; // 计划已确认，选完目录才真正开始建模
+      pick.value = {
+        requestId: payload.requestId,
+        rootName: payload.rootName ?? "ModelLibrary",
+        tree: payload.tree,
+      };
+    }),
     props.client.on("error.card", (data) => {
-      const card = data as { area?: string; reason?: string };
+      const card = data as {
+        area?: string;
+        reason?: string;
+        resumable?: boolean;
+        steps?: number;
+        maxSteps?: number;
+      };
       if (card.area !== props.area) return;
+      if (card.reason === "user-cancelled") {
+        // 用户主动取消（计划卡/选目录弹窗）不是错误，别再弹失败卡
+        busy.value = false;
+        return;
+      }
       if (streaming) {
         // 保留已经收到的半截内容，只是不再显示光标
         streaming.streaming = false;
         streaming = null;
       }
-      pushError(card.reason ?? "unknown");
+      pushError(card.reason ?? "unknown", {
+        resumable: card.resumable,
+        steps: card.steps,
+        maxSteps: card.maxSteps,
+      });
       busy.value = false;
       scrollToBottom();
     }),
@@ -184,7 +338,7 @@ async function send() {
     busy.value = false;
     pushError(error instanceof Error ? error.message : "发送失败");
   }
-  scrollToBottom();
+  scrollToBottom(true);
 }
 
 function removeDraft(item: ChatItem) {
@@ -205,6 +359,7 @@ async function sendDraft(item: ChatItem, text: string) {
       return;
     }
     removeDraft(item); // 已转为正式指令，后端会广播 chat.message(user)
+    scrollToBottom(true); // 自己发的消息一定要能看见
   } catch (error) {
     busy.value = false;
     pushError(error instanceof Error ? error.message : "发送失败");
@@ -226,7 +381,41 @@ async function cancelTask() {
   } catch (error) {
     pushError(error instanceof Error ? error.message : "停止失败");
   } finally {
+    // 取消后不收口会留下永久 streaming 气泡，下一次发送就看不到转圈
+    if (streaming) {
+      streaming.streaming = false;
+      streaming = null;
+    }
     busy.value = false;
+  }
+}
+
+// 选完目录已开工：清场/首次请求期间也要转圈，不能等 task.progress 才有反馈
+function onPickClosed(started?: boolean) {
+  pick.value = null;
+  if (started) busy.value = true;
+}
+
+// 步数耗尽的失败卡：不清场续跑，旧会话与分组位置都在后端
+async function resumeWork(item: ChatItem) {
+  if (busy.value) return;
+  busy.value = true;
+  try {
+    const result = await props.client.request<{ ok?: boolean; error?: string }>("chat.continue", {
+      area: props.area,
+    });
+    if (result?.ok) {
+      item.resumable = false; // 已接续，同一张卡不再重复点击
+      scrollToBottom(true);
+      return;
+    }
+    busy.value = false;
+    const reason = result?.error ?? "nothing-to-resume";
+    item.content = reasonText(reason);
+    if (reason !== "blender-busy") item.resumable = false; // 现场没了，再点也没用
+  } catch (error) {
+    busy.value = false;
+    item.content = error instanceof Error ? error.message : "继续失败";
   }
 }
 
@@ -240,6 +429,8 @@ async function clearChat() {
   }
   messages.value = [];
   streaming = null;
+  hasMore.value = false;
+  nextCursor.value = 0;
   busy.value = false; // chat.clear 会取消本区任务
 }
 
@@ -270,32 +461,66 @@ function onKeydown(event: KeyboardEvent) {
       </span>
     </div>
 
-    <div ref="scroller" class="chat-log">
-      <p v-if="messages.length === 0" class="chat-empty">描述你要生成的资产或要做的修改。</p>
+    <div class="chat-body">
+      <div ref="scroller" class="chat-log" @scroll="onScroll">
+        <div v-if="loadingOlder" class="older-loading">加载更早的消息…</div>
+        <p v-if="messages.length === 0" class="chat-empty">描述你要生成的资产或要做的修改。</p>
 
-      <template v-for="(message, index) in messages" :key="index">
-        <div v-if="message.role === 'image'" class="bubble image">
-          <img class="shot" :src="message.dataUrl" :alt="message.caption ?? '任务截图'" />
-          <span v-if="message.caption" class="caption">{{ message.caption }}</span>
+        <template v-for="(message, index) in messages" :key="index">
+          <div v-if="message.role === 'image'" class="bubble image">
+            <img class="shot" :src="message.dataUrl" :alt="message.caption ?? '任务截图'" />
+            <span v-if="message.caption" class="caption">{{ message.caption }}</span>
+          </div>
+          <div v-else-if="message.role === 'error'" class="error-card">
+            <strong>请求失败</strong>
+            <p>{{ message.content }}</p>
+            <button
+              v-if="message.resumable"
+              class="resume"
+              :disabled="busy"
+              @click="resumeWork(message)"
+            >
+              继续工作
+            </button>
+          </div>
+          <div v-else-if="message.role === 'draft'" class="draft-row">
+            <DraftCard
+              :prompt="message.content ?? ''"
+              @send="(text) => sendDraft(message, text)"
+              @cancel="cancelDraft(message)"
+            />
+          </div>
+          <div v-else-if="message.role === 'plan' && message.plan" class="draft-row">
+            <PlanCard :client="client" :area="area" :plan="message.plan" />
+          </div>
+          <div v-else-if="message.role === 'group'" class="group-divider">
+            <span>第 {{ message.groupIndex }}/{{ message.groupCount }} 组 · {{ message.title }}</span>
+          </div>
+          <div v-else class="bubble" :class="[message.role, { streaming: message.streaming }]">
+            <div class="md" v-html="renderMarkdown(message.content ?? '')" />
+            <i v-if="message.streaming" class="caret" />
+          </div>
+        </template>
+
+        <div v-if="showPending" class="bubble assistant pending">
+          <span class="dot" /><span class="dot" /><span class="dot" />
         </div>
-        <div v-else-if="message.role === 'error'" class="error-card">
-          <strong>请求失败</strong>
-          <p>{{ message.content }}</p>
-        </div>
-        <div v-else-if="message.role === 'draft'" class="draft-row">
-          <DraftCard
-            :prompt="message.content ?? ''"
-            @send="(text) => sendDraft(message, text)"
-            @cancel="cancelDraft(message)"
-          />
-        </div>
-        <div v-else-if="message.role === 'plan' && message.plan" class="draft-row">
-          <PlanCard :client="client" :area="area" :plan="message.plan" />
-        </div>
-        <div v-else class="bubble" :class="[message.role, { streaming: message.streaming }]">
-          <p>{{ message.content }}<i v-if="message.streaming" class="caret" /></p>
-        </div>
-      </template>
+      </div>
+
+      <button v-if="!atBottom" class="jump-bottom" title="回到底部" @click="jumpToBottom">
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path d="M12 5v14M5 12l7 7 7-7" />
+        </svg>
+      </button>
     </div>
 
     <footer class="chat-input">
@@ -312,10 +537,57 @@ function onKeydown(event: KeyboardEvent) {
         </button>
       </div>
     </footer>
+
+    <FolderPicker
+      v-if="pick"
+      :client="client"
+      :area="area"
+      :request-id="pick.requestId"
+      :root-name="pick.rootName"
+      :tree="pick.tree"
+      @close="onPickClosed"
+    />
   </section>
 </template>
 
 <style scoped>
+.chat-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+/* 往上翻后才出现的回底按钮，悬浮在聊天区底部正中心 */
+.jump-bottom {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+}
+
+.jump-bottom:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.older-loading {
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .chat-head {
   gap: 6px;
 }
@@ -397,10 +669,73 @@ function onKeydown(event: KeyboardEvent) {
   font-size: 12px;
 }
 
+.error-card .resume {
+  margin-top: 6px;
+  background: var(--accent);
+  border: 0;
+  color: #fff;
+  border-radius: 3px;
+  padding: 4px 12px;
+  font-size: 12px;
+}
+
+.error-card .resume:disabled {
+  opacity: 0.5;
+}
+
 .chat-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.group-divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.group-divider::before,
+.group-divider::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--border);
+}
+
+.pending {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 10px;
+}
+
+.pending .dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--muted);
+  animation: pending-dot 1s ease-in-out infinite;
+}
+
+.pending .dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.pending .dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes pending-dot {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+  }
+  40% {
+    opacity: 1;
+  }
 }
 
 .chat-actions .primary {

@@ -30,6 +30,95 @@ describe("FileTree", () => {
     expect(wrapper.find(".tree-empty").text()).toContain("暂无资产，右键可新建文件夹");
   });
 
+  it("renders folders and model files from assets.list", async () => {
+    const { client, wrapper } = mountTree("blender", (fake) => {
+      fake.results.set("assets.list", [
+        { name: "chair", relativePath: "Props/chair.glb", kind: "glb" },
+        { name: "table", relativePath: "Props/table.fbx", kind: "fbx" },
+        { name: "lamp", relativePath: "Street/lamp.glb", kind: "glb" },
+        { name: "root", relativePath: "root.blend", kind: "blend" },
+      ]);
+    });
+    await flushPromises();
+
+    expect(client.callsOf("assets.list")).toHaveLength(1);
+    expect(wrapper.findAll(".tree-dir .tree-name").map((row) => row.text())).toEqual([
+      "Props",
+      "Street",
+    ]);
+    expect(wrapper.findAll(".tree-file .tree-name").map((row) => row.text())).toEqual([
+      "chair.glb",
+      "table.fbx",
+      "lamp.glb",
+      "root.blend",
+    ]);
+    expect(wrapper.findAll(".tree-file .suffix").map((tag) => tag.text())).toEqual([
+      "glb",
+      "fbx",
+      "glb",
+      "blend",
+    ]);
+  });
+
+  it("shows empty folders even when they contain no model files", async () => {
+    const { wrapper } = mountTree("blender", (fake) => {
+      fake.results.set("assets.list", [
+        { name: "test1", relativePath: "test1", kind: "dir" },
+        { name: "Inner", relativePath: "test1/Inner", kind: "dir" },
+      ]);
+    });
+    await flushPromises();
+
+    expect(wrapper.findAll(".tree-dir .tree-name").map((row) => row.text())).toEqual([
+      "test1",
+      "Inner",
+    ]);
+    expect(wrapper.findAll(".tree-file")).toHaveLength(0);
+    expect(wrapper.find(".tree-empty").exists()).toBe(false);
+  });
+
+  it("refetches the tree when fileTree.changed arrives", async () => {
+    const { client } = mountTree("blender", (fake) => fake.results.set("assets.list", []));
+    await flushPromises();
+
+    client.emit("fileTree.changed", { area: "blender", reason: "incremental", paths: [""] });
+    await flushPromises();
+    expect(client.callsOf("assets.list")).toHaveLength(2);
+  });
+
+  it("renames the folder that was right-clicked", async () => {
+    const { client, wrapper } = mountTree("blender", (fake) => {
+      fake.results.set("assets.list", [
+        { name: "chair", relativePath: "Props/chair.glb", kind: "glb" },
+      ]);
+    });
+    await flushPromises();
+    vi.spyOn(window, "prompt").mockReturnValue("Models");
+
+    await wrapper.findAll(".tree-dir")[0].trigger("contextmenu", { clientX: 20, clientY: 30 });
+    await menuItems(wrapper)[1].trigger("click");
+    await flushPromises();
+
+    expect(client.callsOf("fs.operate")[0].params).toEqual({
+      area: "blender",
+      op: "rename",
+      path: "Props",
+      name: "Models",
+    });
+  });
+
+  it("refreshes after a folder is created so it shows up immediately", async () => {
+    const { client, wrapper } = mountTree("blender", (fake) => fake.results.set("assets.list", []));
+    await flushPromises();
+    vi.spyOn(window, "prompt").mockReturnValue("Props");
+
+    await openRootMenu(wrapper);
+    await menuItems(wrapper)[0].trigger("click");
+    await flushPromises();
+
+    expect(client.callsOf("assets.list")).toHaveLength(2);
+  });
+
   it("opens the five-item context menu on the tree body", async () => {
     const { wrapper } = mountTree();
     expect(wrapper.find(".ctx-menu").exists()).toBe(false);
@@ -132,6 +221,19 @@ describe("FileTree", () => {
     expect(wrapper.find(".tree-error").text()).toContain("invalid-path");
   });
 
+  it("surfaces ok:false results such as already-exists", async () => {
+    const { wrapper } = mountTree("blender", (fake) => {
+      fake.results.set("fs.operate", { ok: false, error: "already-exists" });
+    });
+    vi.spyOn(window, "prompt").mockReturnValue("Props");
+
+    await openRootMenu(wrapper);
+    await menuItems(wrapper)[0].trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".tree-error").text()).toContain("already-exists");
+  });
+
   it("closes the menu on Escape and on an outside click", async () => {
     const { wrapper } = mountTree();
 
@@ -148,8 +250,9 @@ describe("FileTree", () => {
   });
 
   it("never opens the custom menu for the Unity area", async () => {
-    const { wrapper } = mountTree("unity");
+    const { client, wrapper } = mountTree("unity");
     expect(wrapper.text()).toContain("尚未导入工程");
+    expect(client.callsOf("assets.list")).toHaveLength(0);
 
     await wrapper.find(".tree-body").trigger("contextmenu", { clientX: 10, clientY: 10 });
     expect(wrapper.find(".ctx-menu").exists()).toBe(false);

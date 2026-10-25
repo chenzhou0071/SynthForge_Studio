@@ -74,7 +74,7 @@ function cancel() {
       <button class="primary" @click="start">开始生成</button>
     </div>
     <div v-else class="plan-state">
-      {{ decided === "started" ? "已确认，等待选择存放位置…" : "已取消" }}
+      {{ decided === "started" ? "已确认，选择存放位置后开始生成" : "已取消" }}
     </div>
   </div>
 </template>

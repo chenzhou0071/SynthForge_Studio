@@ -1,4 +1,4 @@
-export type ChatRole = "user" | "assistant" | "error" | "image" | "draft" | "plan";
+export type ChatRole = "user" | "assistant" | "error" | "image" | "draft" | "plan" | "group";
 
 export interface PlanPlacement {
   name: string;
@@ -28,6 +28,12 @@ export interface ChatItem {
   taskId?: string;
   mode?: "lowpoly" | "cloud3d";
   plan?: PlanData;
+  // 分组分隔条：每组建模开始前插一条，截图与文字就不会堆成一团
+  groupIndex?: number;
+  groupCount?: number;
+  title?: string;
+  // 步数耗尽失败卡：可点「继续工作」接着跑，不清场
+  resumable?: boolean;
 }
 
 // session.load 返回 {messages, hasMore, nextCursor}；界面只认能渲染的两种角色

@@ -275,6 +275,93 @@ button {
   margin: 0;
 }
 
+/* v-html 渲染的 Markdown：表格/代码块恢复块级排版，气泡本体仍保留 pre-wrap 给纯文本 */
+.bubble .md {
+  white-space: normal;
+}
+
+.md > :first-child {
+  margin-top: 0;
+}
+
+.md > :last-child {
+  margin-bottom: 0;
+}
+
+.md p {
+  margin: 0 0 6px;
+}
+
+.md h1,
+.md h2,
+.md h3,
+.md h4 {
+  margin: 10px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.md ul,
+.md ol {
+  margin: 0 0 6px;
+  padding-left: 20px;
+}
+
+.md li {
+  margin: 2px 0;
+}
+
+.md code {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+  padding: 1px 4px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 12px;
+}
+
+.md pre {
+  background: #141414;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin: 0 0 8px;
+  overflow-x: auto;
+}
+
+.md pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.md table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 4px 0 8px;
+  font-size: 12px;
+}
+
+.md th,
+.md td {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.md th {
+  background: rgba(255, 255, 255, 0.05);
+  font-weight: 600;
+}
+
+.md blockquote {
+  margin: 0 0 6px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+  color: var(--muted);
+}
+
 .caret {
   display: inline-block;
   width: 6px;
