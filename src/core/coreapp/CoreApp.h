@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 
+#include "core/agent/AgentOrchestrator.h"
 #include "core/llm/LlmGateway.h"
 #include "core/mcp/BlenderGate.h"
 
@@ -59,8 +60,12 @@ private:
     McpRuntime* m_blender = nullptr; // QObject child，析构由 parent 负责
     std::unique_ptr<PreflightChecker> m_preflight;
     SummarizerAgent* m_summarizer = nullptr; // QObject child，析构由 parent 负责
+    AgentOrchestrator* m_orch = nullptr;     // QObject child，析构由 parent 负责
     BlenderGate m_blenderGate; // Blender agent 任务与 unity 转换互斥
     QJsonArray m_blenderTools;
+    QHash<QString, QJsonObject> m_pendingPlans; // area -> 计划卡 JSON
+    QHash<QString, QString> m_planPrompts;      // area -> 已确认提示词
+    QSet<QString> m_planCancelled;              // area -> 规划取消标记
     QHash<QString, QString> m_status; // area -> off|reconnecting|ready
     QHash<QString, QString> m_hints;  // area -> 状态提示文案
     QSet<QString> m_everReady;        // 曾握手成功的区：之后的 off 才算桥接崩溃

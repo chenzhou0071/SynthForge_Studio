@@ -1,5 +1,6 @@
 #include "core/coreapp/CoreApp.h"
 
+#include "core/agent/AgentOrchestrator.h"
 #include "core/agent/SummarizerAgent.h"
 #include "core/llm/LlmGateway.h"
 #include "core/mcp/BridgeCommands.h"
@@ -70,6 +71,74 @@ bool CoreApp::start()
             [this](const QString& area, const QString& reason) {
                 m_ws->broadcastEvent(QStringLiteral("error.card"),
                                      QJsonObject{{"area", area}, {"reason", reason}});
+            });
+
+    // 编排器：计划卡与分组执行。plan() 由 draft.send 触发（Task 7），
+    // plan.confirm / plan.cancel 在 Task 4 接线；本轮先把信号接到前端。
+    m_orch = new AgentOrchestrator(m_llm.get(), m_blender->client(), this);
+    m_orch->setBlenderGate(&m_blenderGate); // 仅 blender 编排器持有租约
+    connect(m_orch, &AgentOrchestrator::toolStep, this,
+            [this](const QString& area, const QString& tool, const QString& status) {
+                m_ws->broadcastEvent(QStringLiteral("tool.step"),
+                                     QJsonObject{{"area", area},
+                                                 {"tool", tool},
+                                                 {"status", status}});
+            });
+    connect(m_orch, &AgentOrchestrator::delta, this,
+            [this](const QString& area, const QString& text) {
+                m_ws->broadcastEvent(QStringLiteral("chat.delta"),
+                                     QJsonObject{{"area", area}, {"text", text}});
+            });
+    connect(m_orch, &AgentOrchestrator::finalText, this,
+            [this](const QString& area, const QString& text) {
+                m_sessions->appendMessage(area, QStringLiteral("assistant"), text);
+                m_ws->broadcastEvent(QStringLiteral("chat.message"),
+                                     QJsonObject{{"area", area},
+                                                 {"role", "assistant"},
+                                                 {"content", text}});
+            });
+    connect(m_orch, &AgentOrchestrator::failed, this,
+            [this](const QString& area, const QString& reason) {
+                m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                     QJsonObject{{"area", area}, {"reason", reason}});
+            });
+    connect(m_orch, &AgentOrchestrator::groupProgress, this,
+            [this](const QString& area, int index, int count, const QString& title) {
+                m_ws->broadcastEvent(QStringLiteral("task.progress"),
+                                     QJsonObject{{"area", area},
+                                                 {"groupIndex", index},
+                                                 {"groupCount", count},
+                                                 {"title", title}});
+            });
+    connect(m_orch, &AgentOrchestrator::imageReceived, this,
+            [this](const QString& area, const QString& taskId, const QString& dataUrl,
+                   const QString& caption) {
+                m_ws->broadcastEvent(QStringLiteral("chat.image"),
+                                     QJsonObject{{"area", area},
+                                                 {"taskId", taskId},
+                                                 {"dataUrl", dataUrl},
+                                                 {"caption", caption}});
+            });
+    connect(m_orch, &AgentOrchestrator::planReady, this,
+            [this](const QString& area, const QString& taskId, const QJsonObject& plan) {
+                if (m_planCancelled.remove(area))
+                    return; // 已取消的规划不再弹卡
+                m_pendingPlans.insert(area, plan);
+                m_ws->broadcastEvent(QStringLiteral("plan.created"),
+                                     QJsonObject{{"area", area},
+                                                 {"taskId", taskId},
+                                                 {"groups", plan.value("groups")},
+                                                 {"totalSteps", plan.value("totalSteps")}});
+            });
+    connect(m_orch, &AgentOrchestrator::artifactsReady, this,
+            [this](const QString& area, const QStringList& absoluteGlbs) {
+                // Task 5 接管：转相对路径 + asset.created 增量。当前只通知前端刷新树
+                if (area != QLatin1String("blender") || absoluteGlbs.isEmpty())
+                    return;
+                m_ws->broadcastEvent(QStringLiteral("fileTree.changed"),
+                                     QJsonObject{{"area", area},
+                                                 {"reason", "full"},
+                                                 {"paths", QJsonArray{}}});
             });
 
     m_router->registerHandler(QStringLiteral("settings.get"), [this](const QJsonObject&) {

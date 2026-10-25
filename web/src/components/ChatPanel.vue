@@ -2,9 +2,10 @@
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { isCloudConfigured } from "../chat/cloud";
 import { toChatItems } from "../chat/history";
-import type { ChatItem } from "../chat/history";
+import type { ChatItem, PlanGroup } from "../chat/history";
 import type { WsClient } from "../ws/WsClient";
 import DraftCard from "./DraftCard.vue";
+import PlanCard from "./PlanCard.vue";
 
 type Area = "blender" | "unity";
 
@@ -116,6 +117,26 @@ onMounted(() => {
         content: draft.prompt ?? "",
         taskId: draft.taskId,
         mode: mode.value,
+      });
+      scrollToBottom();
+    }),
+    props.client.on("plan.created", (data) => {
+      const payload = data as {
+        area?: string;
+        taskId?: string;
+        groups?: PlanGroup[];
+        totalSteps?: number;
+      };
+      if (payload.area !== props.area) return;
+      // 计划已就绪，后端不再生成；等用户点开始才选存放位置
+      busy.value = false;
+      messages.value.push({
+        role: "plan",
+        plan: {
+          taskId: payload.taskId ?? "",
+          groups: payload.groups ?? [],
+          totalSteps: payload.totalSteps ?? 0,
+        },
       });
       scrollToBottom();
     }),
@@ -265,6 +286,9 @@ function onKeydown(event: KeyboardEvent) {
             @send="(text) => sendDraft(message, text)"
             @cancel="cancelDraft(message)"
           />
+        </div>
+        <div v-else-if="message.role === 'plan' && message.plan" class="draft-row">
+          <PlanCard :client="client" :area="area" :plan="message.plan" />
         </div>
         <div v-else class="bubble" :class="[message.role, { streaming: message.streaming }]">
           <p>{{ message.content }}<i v-if="message.streaming" class="caret" /></p>
