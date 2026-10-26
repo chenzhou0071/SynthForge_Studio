@@ -80,6 +80,8 @@ signals:
     void imageReceived(const QString& area, const QString& taskId, const QString& dataUrl,
                        const QString& caption);
     void artifactsReady(const QString& area, const QStringList& absoluteGlbs);
+    // 进入最后的导出回合：前端先挂“导出中”，避免预览到只写了一半的 glb
+    void exportStarted(const QString& area, const QString& folder);
 
 private:
     enum class GroupPhase

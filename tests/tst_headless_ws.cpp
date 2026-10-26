@@ -1,3 +1,4 @@
+#include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -5,6 +6,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QPointer>
+#include <QProcessEnvironment>
 #include <QStringList>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -14,8 +16,10 @@
 #include <QtTest>
 
 #include "core/coreapp/CoreApp.h"
+#include "core/mcp/BridgeCommands.h"
 #include "core/store/SessionStore.h"
 #include "core/ws/WsServer.h"
+#include "mock/MockLlmServer.h"
 
 namespace {
 
@@ -122,6 +126,16 @@ public:
 
     int mark() const { return m_log.size(); }
 
+    // mark 之后最后一个同名事件的 payload；没有则返回空对象
+    QJsonObject lastEvent(const QString& name, int mark = 0) const
+    {
+        for (int i = m_log.size() - 1; i >= mark; --i) {
+            if (m_log.at(i).value(QStringLiteral("event")).toString() == name)
+                return m_log.at(i).value(QStringLiteral("data")).toObject();
+        }
+        return {};
+    }
+
     // mark 之后的事件名（请求-响应帧没有 event 字段，会被跳过）
     QStringList eventsSince(int mark) const
     {
@@ -132,6 +146,22 @@ public:
                 names << frame.value(QStringLiteral("event")).toString();
         }
         return names;
+    }
+
+    // 把某类事件里的 text 字段拼起来：验证流式期间实际发到前端的内容
+    QString textSince(const QString& name, int mark = 0) const
+    {
+        QString text;
+        for (int i = mark; i < m_log.size(); ++i) {
+            const QJsonObject& frame = m_log.at(i);
+            if (frame.value(QStringLiteral("event")).toString() != name)
+                continue;
+            text += frame.value(QStringLiteral("data"))
+                        .toObject()
+                        .value(QStringLiteral("text"))
+                        .toString();
+        }
+        return text;
     }
 
 private:
@@ -155,6 +185,38 @@ QJsonObject configureLlm(WsClient& client, const QString& baseUrl)
 QJsonObject sendChat(WsClient& client, const QString& text)
 {
     return client.request(QStringLiteral("chat.send"), {{"area", "blender"}, {"text", text}});
+}
+
+MockLlmServer::Turn textTurn(const QString& text)
+{
+    return MockLlmServer::Turn{.frames = {MockLlm::textChunk(text), MockLlm::doneChunk()}};
+}
+
+// mock server 与测试 exe 同目录；不用 CMake 宏传路径，Windows 反斜杠会被当成转义
+QString mockServerProgram()
+{
+#ifdef Q_OS_WIN
+    return QCoreApplication::applicationDirPath() + QStringLiteral("/mock_mcp_server.exe");
+#else
+    return QCoreApplication::applicationDirPath() + QStringLiteral("/mock_mcp_server");
+#endif
+}
+
+BridgeCommand mockBlenderBridge()
+{
+    BridgeCommand command;
+    command.program = mockServerProgram();
+    command.env = QProcessEnvironment::systemEnvironment();
+    return command;
+}
+
+// 走低模链路必须带 mode：不传 mode 会落到 P2 的通用流，不会出草稿卡
+QJsonObject sendLowpoly(WsClient& client, const QString& text)
+{
+    return client.request(QStringLiteral("chat.send"),
+                          {{QStringLiteral("area"), QStringLiteral("blender")},
+                           {QStringLiteral("mode"), QStringLiteral("lowpoly")},
+                           {QStringLiteral("text"), text}});
 }
 
 int messageCount(WsClient& client)
@@ -218,6 +280,208 @@ private slots:
 
         const QJsonObject unknown = client.request(QStringLiteral("no.such.method"), {});
         QVERIFY(unknown.contains("error"));
+    }
+
+    // 讨论模式：Blender 未连接也能答；[[EXEC]] 不进正文，草稿成一行 draft
+    void askModeSplitsExecDraftAndKeepsCardsOutOfHistory()
+    {
+        MockLlmServer server(
+            {textTurn(QStringLiteral("建议把招牌换成旧铁皮。\n\n[[EXEC]]\n"
+                                     "把招牌换成深绿做旧铁皮\n[[/EXEC]]")),
+             textTurn(QStringLiteral("明白，先不改。"))});
+        QVERIFY(server.listen());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        CoreApp app({dir.path(), true, dir.filePath(QStringLiteral("library"))});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+        QVERIFY(configureLlm(client, server.baseUrl()).contains(QStringLiteral("result")));
+
+        const int mark = client.mark();
+        const QJsonObject sent =
+            client.request(QStringLiteral("chat.send"),
+                           {{"area", "blender"},
+                            {"mode", "ask"},
+                            {"text", QStringLiteral("这个招牌怎么改才好看")}});
+        QVERIFY2(sent.value(QStringLiteral("result")).toObject().value("accepted").toBool(),
+                 "ask 不应因 Blender 未就绪被拒绝");
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !client.lastEvent(QStringLiteral("draft.created"), mark).isEmpty(), 10000);
+        const QJsonObject message = client.lastEvent(QStringLiteral("chat.message"), mark);
+        QCOMPARE(message.value(QStringLiteral("role")).toString(), QStringLiteral("assistant"));
+        QCOMPARE(message.value(QStringLiteral("content")).toString(),
+                 QStringLiteral("建议把招牌换成旧铁皮。"));
+
+        const QJsonObject created = client.lastEvent(QStringLiteral("draft.created"), mark);
+        QVERIFY(created.value(QStringLiteral("id")).toInteger() > 0);
+        QCOMPARE(created.value(QStringLiteral("prompt")).toString(),
+                 QStringLiteral("把招牌换成深绿做旧铁皮"));
+        QCOMPARE(created.value(QStringLiteral("origin")).toString(),
+                 QStringLiteral("discussion"));
+
+        // 流式期间不能把标记和草稿正文发出去，否则用户会先看到 [[EXEC]]
+        const QString streamed = client.textSince(QStringLiteral("chat.delta"), mark);
+        QVERIFY2(!streamed.contains(QStringLiteral("[[EXEC]]")), qPrintable(streamed));
+        QVERIFY2(!streamed.contains(QStringLiteral("[[/EXEC]]")), qPrintable(streamed));
+        QVERIFY2(!streamed.contains(QStringLiteral("把招牌换成深绿做旧铁皮")),
+                 qPrintable(streamed));
+        QVERIFY2(streamed.contains(QStringLiteral("建议把招牌换成旧铁皮。")),
+                 qPrintable(streamed));
+
+        // 第二次讨论：上一轮写下的 draft 行不能当对话历史喂给模型
+        QVERIFY(client
+                    .request(QStringLiteral("chat.send"),
+                             {{"area", "blender"},
+                              {"mode", "ask"},
+                              {"text", QStringLiteral("先不改")}})
+                    .value(QStringLiteral("result"))
+                    .toObject()
+                    .value("accepted")
+                    .toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(server.requestCount(), 2, 10000);
+        const QJsonArray history = server.requestObjectAt(1)
+                                       .value(QStringLiteral("messages"))
+                                       .toArray();
+        for (const QJsonValue& value : history) {
+            const QString role =
+                value.toObject().value(QStringLiteral("role")).toString();
+            QVERIFY2(role == QLatin1String("system") || role == QLatin1String("user")
+                         || role == QLatin1String("assistant"),
+                     qPrintable(QStringLiteral("草稿行混进了讨论历史：%1").arg(role)));
+        }
+    }
+
+    // 重新生成失败也要回一条 draft.failed：前端靠它停转圈、恢复按钮
+    void draftRegenerateFailureEmitsFailedEvent()
+    {
+        MockLlmServer server(
+            {textTurn(QStringLiteral("建议改材质。\n[[EXEC]]\n把招牌换成旧铁皮\n[[/EXEC]]")),
+             MockLlmServer::Turn{.frames = {}, .status = 500}});
+        QVERIFY(server.listen());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        CoreApp app({dir.path(), true, dir.filePath(QStringLiteral("library"))});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+        QVERIFY(configureLlm(client, server.baseUrl()).contains(QStringLiteral("result")));
+
+        QVERIFY(client
+                    .request(QStringLiteral("chat.send"),
+                             {{"area", "blender"},
+                              {"mode", "ask"},
+                              {"text", QStringLiteral("招牌怎么改")}})
+                    .value(QStringLiteral("result"))
+                    .toObject()
+                    .value("accepted")
+                    .toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !client.lastEvent(QStringLiteral("draft.created")).isEmpty(), 10000);
+        const qint64 id = client.lastEvent(QStringLiteral("draft.created"))
+                              .value(QStringLiteral("id"))
+                              .toInteger();
+
+        const int mark = client.mark();
+        QVERIFY(client.request(QStringLiteral("draft.regenerate"), {{"id", id}})
+                    .value(QStringLiteral("result"))
+                    .toObject()
+                    .value("accepted")
+                    .toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !client.lastEvent(QStringLiteral("draft.failed"), mark).isEmpty(), 10000);
+        const QJsonObject failed = client.lastEvent(QStringLiteral("draft.failed"), mark);
+        QCOMPARE(failed.value(QStringLiteral("id")).toInteger(), id);
+        QVERIFY(!failed.value(QStringLiteral("reason")).toString().isEmpty());
+        QVERIFY(client.eventsSince(mark).contains(QStringLiteral("error.card")));
+    }
+
+    // 文件树刷新必须重新扫描磁盘：外部写入的文件也要出现在 assets.list
+    void refreshScansFilesWrittenOutsideTheApp()
+    {
+        QTemporaryDir dir;
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library + QStringLiteral("/Props")));
+        QFile glb(library + QStringLiteral("/Props/chair.glb"));
+        QVERIFY(glb.open(QIODevice::WriteOnly));
+        glb.write("glTF");
+        glb.close();
+
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        const int mark = client.mark();
+        const QJsonObject refreshed =
+            client.request(QStringLiteral("fs.operate"),
+                           {{"area", "blender"}, {"op", "refresh"}, {"path", ""}})
+                .value(QStringLiteral("result"))
+                .toObject();
+        QVERIFY(refreshed.value(QStringLiteral("ok")).toBool());
+        QVERIFY(client.eventsSince(mark).contains(QStringLiteral("fileTree.changed")));
+
+        const QJsonArray items = client.request(QStringLiteral("assets.list"),
+                                                {{"area", "blender"}})
+                                     .value(QStringLiteral("result"))
+                                     .toArray();
+        bool found = false;
+        for (const QJsonValue& value : items) {
+            if (value.toObject().value(QStringLiteral("relativePath")).toString()
+                == QLatin1String("Props/chair.glb"))
+                found = true;
+        }
+        QVERIFY2(found, "刷新后 assets.list 里没有外部写入的 chair.glb");
+    }
+
+    // 只有 glb 的云资产：讨论时必须说明没有 .blend、只能重新生成
+    void askModeMarksAssetsWithoutBlendSource()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("这个资产没有源文件，只能重新生成。"))});
+        QVERIFY(server.listen());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir(library).mkpath(QStringLiteral("Props")));
+        QFile glb(QDir(library).filePath(QStringLiteral("Props/chair.glb")));
+        QVERIFY(glb.open(QIODevice::WriteOnly));
+        glb.write("glTF");
+        glb.close();
+
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+        QVERIFY(configureLlm(client, server.baseUrl()).contains(QStringLiteral("result")));
+
+        QVERIFY(client
+                    .request(QStringLiteral("chat.send"),
+                             {{"area", "blender"},
+                              {"mode", "ask"},
+                              {"asset", "Props/chair.glb"},
+                              {"text", QStringLiteral("这个能怎么改")}})
+                    .value(QStringLiteral("result"))
+                    .toObject()
+                    .value("accepted")
+                    .toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(server.requestCount(), 1, 10000);
+
+        const QString system = server.requestObjectAt(0)
+                                   .value(QStringLiteral("messages"))
+                                   .toArray()
+                                   .first()
+                                   .toObject()
+                                   .value(QStringLiteral("content"))
+                                   .toString();
+        QVERIFY2(system.contains(QStringLiteral("无 .blend 源文件，只能重新生成")),
+                 qPrintable(system));
+        QVERIFY2(system.contains(QStringLiteral("Props/chair.glb（无 .blend，只能重新生成）")),
+                 qPrintable(system));
+
+        // 收尾：等回复落库后再销毁应用
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !client.lastEvent(QStringLiteral("chat.message")).isEmpty(), 10000);
     }
 
     void newClientReceivesConnStatusSnapshot()
@@ -354,6 +618,9 @@ private slots:
                     .startsWith(QStringLiteral("file://")));
         QCOMPARE(model.value(QStringLiteral("blendPath")).toString(),
                  QStringLiteral("Props/chair.blend"));
+        // 前端靠 size + modified 判断导出中的 glb 是否已经写完
+        QVERIFY(model.value(QStringLiteral("size")).toDouble() > 0);
+        QVERIFY(!model.value(QStringLiteral("modified")).toString().isEmpty());
 
         const QJsonObject blendInfo = client.request(QStringLiteral("file.read"),
                                                      {{"area", "blender"},
@@ -616,6 +883,113 @@ private slots:
         QVERIFY(!raw.contains("m5"));
         QVERIFY(raw.contains("最新一句"));
         QVERIFY(!raw.contains("\"ts\":")); // 只发 role/content，不带 id/ts
+    }
+
+    // 计划卡落库：draft.send 走真实握手 → plan.created 带 id → 刷新能按 id 恢复 → 确认后置 started
+    void planCardPersistsAndUpdatesState()
+    {
+        MockLlmServer server({
+            textTurn(QStringLiteral("主题与视角：测试店面")),
+            textTurn(QStringLiteral(R"({"rules":[],"groups":[{"title":"底座"},{"title":"主体"}]})")),
+        });
+        QVERIFY(server.listen());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        // 模拟上次会话留下的一张已取消计划卡：它不能混进这次规划请求的历史
+        {
+            SessionStore seed(dir.path() + QStringLiteral("/sessions.db"));
+            QVERIFY(seed.open());
+            QVERIFY(seed.appendMessage(QStringLiteral("blender"), QStringLiteral("plan"),
+                                       QStringLiteral("{}"),
+                                       QJsonObject{{QStringLiteral("state"),
+                                                    QStringLiteral("cancelled")}})
+                    > 0);
+        }
+
+        CoreApp app({dir.path(), true, dir.filePath(QStringLiteral("library")),
+                     mockBlenderBridge()});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+        // 假桥接握手完成后 isReady() 才为真，draft.send 的前置检查才会放行
+        QTRY_VERIFY_WITH_TIMEOUT(client.lastEvent(QStringLiteral("conn.status"))
+                                     .value(QStringLiteral("blender")).toString()
+                                 == QStringLiteral("ready"),
+                                 10000);
+        QVERIFY(configureLlm(client, server.baseUrl()).contains(QStringLiteral("result")));
+
+        QVERIFY(sendLowpoly(client, QStringLiteral("做一个测试店面"))
+                    .value(QStringLiteral("result")).toObject()
+                    .value(QStringLiteral("accepted")).toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(!client.lastEvent(QStringLiteral("draft.created")).isEmpty(),
+                                 10000);
+        const qint64 draftId = client.lastEvent(QStringLiteral("draft.created"))
+                                   .value(QStringLiteral("id")).toInteger();
+        QVERIFY(draftId > 0);
+
+        const QJsonObject sent =
+            client.request(QStringLiteral("draft.send"),
+                           QJsonObject{{QStringLiteral("id"), draftId},
+                                       {QStringLiteral("prompt"), QStringLiteral("做一个测试店面")}})
+                .value(QStringLiteral("result"))
+                .toObject();
+        QVERIFY2(sent.value(QStringLiteral("accepted")).toBool(),
+                 qPrintable(sent.value(QStringLiteral("reason")).toString()));
+        QTRY_VERIFY_WITH_TIMEOUT(!client.lastEvent(QStringLiteral("plan.created")).isEmpty(),
+                                 10000);
+        const QJsonObject created = client.lastEvent(QStringLiteral("plan.created"));
+        const qint64 planId = created.value(QStringLiteral("id")).toInteger();
+        QVERIFY(planId > 0);
+
+        // 历史里能看到计划行，且 JSON 能解析
+        const QJsonArray rows = client.request(QStringLiteral("session.load"),
+                                               {{QStringLiteral("area"), QStringLiteral("blender")}})
+                                    .value(QStringLiteral("result")).toObject()
+                                    .value(QStringLiteral("messages")).toArray();
+        bool found = false;
+        for (const QJsonValue& value : rows) {
+            const QJsonObject row = value.toObject();
+            if (row.value(QStringLiteral("id")).toInteger() != planId)
+                continue;
+            found = true;
+            QCOMPARE(row.value(QStringLiteral("role")).toString(), QStringLiteral("plan"));
+            QCOMPARE(row.value(QStringLiteral("meta")).toObject()
+                         .value(QStringLiteral("state")).toString(),
+                     QStringLiteral("pending"));
+            QCOMPARE(
+                QJsonDocument::fromJson(row.value(QStringLiteral("content")).toString().toUtf8())
+                    .object().value(QStringLiteral("groups")).toArray().size(),
+                2);
+        }
+        QVERIFY(found);
+
+        // 第 2 次 LLM 请求是 planner：卡片行（这里是上面种的 plan）不能原样喂给模型
+        const QJsonArray sentMessages =
+            server.requestObjectAt(1).value(QStringLiteral("messages")).toArray();
+        QVERIFY(!sentMessages.isEmpty());
+        for (const QJsonValue& value : sentMessages) {
+            const QString role = value.toObject().value(QStringLiteral("role")).toString();
+            QVERIFY2(role == QLatin1String("system") || role == QLatin1String("user")
+                         || role == QLatin1String("assistant"),
+                     qPrintable(QStringLiteral("卡片行混进了 LLM 历史：%1").arg(role)));
+        }
+
+        // 确认后置为 started，刷新不会又变回可点击
+        const QJsonObject confirmed =
+            client.request(QStringLiteral("plan.confirm"),
+                           QJsonObject{{QStringLiteral("area"), QStringLiteral("blender")},
+                                       {QStringLiteral("taskId"),
+                                        created.value(QStringLiteral("taskId"))},
+                                       {QStringLiteral("id"), planId}})
+                .value(QStringLiteral("result"))
+                .toObject();
+        QCOMPARE(confirmed.value(QStringLiteral("ok")).toBool(), true);
+        SessionStore store(dir.path() + QStringLiteral("/sessions.db"));
+        QVERIFY(store.open());
+        QCOMPARE(store.messageById(planId).value(QStringLiteral("meta")).toObject()
+                     .value(QStringLiteral("state")).toString(),
+                 QStringLiteral("started"));
     }
 
     void bridgeRestartReportsNotRegistered()

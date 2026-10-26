@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, watch } from "vue";
 import type { WsClient } from "../ws/WsClient";
 
 const props = defineProps<{
   client: WsClient;
   area: string;
+  // 消息行号：确认/取消都按它回写 meta.state
+  id?: number;
+  state?: "pending" | "started" | "cancelled";
   plan: {
     taskId: string;
     rules: string[];
@@ -17,8 +20,14 @@ const props = defineProps<{
     totalSteps: number;
   };
 }>();
-const decided = ref<"pending" | "started" | "cancelled">("pending");
+const decided = ref<"pending" | "started" | "cancelled">(props.state ?? "pending");
 const error = ref("");
+watch(
+  () => props.state,
+  (state) => {
+    if (state) decided.value = state;
+  },
+);
 
 async function start() {
   error.value = "";
@@ -26,12 +35,17 @@ async function start() {
     const res = await props.client.request<{ ok?: boolean; error?: string }>("plan.confirm", {
       area: props.area,
       taskId: props.plan.taskId,
+      id: props.id,
     });
     if (res?.ok === false) {
       // blender-busy：计划卡保留，等当前建模/转换结束后可再次点开始
-      error.value = res.error === "blender-busy"
-        ? "Blender 会话正忙：请等当前建模/转换完成后再点开始"
-        : (res.error ?? "确认失败");
+      error.value =
+        res.error === "plan-not-found"
+          ? "计划已失效：应用重启后旧计划无法继续，请重新生成。"
+          : res.error === "blender-busy"
+            ? "Blender 会话正忙：请等当前建模/转换完成后再点开始"
+            : (res.error ?? "确认失败");
+      if (res.error === "plan-not-found") decided.value = "cancelled"; // 失效卡置灰
       return;
     }
     decided.value = "started";
@@ -40,11 +54,13 @@ async function start() {
   }
 }
 
-function cancel() {
+async function cancel() {
   decided.value = "cancelled";
-  props.client.request("plan.cancel", { area: props.area, taskId: props.plan.taskId }).catch(() => {
-    // 取消失败不阻断 UI：卡片已置灰，后端即便没收到也不会再执行
-  });
+  await props.client
+    .request("plan.cancel", { area: props.area, taskId: props.plan.taskId, id: props.id })
+    .catch(() => {
+      // 取消失败不阻断 UI：卡片已置灰，后端即便没收到也不会再执行
+    });
 }
 </script>
 

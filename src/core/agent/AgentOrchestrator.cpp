@@ -11,6 +11,7 @@
 #include <QImage>
 #include <QJsonDocument>
 #include <QJsonValue>
+#include <QTimer>
 
 namespace {
 
@@ -64,7 +65,8 @@ QString blenderSystemPrompt()
     return QStringLiteral(
         "你是 SynthForge Studio 的 Blender 建模 agent。使用提供的 MCP 工具"
         "（execute_blender_code 等）完成低模场景：先清场再分组建造，"
-        "必要时截图查看结果并修正；全部完成后按规范导出并落盘。\n"
+        "必要时截图查看结果并修正。不要自行导出或保存文件："
+        "导出与保存由系统在最后的导出回合统一执行。\n"
         "沟通方式（必须遵守）：全程用简体中文（对象名、代码、文件路径除外），"
         "不要用英文写进度说明或最终回复。每一轮先用 1 句中文说明这一步要做什么、"
         "依据是什么，再调用工具，不要只发工具调用不解释；工具返回截图后，"
@@ -89,7 +91,9 @@ QString blenderSystemPrompt()
         "10. 灯光必须是真实光源对象（AREA/POINT/SPOT/SUN），室内每个空间至少一盏；"
         "不要用自发光平面、光雾、飞虫、湿地面或贴图冒充照明。光粒子、光雾可以用粒子/着色器"
         "增强氛围，但必须有真实光源支撑；不要默认生成飞虫、湿地面、积水等元素，用户明确要求时"
-        "才做，且不得用几何体冒充。");
+        "才做，且不得用几何体冒充。\n"
+        "11. 建造与自检阶段禁止调用 export_scene / save_as_mainfile；"
+        "收到系统的导出指令后再执行，且只执行一次。");
 }
 
 // 截图为 image content 时压成 JPEG base64：同一份结果既回喂模型又给前端展示
@@ -332,6 +336,8 @@ void AgentOrchestrator::resume(const QString& taskId, TaskManager* tm)
     const int remaining = qMax(1, m_plan.groups.size() - m_groupIndex);
     m_maxSteps += qMin(30 * remaining + 20, 200);
     m_stream.clear();
+    if (m_exporting) // 上次卡在导出回合：续跑时前端仍要挂“导出中”
+        emit exportStarted(m_area, m_targetFolder);
     tick(); // 不清场、不重发分组指令：接着上一轮的会话往下跑
 }
 
@@ -450,6 +456,7 @@ void AgentOrchestrator::onTurnFinished() // 一轮 LLM 无工具调用时进入
     if (!m_exporting) {
         finishTurnText();
         m_exporting = true; // 最后一轮：按规格 5.5 导出三件套并保存源文件
+        emit exportStarted(m_area, m_targetFolder);
         // 修改任务已有目标基名：直接覆盖，不能让“撞名加序号”把修改变成新建
         const bool overwrite = !m_plan.targetBase.isEmpty();
         const QString baseHint =
@@ -553,23 +560,40 @@ void AgentOrchestrator::executeToolCalls(const QJsonArray& calls)
         emit toolStep(m_area, name, "running");
         if (m_toolCallHook)
             m_toolCallHook(name, true); // P6：异步工具调用全程抑制 watcher
-        m_mcp->callTool(name, args,
-                        [this, call, name](const QJsonValue& result, const QJsonObject& error) {
-                            if (m_toolCallHook)
-                                m_toolCallHook(name, false);
-                            emit toolStep(m_area, name, error.isEmpty() ? "done" : "error");
-                            QStringList images;
-                            m_messages.append(
-                                toolResultMessage(call.value(QStringLiteral("id")).toString(),
-                                                  result, error, &images));
-                            for (const QString& dataUrl : images)
-                                emit imageReceived(m_area, m_taskId, dataUrl, name);
-                            if (--m_pendingToolCalls == 0) {
-                                m_awaitingTools = false;
-                                m_stream.clear();
-                                tick(); // 回喂后继续下一轮
-                            }
-                        });
+        auto finishCall = [this, call, name](const QJsonValue& result,
+                                             const QJsonObject& error) {
+            if (m_toolCallHook)
+                m_toolCallHook(name, false);
+            emit toolStep(m_area, name, error.isEmpty() ? "done" : "error");
+            QStringList images;
+            m_messages.append(toolResultMessage(call.value(QStringLiteral("id")).toString(),
+                                                result, error, &images));
+            for (const QString& dataUrl : images)
+                emit imageReceived(m_area, m_taskId, dataUrl, name);
+            if (--m_pendingToolCalls == 0) {
+                m_awaitingTools = false;
+                m_stream.clear();
+                tick(); // 回喂后继续下一轮
+            }
+        };
+
+        // 建造/自检阶段模型自己 export/save 会先生成一份文件，系统收尾再导出就变成 _2。
+        // 这里硬拦：只有 m_exporting 的导出回合允许落盘。
+        const QString code = args.value(QStringLiteral("code")).toString();
+        if (name == QLatin1String("execute_blender_code") && !m_exporting
+            && (code.contains(QLatin1String("export_scene"))
+                || code.contains(QLatin1String("save_as_mainfile")))) {
+            // 必须等本轮 LLM 的 onDone 先到：同步回包会让 onDone 误以为工具已结束，
+            // 把建造阶段直接推到自检，跳过用户脚本里的下一轮文字。
+            QTimer::singleShot(0, this, [finishCall]() {
+                finishCall({}, QJsonObject{{"message",
+                                            QStringLiteral("建造阶段禁止自行导出或保存；"
+                                                           "导出由系统在最后统一执行，请继续建模。")}});
+            });
+            continue;
+        }
+
+        m_mcp->callTool(name, args, finishCall);
     }
 }
 

@@ -187,6 +187,7 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(finalSpy.count(), 1, 5000);
         QCOMPARE(server.requestCount(), 4); // 建造 → 自检 → 导出 → 收尾
         QVERIFY(server.requestAt(0).contains(QStringLiteral("简体中文"))); // 面向用户的话必须是中文
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("不要自行导出"))); // 中途导出会撞名生成 _2
         QVERIFY(server.requestAt(0).contains(QStringLiteral("底座边长按真实尺度反推"))); // 不能把主体做小
         QVERIFY(server.requestAt(0).contains(QStringLiteral("与主题无关"))); // 合理补充也有限度
         QVERIFY(server.requestAt(0).contains(QStringLiteral("真实光源"))); // 灯光必须是真实光源
@@ -208,6 +209,54 @@ private slots:
         QVERIFY(server.requestAt(3).contains(QStringLiteral("不要复述本条要求或脚本内容"))); // 别复述导出指令
         QVERIFY(server.requestAt(3).contains(QStringLiteral("最终回复保持简短"))); // 收尾别写小作文
         QVERIFY(server.requestAt(3).contains(QStringLiteral("最多 5 条清单")));   // 清单保留
+    }
+
+    // 建造/自检阶段自行 export/save 会被拦下，只有系统最后的导出回合能落盘
+    void executorBlocksSelfExportBeforeExportRound()
+    {
+        MockLlmServer server(
+            {MockLlmServer::Turn{
+                 .frames = {MockLlm::toolCallChunk(
+                                QStringLiteral("execute_blender_code"),
+                                QStringLiteral(R"json({"code":"bpy.ops.export_scene.gltf(filepath='x.glb')"})json")),
+                            MockLlm::doneChunk()}},
+             textTurn(QStringLiteral("本组建造完成")),
+             textTurn(QStringLiteral("自检通过")),
+             MockLlmServer::Turn{
+                 .frames = {MockLlm::toolCallChunk(
+                                QStringLiteral("execute_blender_code"),
+                                QStringLiteral(R"json({"code":"bpy.ops.export_scene.gltf(filepath='y.glb')"})json")),
+                            MockLlm::doneChunk()}},
+             textTurn(QStringLiteral("已导出"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+        orch.setModelConfig(server.config());
+        BuildPlan plan;
+        BuildGroup group;
+        group.title = QStringLiteral("底座与环境");
+        group.items = {QStringLiteral("底座")};
+        group.acceptance = QStringLiteral("俯视截图检查底座完整");
+        plan.groups = {group};
+        plan.maxSteps = 24;
+        QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
+        QSignalSpy exportSpy(&orch, &AgentOrchestrator::exportStarted);
+
+        orch.execute(QStringLiteral("t1"), nullptr, openAiTools(), plan,
+                     QStringLiteral("做一个雨夜便利店"), QStringLiteral("/tmp/out"),
+                     QStringLiteral("blender"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(finalSpy.count(), 1, 5000);
+        QCOMPARE(server.requestCount(), 5); // 中途导出被拦后仍能继续，最后再走系统导出
+        // 两次 MCP 调用 = 清场 + 系统导出；中途那次被拦下，没有落到 MCP
+        QCOMPARE(mcp.calls.size(), 2);
+        QCOMPARE(mcp.calls.first(), QStringLiteral("execute_blender_code"));
+        QCOMPARE(mcp.calls.last(), QStringLiteral("execute_blender_code"));
+        // 导出回合一开始就报给前端：预览面板先显示“导出中”，不加载半成品
+        QCOMPARE(exportSpy.count(), 1);
+        QCOMPARE(exportSpy.first().at(0).toString(), QStringLiteral("blender"));
+        QCOMPARE(exportSpy.first().at(1).toString(), QStringLiteral("/tmp/out"));
     }
 
     // 修改已有资产：导出必须覆盖同名文件，不能再走“撞名加序号”

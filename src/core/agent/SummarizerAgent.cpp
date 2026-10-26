@@ -49,45 +49,56 @@ LlmConfig SummarizerAgent::resolveConfig() const
                      picked.value(QStringLiteral("model")).toString()};
 }
 
-void SummarizerAgent::generate(const QString& area, const QString& userText, const QString& mode)
+void SummarizerAgent::generate(const SummarizeRequest& request)
 {
     ensurePromptResources();
 
     const LlmConfig cfg = resolveConfig();
     if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty() || cfg.model.isEmpty()) {
-        emit failed(area, QStringLiteral("agent-not-configured"));
+        emit failed(request.area, QStringLiteral("agent-not-configured"));
         return;
     }
 
-    const QString templatePath = mode == QLatin1String("cloud3d")
-                                     ? QStringLiteral(":/prompts/summarizer-cloud3d.md")
-                                     : QStringLiteral(":/prompts/summarizer.md");
+    // 三种模式三份模板：修改已有资产绝不能套用新建场景的骨架，否则 agent 会清场重建
+    QString templatePath = QStringLiteral(":/prompts/summarizer.md");
+    if (request.mode == QLatin1String("modify"))
+        templatePath = QStringLiteral(":/prompts/summarizer-modify.md");
+    else if (request.mode == QLatin1String("cloud3d"))
+        templatePath = QStringLiteral(":/prompts/summarizer-cloud3d.md");
+
     QFile tpl(templatePath);
     QString system;
     if (tpl.open(QIODevice::ReadOnly | QIODevice::Text))
         system = QString::fromUtf8(tpl.readAll());
     if (system.isEmpty()) {
-        emit failed(area, QStringLiteral("prompt-template-missing"));
+        emit failed(request.area, QStringLiteral("prompt-template-missing"));
         return;
     }
-    system.replace(QStringLiteral("{{user_request}}"), userText);
-    system.replace(QStringLiteral("{{mode}}"), mode);
+    system.replace(QStringLiteral("{{user_request}}"), request.userText);
+    system.replace(QStringLiteral("{{mode}}"), request.mode);
+    system.replace(QStringLiteral("{{asset}}"),
+                   request.asset.isEmpty() ? QStringLiteral("（未指定）") : request.asset);
+    // 讨论结论用代码拼接：模板里留空段会比留空行更难维护
+    if (!request.discussion.isEmpty()) {
+        system += QStringLiteral("\n\n## 用户已确认的讨论要点\n") + request.discussion;
+    }
 
     const QJsonArray messages{
         QJsonObject{{QStringLiteral("role"), QStringLiteral("system")},
                     {QStringLiteral("content"), system}},
         QJsonObject{{QStringLiteral("role"), QStringLiteral("user")},
-                    {QStringLiteral("content"), userText}}};
+                    {QStringLiteral("content"), request.userText}}};
 
     // 缓冲放堆上：onDone / onError 可能在 chatStream 返回之后才触发
     auto buffer = std::make_shared<QString>();
+    const QString area = request.area;
     m_llm->chatStream(
         cfg, messages, {},
         {.onDelta = [buffer](const QString& delta) { buffer->append(delta); },
          .onToolCalls = nullptr,
          .onError = [this, area](const QString& error) { emit failed(area, error); },
          .onDone = [this, area, buffer]() {
-             m_sessions->saveDraft(area, *buffer);
+             // 落库交给 CoreApp 的 draftReady 接线：那里才知道 asset / source，并能拿到新行 id
              emit draftReady(area, *buffer);
          }});
 }

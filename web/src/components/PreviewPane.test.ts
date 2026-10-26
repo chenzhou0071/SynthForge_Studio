@@ -167,6 +167,25 @@ describe("PreviewPane", () => {
     expect(wrapper.emitted("close")).toHaveLength(1);
   });
 
+  it("shows an export notice instead of loading the model being written", async () => {
+    const wrapper = mount(PreviewPane, {
+      props: { area: "blender", exporting: true, file: null },
+    });
+
+    expect(wrapper.find(".export-banner").text()).toContain("正在导出");
+    expect(wrapper.find(".export-banner").text()).toContain("完成后自动预览");
+  });
+
+  it("hides the export notice once exporting finishes", async () => {
+    const wrapper = mount(PreviewPane, {
+      props: { area: "blender", exporting: true, file: null },
+    });
+    expect(wrapper.find(".export-banner").exists()).toBe(true);
+
+    await wrapper.setProps({ exporting: false });
+    expect(wrapper.find(".export-banner").exists()).toBe(false);
+  });
+
   it("sizes the 3D canvas only after the host becomes visible", async () => {
     const wrapper = mount(PreviewPane, {
       props: {

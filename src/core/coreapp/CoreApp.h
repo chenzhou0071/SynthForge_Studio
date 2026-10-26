@@ -15,6 +15,7 @@
 #include "core/assets/AssetLibrary.h"
 #include "core/llm/LlmGateway.h"
 #include "core/mcp/BlenderGate.h"
+#include "core/mcp/BridgeCommands.h" // BridgeCommand
 
 class SettingsStore;
 class SessionStore;
@@ -29,7 +30,8 @@ struct CoreOptions
 {
     QString dataDir;
     bool headless = false;
-    QString libraryRoot; // 空 = Documents/SynthForgeStudio/ModelLibrary；测试注入用
+    QString libraryRoot;         // 空 = Documents/SynthForgeStudio/ModelLibrary；测试注入用
+    BridgeCommand blenderBridge; // program 为空 = 默认 uvx mcp-for-blender；测试注入 mock_mcp_server
 };
 
 // 已确认、等用户选完存放目录就执行的任务
@@ -58,6 +60,8 @@ public:
 
 private:
     QJsonValue handleChatSend(const QJsonObject& params, bool appendUser = true);
+    // 修改已有资产：单组计划直接执行，调用前草稿已转正为 user 行
+    QJsonValue startModify(const QString& area, const QString& asset, const QString& text);
     void broadcastConnStatus(const QString& area, const QString& status, const QString& hint);
     // 新客户端连上时补发当前状态：桥接先就绪、页面后加载也不会永远灰灯
     void broadcastStatusSnapshot() const;
@@ -83,6 +87,9 @@ private:
     std::unique_ptr<AssetLibrary> m_library;    // 资产库根目录（ModelLibrary）
     QHash<QString, QJsonObject> m_pendingPlans; // area -> 计划卡 JSON
     QHash<QString, QString> m_planPrompts;      // area -> 已确认提示词
+    QHash<QString, QString> m_pendingDraftAsset;  // area -> 本次草稿针对的资产
+    QHash<QString, QString> m_pendingDraftSource; // area -> 用户原始需求（供「重新生成」）
+    QHash<QString, qint64> m_regenDraft;          // area -> 正在重新生成的草稿 id
     QSet<QString> m_planCancelled;              // area -> 规划取消标记
     QHash<QString, PendingPick> m_pendingPicks; // area -> 等待选目录的执行任务
     QHash<QString, QString> m_pickRequests;     // requestId -> area

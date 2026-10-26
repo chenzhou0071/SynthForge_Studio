@@ -26,6 +26,7 @@ add_library(synthforge_core STATIC
     src/core/llm/ToolBridge.cpp
     src/core/llm/LlmGateway.cpp
     src/core/agent/SummarizerAgent.cpp
+    src/core/agent/AskReply.cpp
     src/core/agent/AgentOrchestrator.cpp
     src/core/assets/AssetLibrary.cpp
     src/core/coreapp/CoreApp.cpp
@@ -37,7 +38,9 @@ target_link_libraries(synthforge_core PUBLIC Qt6::Core Qt6::Sql Qt6::WebSockets 
 qt_add_resources(synthforge_core "prompts"
     PREFIX "/prompts"
     BASE "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts"
-    FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/summarizer.md")
+    FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/summarizer.md"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/summarizer-modify.md"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/ask.md")
 
 enable_testing()
 
@@ -153,6 +156,12 @@ add_test(NAME tst_session_store COMMAND tst_session_store)
 set_tests_properties(tst_session_store PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
+add_executable(tst_ask_reply tests/tst_ask_reply.cpp)
+target_link_libraries(tst_ask_reply PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_ask_reply COMMAND tst_ask_reply)
+set_tests_properties(tst_ask_reply PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
 add_executable(tst_task_manager tests/tst_task_manager.cpp)
 target_link_libraries(tst_task_manager PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_task_manager COMMAND tst_task_manager)
@@ -207,8 +216,11 @@ add_test(NAME tst_asset_library COMMAND tst_asset_library)
 set_tests_properties(tst_asset_library PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
-add_executable(tst_headless_ws tests/tst_headless_ws.cpp)
+add_executable(tst_headless_ws tests/tst_headless_ws.cpp tests/mock/MockLlmServer.cpp)
+target_include_directories(tst_headless_ws PRIVATE tests)
 target_link_libraries(tst_headless_ws PRIVATE synthforge_core Qt6::Test)
+# 假 Blender 桥接：mock_mcp_server 让 preflight 走真实握手
+add_dependencies(tst_headless_ws mock_mcp_server)
 add_test(NAME tst_headless_ws COMMAND tst_headless_ws)
 set_tests_properties(tst_headless_ws PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")

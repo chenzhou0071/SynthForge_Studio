@@ -20,7 +20,11 @@ hljs.registerLanguage("lua", lua);
 hljs.registerLanguage("plaintext", plaintext);
 hljs.registerLanguage("typescript", typescript);
 
-const props = defineProps<{ area: "blender" | "unity"; file: PreviewFile | null }>();
+const props = defineProps<{
+  area: "blender" | "unity";
+  file: PreviewFile | null;
+  exporting?: boolean; // 导出回合进行中：先挂提示，不加载只写了一半的 glb
+}>();
 const emit = defineEmits<{ modify: [path: string]; close: [] }>();
 
 const host = ref<HTMLDivElement>();
@@ -241,6 +245,9 @@ onBeforeUnmount(() => {
     </header>
 
     <div class="preview-body">
+      <div v-if="exporting" class="export-banner">
+        正在导出模型，完成后自动预览
+      </div>
       <div ref="host" class="canvas-host" :class="{ hidden: !isModel }" />
       <p v-if="isModel && loadError" class="info-card">{{ loadError }}</p>
 
@@ -366,6 +373,20 @@ onBeforeUnmount(() => {
 
 .canvas-host.hidden {
   display: none;
+}
+
+.export-banner {
+  position: absolute;
+  top: 10px;
+  left: 12px;
+  z-index: 2;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: #cfe8fa;
+  background: rgba(14, 99, 156, 0.78);
+  border: 1px solid rgba(106, 170, 214, 0.5);
+  border-radius: 4px;
+  pointer-events: none; /* 不挡旧模型的拖拽旋转 */
 }
 
 .preview-note {

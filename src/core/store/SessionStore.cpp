@@ -39,9 +39,22 @@ bool SessionStore::open()
     q.exec(QStringLiteral("PRAGMA journal_mode=WAL")); // 防断电损坏 + 读写并发
     q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS messages("
                           "id INTEGER PRIMARY KEY AUTOINCREMENT, area TEXT NOT NULL,"
-                          "role TEXT NOT NULL, content TEXT NOT NULL, ts INTEGER NOT NULL)"));
-    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS drafts("
-                          "area TEXT PRIMARY KEY, content TEXT NOT NULL, updated INTEGER NOT NULL)"));
+                          "role TEXT NOT NULL, content TEXT NOT NULL, ts INTEGER NOT NULL,"
+                          "meta TEXT NOT NULL DEFAULT '{}')"));
+    {
+        // SQLite 的 ADD COLUMN 没有 IF NOT EXISTS：先查 PRAGMA 再补
+        QSqlQuery probe(m_db);
+        probe.exec(QStringLiteral("PRAGMA table_info(messages)"));
+        bool hasMeta = false;
+        while (probe.next()) {
+            if (probe.value(1).toString() == QLatin1String("meta"))
+                hasMeta = true;
+        }
+        if (!hasMeta)
+            q.exec(QStringLiteral(
+                "ALTER TABLE messages ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'"));
+    }
+    q.exec(QStringLiteral("DROP TABLE IF EXISTS drafts"));
     // 分页查询走 (area, id)：定位到某个区、某条 id 之前，不扫其他区
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_area_id "
                           "ON messages(area, id)"));
@@ -55,28 +68,39 @@ bool SessionStore::open()
     return true;
 }
 
-void SessionStore::appendMessage(const QString& area, const QString& role,
-                                 const QString& content)
+qint64 SessionStore::appendMessage(const QString& area, const QString& role,
+                                   const QString& content, const QJsonObject& meta)
 {
     QSqlQuery q(m_db);
-    q.prepare(QStringLiteral("INSERT INTO messages(area, role, content, ts) VALUES(?,?,?,?)"));
+    q.prepare(QStringLiteral(
+        "INSERT INTO messages(area, role, content, ts, meta) VALUES(?,?,?,?,?)"));
     q.addBindValue(area);
     q.addBindValue(role);
     q.addBindValue(content);
     q.addBindValue(QDateTime::currentMSecsSinceEpoch());
-    q.exec();
+    q.addBindValue(QString::fromUtf8(QJsonDocument(meta).toJson(QJsonDocument::Compact)));
+    if (!q.exec())
+        return 0;
+    return q.lastInsertId().toLongLong();
 }
 
 QJsonArray SessionStore::messages(const QString& area) const
 {
     QJsonArray out;
     QSqlQuery q(m_db);
-    q.prepare(QStringLiteral("SELECT role, content FROM messages WHERE area=? ORDER BY id ASC"));
+    q.prepare(QStringLiteral(
+        "SELECT id, role, content, ts, meta FROM messages WHERE area=? ORDER BY id ASC"));
     q.addBindValue(area);
     q.exec();
-    while (q.next())
-        out.append(QJsonObject{{QStringLiteral("role"), q.value(0).toString()},
-                               {QStringLiteral("content"), q.value(1).toString()}});
+    while (q.next()) {
+        out.append(QJsonObject{
+            {QStringLiteral("id"), q.value(0).toLongLong()},
+            {QStringLiteral("role"), q.value(1).toString()},
+            {QStringLiteral("content"), q.value(2).toString()},
+            {QStringLiteral("ts"), q.value(3).toLongLong()},
+            {QStringLiteral("meta"),
+             QJsonDocument::fromJson(q.value(4).toString().toUtf8()).object()}});
+    }
     return out;
 }
 
@@ -87,13 +111,13 @@ MessagePage SessionStore::messagePage(const QString& area, int limit, qint64 bef
 
     QSqlQuery q(m_db);
     if (beforeId > 0) {
-        q.prepare(QStringLiteral("SELECT id, role, content, ts FROM messages "
+        q.prepare(QStringLiteral("SELECT id, role, content, ts, meta FROM messages "
                                  "WHERE area=? AND id<? ORDER BY id DESC LIMIT ?"));
         q.addBindValue(area);
         q.addBindValue(beforeId);
         q.addBindValue(pageSize + 1); // 多取一条，用来判断还有没有更早的
     } else {
-        q.prepare(QStringLiteral("SELECT id, role, content, ts FROM messages "
+        q.prepare(QStringLiteral("SELECT id, role, content, ts, meta FROM messages "
                                  "WHERE area=? ORDER BY id DESC LIMIT ?"));
         q.addBindValue(area);
         q.addBindValue(pageSize + 1);
@@ -106,7 +130,9 @@ MessagePage SessionStore::messagePage(const QString& area, int limit, qint64 bef
             {QStringLiteral("id"), q.value(0).toLongLong()},
             {QStringLiteral("role"), q.value(1).toString()},
             {QStringLiteral("content"), q.value(2).toString()},
-            {QStringLiteral("ts"), q.value(3).toLongLong()}});
+            {QStringLiteral("ts"), q.value(3).toLongLong()},
+            {QStringLiteral("meta"),
+             QJsonDocument::fromJson(q.value(4).toString().toUtf8()).object()}});
     }
     page.hasMore = newestFirst.size() > pageSize;
     if (page.hasMore)
@@ -120,25 +146,49 @@ MessagePage SessionStore::messagePage(const QString& area, int limit, qint64 bef
     return page;
 }
 
-void SessionStore::saveDraft(const QString& area, const QString& content)
+QJsonObject SessionStore::messageById(qint64 id) const
 {
     QSqlQuery q(m_db);
-    q.prepare(QStringLiteral("INSERT INTO drafts(area, content, updated) VALUES(?,?,?)"
-                             " ON CONFLICT(area) DO UPDATE SET content=excluded.content,"
-                             " updated=excluded.updated"));
-    q.addBindValue(area);
-    q.addBindValue(content);
-    q.addBindValue(QDateTime::currentMSecsSinceEpoch());
+    q.prepare(QStringLiteral(
+        "SELECT id, area, role, content, ts, meta FROM messages WHERE id=?"));
+    q.addBindValue(id);
     q.exec();
+    if (!q.next())
+        return {};
+    return QJsonObject{
+        {QStringLiteral("id"), q.value(0).toLongLong()},
+        {QStringLiteral("area"), q.value(1).toString()},
+        {QStringLiteral("role"), q.value(2).toString()},
+        {QStringLiteral("content"), q.value(3).toString()},
+        {QStringLiteral("ts"), q.value(4).toLongLong()},
+        {QStringLiteral("meta"), QJsonDocument::fromJson(q.value(5).toString().toUtf8()).object()}};
 }
 
-QString SessionStore::draft(const QString& area) const
+bool SessionStore::updateMessageContent(qint64 id, const QString& content)
 {
     QSqlQuery q(m_db);
-    q.prepare(QStringLiteral("SELECT content FROM drafts WHERE area=?"));
-    q.addBindValue(area);
-    q.exec();
-    return q.next() ? q.value(0).toString() : QString();
+    q.prepare(QStringLiteral("UPDATE messages SET content=? WHERE id=?"));
+    q.addBindValue(content);
+    q.addBindValue(id);
+    return q.exec() && q.numRowsAffected() > 0;
+}
+
+bool SessionStore::updateMessageMeta(qint64 id, const QJsonObject& meta)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE messages SET meta=? WHERE id=?"));
+    q.addBindValue(QString::fromUtf8(QJsonDocument(meta).toJson(QJsonDocument::Compact)));
+    q.addBindValue(id);
+    return q.exec() && q.numRowsAffected() > 0;
+}
+
+bool SessionStore::setMessageRole(qint64 id, const QString& role)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE messages SET role=? WHERE id=?"));
+    q.addBindValue(role);
+    q.addBindValue(id);
+    return q.exec() && q.numRowsAffected() > 0;
 }
 
 void SessionStore::clearMessages(const QString& area)

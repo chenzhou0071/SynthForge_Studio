@@ -59,13 +59,7 @@ private:
 private slots:
     void initTestCase() { QVERIFY(m_sessions.open()); }
 
-    void init()
-    {
-        // 用例共享同一个 db：每个用例从干净草稿开始（content 列 NOT NULL，不能传 null QString）
-        m_sessions.saveDraft(QStringLiteral("blender"), QStringLiteral(""));
-    }
-
-    void generatesDraftFromTemplateAndPersists()
+    void generatesDraftFromTemplate()
     {
         MockLlmServer server({textTurn(QStringLiteral("优化后的提示词"))});
         QVERIFY(server.listen());
@@ -76,13 +70,12 @@ private slots:
         QSignalSpy ready(&agent, &SummarizerAgent::draftReady);
         QSignalSpy failed(&agent, &SummarizerAgent::failed);
 
-        agent.generate(QStringLiteral("blender"), QStringLiteral("做一个雨夜便利店街角场景"));
+        agent.generate({QStringLiteral("blender"), QStringLiteral("做一个雨夜便利店街角场景")});
 
         QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
         QCOMPARE(failed.count(), 0);
         QCOMPARE(ready.at(0).at(0).toString(), QStringLiteral("blender"));
         QCOMPARE(ready.at(0).at(1).toString(), QStringLiteral("优化后的提示词"));
-        QCOMPARE(m_sessions.draft(QStringLiteral("blender")), QStringLiteral("优化后的提示词"));
 
         QCOMPARE(server.requestCount(), 1);
         QCOMPARE(server.pathAt(0), QStringLiteral("/v1/chat/completions"));
@@ -110,7 +103,7 @@ private slots:
 
         SummarizerAgent agent(&m_llm, &m_sessions, &m_settings);
         QSignalSpy ready(&agent, &SummarizerAgent::draftReady);
-        agent.generate(QStringLiteral("blender"), QStringLiteral("做一个雨夜便利店街角场景"));
+        agent.generate({QStringLiteral("blender"), QStringLiteral("做一个雨夜便利店街角场景")});
 
         QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
         const QJsonArray messages =
@@ -133,7 +126,7 @@ private slots:
 
         SummarizerAgent agent(&m_llm, &m_sessions, &m_settings);
         QSignalSpy ready(&agent, &SummarizerAgent::draftReady);
-        agent.generate(QStringLiteral("blender"), QStringLiteral("做一个雨夜便利店街角场景"));
+        agent.generate({QStringLiteral("blender"), QStringLiteral("做一个雨夜便利店街角场景")});
 
         QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
         const QString system = server.requestObjectAt(0)
@@ -162,7 +155,7 @@ private slots:
 
         SummarizerAgent agent(&m_llm, &m_sessions, &m_settings);
         QSignalSpy ready(&agent, &SummarizerAgent::draftReady);
-        agent.generate(QStringLiteral("blender"), QStringLiteral("做一个路灯"));
+        agent.generate({QStringLiteral("blender"), QStringLiteral("做一个路灯")});
 
         QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
         QCOMPARE(server.authorizationAt(0), QByteArrayLiteral("Bearer k-sum"));
@@ -181,7 +174,7 @@ private slots:
 
         SummarizerAgent agent(&m_llm, &m_sessions, &m_settings);
         QSignalSpy ready(&agent, &SummarizerAgent::draftReady);
-        agent.generate(QStringLiteral("blender"), QStringLiteral("做一个路灯"));
+        agent.generate({QStringLiteral("blender"), QStringLiteral("做一个路灯")});
 
         QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
         QCOMPARE(server.authorizationAt(0), QByteArrayLiteral("Bearer k-primary"));
@@ -189,7 +182,7 @@ private slots:
                  QStringLiteral("primary-model"));
     }
 
-    void httpErrorEmitsFailedWithoutPersisting()
+    void httpErrorEmitsFailed()
     {
         MockLlmServer server({MockLlmServer::Turn{
             .status = 401,
@@ -202,13 +195,62 @@ private slots:
         QSignalSpy ready(&agent, &SummarizerAgent::draftReady);
         QSignalSpy failed(&agent, &SummarizerAgent::failed);
 
-        agent.generate(QStringLiteral("blender"), QStringLiteral("做一个路灯"));
+        agent.generate({QStringLiteral("blender"), QStringLiteral("做一个路灯")});
 
         QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 5000);
         QCOMPARE(ready.count(), 0);
         QCOMPARE(failed.at(0).at(0).toString(), QStringLiteral("blender"));
         QVERIFY2(!failed.at(0).at(1).toString().isEmpty(), "失败原因为空");
-        QVERIFY2(m_sessions.draft(QStringLiteral("blender")).isEmpty(), "失败不应写入草稿");
+    }
+
+    void modifyModeUsesModifyTemplate()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("把招牌材质换成深绿做旧铁皮，粗糙度调高"))});
+        QVERIFY(server.listen());
+        m_settings.setData(agentSettings(server.baseUrl(), QStringLiteral("k-primary"),
+                                         QStringLiteral("primary-model")));
+        SummarizerAgent agent(&m_llm, &m_sessions, &m_settings);
+        QSignalSpy ready(&agent, &SummarizerAgent::draftReady);
+
+        agent.generate({QStringLiteral("blender"), QStringLiteral("招牌弄旧一点"),
+                        QStringLiteral("modify"), QStringLiteral("sword_01"), {}});
+
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
+        const QString system = server.requestObjectAt(0)
+                                   .value(QStringLiteral("messages"))
+                                   .toArray()
+                                   .first()
+                                   .toObject()
+                                   .value(QStringLiteral("content"))
+                                   .toString();
+        QVERIFY2(system.contains(QStringLiteral("已经存在")), "没有使用修改模板");
+        QVERIFY2(!system.contains(QStringLiteral("底座与构图")), "串进了新建模板的骨架");
+        QVERIFY2(system.contains(QStringLiteral("sword_01")), "资产名未注入");
+    }
+
+    void discussionIsInjected()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("主题与视角：雨夜便利店"))});
+        QVERIFY(server.listen());
+        m_settings.setData(agentSettings(server.baseUrl(), QStringLiteral("k-primary"),
+                                         QStringLiteral("primary-model")));
+        SummarizerAgent agent(&m_llm, &m_sessions, &m_settings);
+        QSignalSpy ready(&agent, &SummarizerAgent::draftReady);
+
+        agent.generate({QStringLiteral("blender"), QStringLiteral("做个便利店"),
+                        QStringLiteral("lowpoly"), {},
+                        QStringLiteral("已确认：要有自动门与积水")});
+
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
+        const QString system = server.requestObjectAt(0)
+                                   .value(QStringLiteral("messages"))
+                                   .toArray()
+                                   .first()
+                                   .toObject()
+                                   .value(QStringLiteral("content"))
+                                   .toString();
+        QVERIFY2(system.contains(QStringLiteral("用户已确认的讨论要点")), "缺讨论结论段");
+        QVERIFY2(system.contains(QStringLiteral("自动门与积水")), "讨论结论未注入");
     }
 };
 

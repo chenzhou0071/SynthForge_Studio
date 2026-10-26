@@ -1,5 +1,6 @@
 #include <QFile>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QJsonObject>
 #include <QStringList>
 #include <QTemporaryDir>
@@ -42,15 +43,72 @@ private slots:
         QCOMPARE(store.messages(QStringLiteral("unity")).size(), 1);
     }
 
-    void draftUpsertKeepsLatest()
+    void draftRoundTripsWithMeta()
     {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
         SessionStore store(dir.path() + QStringLiteral("/sessions.db"));
         QVERIFY(store.open());
-        store.saveDraft(QStringLiteral("blender"), QStringLiteral("第一版"));
-        store.saveDraft(QStringLiteral("blender"), QStringLiteral("第二版"));
-        QCOMPARE(store.draft(QStringLiteral("blender")), QStringLiteral("第二版"));
+
+        const qint64 id = store.appendMessage(
+            QStringLiteral("blender"), QStringLiteral("draft"),
+            QStringLiteral("主题与视角：雨夜便利店"),
+            QJsonObject{{QStringLiteral("state"), QStringLiteral("pending")},
+                        {QStringLiteral("asset"), QStringLiteral("shop.glb")}});
+        QVERIFY(id > 0);
+
+        const MessagePage page = store.messagePage(QStringLiteral("blender"), 10);
+        QCOMPARE(page.messages.size(), 1);
+        const QJsonObject row = page.messages.first().toObject();
+        QCOMPARE(row.value(QStringLiteral("id")).toInteger(), id);
+        QCOMPARE(row.value(QStringLiteral("role")).toString(), QStringLiteral("draft"));
+        QCOMPARE(row.value(QStringLiteral("meta")).toObject()
+                     .value(QStringLiteral("asset")).toString(),
+                 QStringLiteral("shop.glb"));
+    }
+
+    void confirmedDraftBecomesUserMessage()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        SessionStore store(dir.path() + QStringLiteral("/sessions.db"));
+        QVERIFY(store.open());
+        const qint64 id = store.appendMessage(
+            QStringLiteral("blender"), QStringLiteral("draft"), QStringLiteral("旧文本"),
+            QJsonObject{{QStringLiteral("state"), QStringLiteral("pending")}});
+
+        QVERIFY(store.updateMessageContent(id, QStringLiteral("改过的文本")));
+        QVERIFY(store.setMessageRole(id, QStringLiteral("user")));
+
+        const QJsonObject row = store.messageById(id);
+        QCOMPARE(row.value(QStringLiteral("role")).toString(), QStringLiteral("user"));
+        QCOMPARE(row.value(QStringLiteral("content")).toString(), QStringLiteral("改过的文本"));
+    }
+
+    void planSurvivesAsMessage()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        SessionStore store(dir.path() + QStringLiteral("/sessions.db"));
+        QVERIFY(store.open());
+
+        const QJsonObject plan{{QStringLiteral("taskId"), QStringLiteral("plan-1")},
+                               {QStringLiteral("totalSteps"), 60}};
+        const qint64 id = store.appendMessage(
+            QStringLiteral("blender"), QStringLiteral("plan"),
+            QString::fromUtf8(QJsonDocument(plan).toJson(QJsonDocument::Compact)),
+            QJsonObject{{QStringLiteral("state"), QStringLiteral("pending")},
+                        {QStringLiteral("taskId"), QStringLiteral("plan-1")}});
+        QVERIFY(id > 0);
+
+        const QJsonObject row = store.messageById(id);
+        QCOMPARE(row.value(QStringLiteral("role")).toString(), QStringLiteral("plan"));
+        QCOMPARE(row.value(QStringLiteral("meta")).toObject()
+                     .value(QStringLiteral("state")).toString(),
+                 QStringLiteral("pending"));
+        QCOMPARE(QJsonDocument::fromJson(row.value(QStringLiteral("content")).toString().toUtf8())
+                     .object().value(QStringLiteral("totalSteps")).toInt(),
+                 60);
     }
 
     void walModePersistedInFileHeader()

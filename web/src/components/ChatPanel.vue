@@ -24,6 +24,8 @@ const emit = defineEmits<{ clearAsset: [] }>();
 const messages = ref<ChatItem[]>([]);
 const draft = ref("");
 const mode = ref<"lowpoly" | "cloud3d">("lowpoly");
+// 讨论只聊方案、不碰 Blender；执行先出草稿卡，确认后才动手
+const chatMode = ref<"ask" | "exec">("exec");
 const cloudConfigured = ref(false);
 // 目标资产 chip：只显示文件名，去掉目录与 .blend 后缀
 const assetName = computed(
@@ -246,21 +248,51 @@ onMounted(() => {
       if ((data as { area?: string }).area === props.area) busy.value = false; // 落盘即任务结束
     }),
     props.client.on("draft.created", (data) => {
-      const draft = data as { area?: string; taskId?: string; prompt?: string };
-      if (draft.area !== props.area) return;
-      // 后端已停止生成，等用户编辑确认；发送后才进入规划
+      const d = data as { area?: string; id?: number; prompt?: string; origin?: string };
+      if (d.area !== props.area) return;
+      // 后端已停止生成，等用户编辑确认；执行后才进入规划/修改
       busy.value = false;
       messages.value.push({
         role: "draft",
-        content: draft.prompt ?? "",
-        taskId: draft.taskId,
-        mode: mode.value,
+        id: d.id,
+        content: d.prompt ?? "",
+        origin: d.origin === "discussion" ? "discussion" : "generated",
+        state: "pending",
       });
       scrollToBottom();
+    }),
+    props.client.on("draft.updated", (data) => {
+      const d = data as { area?: string; id?: number; prompt?: string };
+      if (d.area !== props.area) return;
+      const card = messages.value.find((m) => m.role === "draft" && m.id === d.id);
+      if (card) card.content = d.prompt ?? "";
+    }),
+    props.client.on("draft.done", (data) => {
+      const d = data as { area?: string; id?: number; cancelled?: boolean };
+      if (d.area !== props.area) return;
+      const card = messages.value.find((m) => m.role === "draft" && m.id === d.id);
+      if (!card) return;
+      if (d.cancelled) {
+        card.state = "cancelled"; // 灰卡只读
+        return;
+      }
+      // 草稿已转正：后端马上开始规划/修改。卡片会被删掉，DraftCard 的 sent
+      // 可能晚于这个事件才回到前端，所以这里就接管 busy，否则规划期没有转圈。
+      cancelRequested = false;
+      if (streaming) {
+        streaming.streaming = false;
+        streaming = null;
+      }
+      chatMode.value = "exec";
+      busy.value = true;
+      // 已转成 user 气泡，删卡避免同一段文本出现两次
+      messages.value = messages.value.filter((m) => m !== card);
+      scrollToBottom(true);
     }),
     props.client.on("plan.created", (data) => {
       const payload = data as {
         area?: string;
+        id?: number;
         taskId?: string;
         rules?: string[];
         groups?: PlanGroup[];
@@ -271,6 +303,8 @@ onMounted(() => {
       busy.value = false;
       messages.value.push({
         role: "plan",
+        id: payload.id,
+        state: "pending",
         plan: {
           taskId: payload.taskId ?? "",
           rules: payload.rules ?? [],
@@ -348,7 +382,11 @@ async function send() {
   const modify = props.area === "blender" && !!props.selectedAsset;
   try {
     const params: Record<string, unknown> = { area: props.area, text };
-    if (modify) {
+    if (props.area === "blender" && chatMode.value === "ask") {
+      // 讨论不检查 Blender；带上当前资产只让模型知道在聊哪个文件
+      params.mode = "ask";
+      if (props.selectedAsset) params.asset = props.selectedAsset;
+    } else if (modify) {
       params.mode = "modify";
       params.asset = props.selectedAsset;
     } else if (props.area === "blender") {
@@ -361,7 +399,7 @@ async function send() {
     if (result?.error === "no-blend-source") {
       window.alert("无法修改此资产：源文件已不存在，请重新选择。");
       emit("clearAsset");
-    } else if (result?.accepted !== false && modify) {
+    } else if (result?.accepted !== false && modify && chatMode.value !== "ask") {
       emit("clearAsset"); // 一次修改一条指令
     }
     if (result?.accepted === false) busy.value = false;
@@ -372,39 +410,17 @@ async function send() {
   scrollToBottom(true);
 }
 
-function removeDraft(item: ChatItem) {
-  messages.value = messages.value.filter((message) => message !== item);
-}
-
-async function sendDraft(item: ChatItem, text: string) {
-  if (busy.value) return;
+// 草稿已转成正式指令：规划/修改在跑，显示停止与转圈
+function onDraftSent() {
   cancelRequested = false;
+  // 讨论的流式气泡可能还挂着光标：先收口，否则 showPending 会一直为 false
+  if (streaming) {
+    streaming.streaming = false;
+    streaming = null;
+  }
+  chatMode.value = "exec"; // 已进入执行链路，底部开关跟着切
   busy.value = true;
-  try {
-    const result = await props.client.request<{ accepted?: boolean }>("draft.send", {
-      area: props.area,
-      prompt: text,
-      mode: item.mode ?? mode.value,
-    });
-    if (result?.accepted === false) {
-      busy.value = false;
-      return;
-    }
-    removeDraft(item); // 已转为正式指令，后端会广播 chat.message(user)
-    scrollToBottom(true); // 自己发的消息一定要能看见
-  } catch (error) {
-    busy.value = false;
-    pushError(error instanceof Error ? error.message : "发送失败");
-  }
-}
-
-async function cancelDraft(item: ChatItem) {
-  removeDraft(item);
-  try {
-    await props.client.request("draft.cancel", { area: props.area, taskId: item.taskId });
-  } catch (error) {
-    pushError(error instanceof Error ? error.message : "取消失败");
-  }
+  scrollToBottom(true);
 }
 
 async function cancelTask() {
@@ -523,21 +539,29 @@ function onKeydown(event: KeyboardEvent) {
           </div>
           <div v-else-if="message.role === 'draft'" class="draft-row">
             <DraftCard
-              :prompt="message.content ?? ''"
-              @send="(text) => sendDraft(message, text)"
-              @cancel="cancelDraft(message)"
+              :client="client"
+              :id="message.id"
+              :content="message.content ?? ''"
+              :state="message.state === 'cancelled' ? 'cancelled' : 'pending'"
+              :origin="message.origin"
+              @sent="onDraftSent"
             />
           </div>
           <div v-else-if="message.role === 'plan' && message.plan" class="draft-row">
-            <PlanCard :client="client" :area="area" :plan="message.plan" />
+            <PlanCard
+              :client="client"
+              :area="area"
+              :plan="message.plan"
+              :id="message.id"
+              :state="message.state"
+            />
           </div>
           <div v-else-if="message.role === 'group'" class="group-divider">
             <span>第 {{ message.groupIndex }}/{{ message.groupCount }} 组 · {{ message.title }}</span>
           </div>
           <div v-else class="bubble" :class="[message.role, { streaming: message.streaming }]">
-            <!-- 流式期间按纯文本渲染：每个 token 全量 markdown parse+sanitize 会拖死 UI -->
-            <div v-if="message.streaming" class="md stream-plain">{{ message.content }}</div>
-            <div v-else class="md" v-html="renderMarkdown(message.content ?? '')" />
+            <!-- 流式期间也走 markdown：否则 ** 和 ## 会原样露出 -->
+            <div class="md" v-html="renderMarkdown(message.content ?? '')" />
             <i v-if="message.streaming" class="caret" />
           </div>
         </template>
@@ -564,6 +588,15 @@ function onKeydown(event: KeyboardEvent) {
     </div>
 
     <footer class="chat-input">
+      <div v-if="area === 'blender'" class="chat-mode">
+        <div class="mode-switch">
+          <button :class="{ active: chatMode === 'ask' }" @click="chatMode = 'ask'">讨论</button>
+          <button :class="{ active: chatMode === 'exec' }" @click="chatMode = 'exec'">执行</button>
+        </div>
+        <span class="chat-mode-hint">
+          {{ chatMode === "ask" ? "只聊方案，不触碰 Blender" : "先出草稿卡，确认后才动手" }}
+        </span>
+      </div>
       <div v-if="selectedAsset" class="asset-chip">
         <span>目标资产：{{ assetName }}</span>
         <button type="button" title="取消修改目标" @click="emit('clearAsset')">✕</button>
@@ -663,6 +696,18 @@ function onKeydown(event: KeyboardEvent) {
   align-items: center;
   gap: 8px;
   padding: 0 12px 8px;
+}
+
+/* 输入区左上的讨论/执行开关 */
+.chat-mode {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-mode-hint {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .mode-switch {

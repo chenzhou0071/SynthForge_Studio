@@ -72,15 +72,14 @@ describe("ChatPanel", () => {
     expect(wrapper.text().match(/你好呀/g)).toHaveLength(1);
   });
 
-  it("renders streaming text literally until the turn is finalized", async () => {
+  it("renders markdown while streaming so ** does not leak into the bubble", async () => {
     const { client, wrapper } = mountPanel("blender");
     await flushPromises();
 
     client.emit("chat.delta", { area: "blender", text: "**粗体**" });
     await flushPromises();
-    // 流式期间不做 markdown 解析：每个 token 全量 parse + sanitize 会把渲染线程压死
-    expect(wrapper.find(".bubble.streaming .md").text()).toContain("**粗体**");
-    expect(wrapper.find(".bubble.streaming .md strong").exists()).toBe(false);
+    expect(wrapper.find(".bubble.streaming .md strong").text()).toBe("粗体");
+    expect(wrapper.find(".bubble.streaming .md").text()).not.toContain("**");
 
     client.emit("chat.turn", { area: "blender", content: "**粗体**" });
     await flushPromises();
@@ -576,5 +575,293 @@ describe("ChatPanel", () => {
     await wrapper.setProps({ settingsVersion: 1 });
     await flushPromises();
     expect(wrapper.find(".badge").text()).toContain("已配置");
+  });
+
+  it("restores a started plan card without action buttons", async () => {
+    const plan = {
+      taskId: "task-plan",
+      rules: ["留出通道"],
+      groups: [{ title: "底座", items: ["base"], placements: [], acceptance: "宽度 22" }],
+      totalSteps: 4,
+    };
+    const { wrapper } = mountPanel("blender", (fake) => {
+      fake.results.set("session.load", {
+        messages: [
+          { id: 7, role: "plan", content: JSON.stringify(plan), meta: { state: "started" } },
+        ],
+      });
+    });
+    await flushPromises();
+
+    expect(wrapper.find(".plan-card").exists()).toBe(true);
+    expect(wrapper.find(".plan-card").text()).toContain("底座");
+    expect(wrapper.findAll("button").some((button) => button.text() === "开始生成")).toBe(false);
+    expect(wrapper.find(".plan-state").text()).toContain("已确认");
+  });
+
+  it("confirms a restored pending plan with its row id", async () => {
+    const plan = {
+      taskId: "task-plan",
+      rules: ["留出通道"],
+      groups: [{ title: "底座", items: ["base"], placements: [], acceptance: "宽度 22" }],
+      totalSteps: 4,
+    };
+    const { client, wrapper } = mountPanel("blender", (fake) => {
+      fake.results.set("session.load", {
+        messages: [
+          { id: 9, role: "plan", content: JSON.stringify(plan), meta: { state: "pending" } },
+        ],
+      });
+      fake.results.set("plan.confirm", { ok: true });
+    });
+    await flushPromises();
+
+    const start = wrapper.findAll("button").find((button) => button.text() === "开始生成");
+    expect(start).toBeTruthy();
+    await start!.trigger("click");
+    await flushPromises();
+
+    expect(client.callsOf("plan.confirm")[0].params).toMatchObject({
+      area: "blender",
+      taskId: "task-plan",
+      id: 9,
+    });
+  });
+
+  it("sends ask mode from the discussion switch and shows the draft card", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+
+    await wrapper.findAll(".chat-mode button")[0].trigger("click");
+    await wrapper.find("textarea").setValue("这个招牌怎么改才好看");
+    await wrapper.find("button.primary").trigger("click");
+    await flushPromises();
+
+    expect(client.callsOf("chat.send")[0].params).toMatchObject({
+      area: "blender",
+      mode: "ask",
+      text: "这个招牌怎么改才好看",
+    });
+
+    client.emit("draft.created", {
+      area: "blender",
+      id: 21,
+      prompt: "把招牌改旧一些",
+      origin: "discussion",
+    });
+    await flushPromises();
+
+    const card = wrapper.find(".draft-card");
+    expect(card.text()).toContain("讨论整理出的草稿");
+    expect(card.find("pre").text()).toContain("把招牌改旧一些");
+    expect(card.findAll("button").map((button) => button.text())).toEqual([
+      "执行",
+      "重新生成",
+      "取消",
+    ]);
+  });
+
+  it("saves an edited draft when the textarea loses focus", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.emit("draft.created", { area: "blender", id: 22, prompt: "初稿" });
+    await flushPromises();
+
+    await wrapper.find(".draft-card pre").trigger("dblclick");
+    const editor = wrapper.find(".draft-card textarea");
+    await editor.setValue("改过的方案");
+    await editor.trigger("blur");
+    await flushPromises();
+
+    expect(client.callsOf("draft.save")[0].params).toMatchObject({
+      id: 22,
+      content: "改过的方案",
+    });
+  });
+
+  it("regenerates and cancels a draft by id", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.emit("draft.created", { area: "blender", id: 23, prompt: "初稿" });
+    await flushPromises();
+
+    const regenerate = wrapper.findAll("button").find((button) => button.text() === "重新生成");
+    await regenerate!.trigger("click");
+    await flushPromises();
+    expect(client.callsOf("draft.regenerate")[0].params).toMatchObject({ id: 23 });
+
+    client.emit("draft.updated", { area: "blender", id: 23, prompt: "重写后的方案" });
+    await flushPromises();
+    expect(wrapper.find(".draft-card pre").text()).toContain("重写后的方案");
+
+    const cancel = wrapper.findAll("button").find((button) => button.text() === "取消");
+    await cancel!.trigger("click");
+    await flushPromises();
+    expect(client.callsOf("draft.cancel")[0].params).toMatchObject({ id: 23 });
+
+    client.emit("draft.done", { area: "blender", id: 23, cancelled: true });
+    await flushPromises();
+    expect(wrapper.find(".draft-card").text()).toContain("已取消");
+    expect(wrapper.find(".draft-card button").exists()).toBe(false); // 灰卡只读
+  });
+
+  it("executes a draft by id and removes the card once it becomes a user message", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.results.set("draft.send", { accepted: true });
+    client.emit("draft.created", { area: "blender", id: 24, prompt: "方案", origin: "discussion" });
+    await flushPromises();
+
+    const run = wrapper.findAll("button").find((button) => button.text() === "执行");
+    await run!.trigger("click");
+    await flushPromises();
+    expect(client.callsOf("draft.send")[0].params).toMatchObject({ id: 24, prompt: "方案" });
+    expect(wrapper.find("button.stop").exists()).toBe(true); // 已进入规划，可停止
+
+    client.emit("draft.done", { area: "blender", id: 24 });
+    client.emit("chat.message", { area: "blender", role: "user", content: "方案" });
+    await flushPromises();
+
+    expect(wrapper.find(".draft-card").exists()).toBe(false);
+    expect(wrapper.text().match(/方案/g)).toHaveLength(1); // 转正后历史不重复
+  });
+
+  it("keeps the draft card with an error when the target has no blend source", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.results.set("draft.send", { accepted: false, error: "no-blend-source" });
+    client.emit("draft.created", { area: "blender", id: 25, prompt: "改旧一点" });
+    await flushPromises();
+
+    const run = wrapper.findAll("button").find((button) => button.text() === "执行");
+    await run!.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".draft-card").exists()).toBe(true);
+    expect(wrapper.find(".draft-error").text()).toContain("源文件");
+    expect(client.callsOf("draft.send")).toHaveLength(1);
+  });
+
+  it("restores a cancelled draft as a grey read-only card", async () => {
+    const { wrapper } = mountPanel("blender", (fake) => {
+      fake.results.set("session.load", {
+        messages: [
+          {
+            id: 26,
+            role: "draft",
+            content: "旧方案",
+            meta: { state: "cancelled", origin: "generated" },
+          },
+        ],
+      });
+    });
+    await flushPromises();
+
+    expect(wrapper.find(".draft-card").exists()).toBe(true);
+    expect(wrapper.find(".draft-card").text()).toContain("旧方案");
+    expect(wrapper.find(".draft-card").text()).toContain("已取消");
+    expect(wrapper.find(".draft-card button").exists()).toBe(false);
+  });
+
+  it("switches to exec mode after executing a discussion draft", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.results.set("draft.send", { accepted: true });
+    await wrapper.findAll(".chat-mode button")[0].trigger("click"); // 讨论
+    client.emit("draft.created", { area: "blender", id: 27, prompt: "方案" });
+    await flushPromises();
+
+    await wrapper.findAll(".draft-card button")[0].trigger("click");
+    await flushPromises();
+
+    const active = wrapper.findAll(".chat-mode button").find((button) => button.classes("active"));
+    expect(active?.text()).toBe("执行");
+  });
+
+  it("shows planning dots after executing a draft even if a stream was left open", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.results.set("draft.send", { accepted: true });
+    client.emit("chat.delta", { area: "blender", text: "半截回答" });
+    await flushPromises();
+    client.emit("draft.created", { area: "blender", id: 28, prompt: "方案" });
+    await flushPromises();
+
+    await wrapper.findAll(".draft-card button")[0].trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".bubble.streaming").exists()).toBe(false);
+    expect(wrapper.find(".bubble.pending").exists()).toBe(true);
+  });
+
+  it("keeps the planning dots when draft.done arrives before the send response", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    let resolveSend!: (value: unknown) => void;
+    client.results.set(
+      "draft.send",
+      () => new Promise((resolve) => {
+        resolveSend = resolve;
+      }),
+    );
+    client.emit("draft.created", { area: "blender", id: 31, prompt: "方案" });
+    await flushPromises();
+
+    await wrapper.findAll(".draft-card button")[0].trigger("click");
+
+    // 真实后端在请求返回前就广播了转正事件：卡片会先消失
+    client.emit("draft.done", { area: "blender", id: 31 });
+    client.emit("chat.message", { area: "blender", role: "user", content: "方案" });
+    await flushPromises();
+
+    expect(wrapper.find(".bubble.streaming").exists()).toBe(false);
+    expect(wrapper.find(".bubble.pending").exists()).toBe(true);
+
+    resolveSend({ accepted: true });
+    await flushPromises();
+    expect(wrapper.find(".bubble.pending").exists()).toBe(true);
+  });
+
+  it("disables draft actions and shows a spinner while regenerating", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.results.set("draft.regenerate", () => new Promise(() => {}));
+    client.emit("draft.created", { area: "blender", id: 29, prompt: "初稿" });
+    await flushPromises();
+
+    await wrapper.findAll(".draft-card button")[1].trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".draft-card .spinner").exists()).toBe(true);
+    const buttons = wrapper.findAll(".draft-card button");
+    expect(buttons.every((button) => (button.element as HTMLButtonElement).disabled)).toBe(true);
+
+    // 重复点击不能叠第二次重新生成请求
+    await buttons[1].trigger("click");
+    expect(client.callsOf("draft.regenerate")).toHaveLength(1);
+
+    client.emit("draft.updated", { area: "blender", id: 29, prompt: "新版" });
+    await flushPromises();
+    expect(wrapper.find(".draft-card .spinner").exists()).toBe(false);
+    expect(wrapper.find(".draft-card pre").text()).toContain("新版");
+  });
+
+  it("clears the regenerate spinner when draft.failed arrives", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.results.set("draft.regenerate", { accepted: true });
+    client.emit("draft.created", { area: "blender", id: 30, prompt: "初稿" });
+    await flushPromises();
+
+    await wrapper.findAll(".draft-card button")[1].trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".draft-card .spinner").exists()).toBe(true);
+
+    client.emit("draft.failed", { area: "blender", id: 30, reason: "http-500" });
+    await flushPromises();
+    expect(wrapper.find(".draft-card .spinner").exists()).toBe(false);
+    expect(wrapper.find(".draft-error").text()).toContain("重新生成失败");
+    expect((wrapper.findAll(".draft-card button")[1].element as HTMLButtonElement).disabled).toBe(
+      false,
+    );
   });
 });

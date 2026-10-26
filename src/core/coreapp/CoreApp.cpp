@@ -1,6 +1,7 @@
 #include "core/coreapp/CoreApp.h"
 
 #include "core/agent/AgentOrchestrator.h"
+#include "core/agent/AskReply.h"
 #include "core/agent/SummarizerAgent.h"
 #include "core/assets/AssetLibrary.h"
 #include "core/llm/LlmGateway.h"
@@ -19,6 +20,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QStandardPaths>
@@ -63,10 +65,12 @@ bool CoreApp::start()
     m_library = std::make_unique<AssetLibrary>(libraryRoot);
 
     // Blender 桥接运行时：先建好再注册 handler，保证 chat.send 的前置检查有可用对象
-    m_blender = new McpRuntime(
-        QStringLiteral("blender"),
-        std::make_unique<StdioTransport>(defaultBridgeCommand(QStringLiteral("blender"))),
-        this);
+    const BridgeCommand bridge =
+        m_options.blenderBridge.program.isEmpty()
+            ? defaultBridgeCommand(QStringLiteral("blender"))
+            : m_options.blenderBridge;
+    m_blender = new McpRuntime(QStringLiteral("blender"),
+                               std::make_unique<StdioTransport>(bridge), this);
     connect(m_blender, &McpRuntime::toolsChanged, this, [this](const QJsonArray& tools) {
         m_blenderTools = tools;
         if (m_blender->isReady()) // 顶栏悬停文案：已就绪 · N 个工具（规格 4.2）
@@ -80,14 +84,35 @@ bool CoreApp::start()
     m_summarizer = new SummarizerAgent(m_llm.get(), m_sessions.get(), m_settings.get(), this);
     connect(m_summarizer, &SummarizerAgent::draftReady, this,
             [this](const QString& area, const QString& prompt) {
+                // 重新生成：同一条草稿原地换文本，不新增卡片
+                if (const qint64 regenId = m_regenDraft.take(area); regenId > 0) {
+                    m_sessions->updateMessageContent(regenId, prompt);
+                    m_ws->broadcastEvent(
+                        QStringLiteral("draft.updated"),
+                        QJsonObject{{"area", area}, {"id", regenId}, {"prompt", prompt}});
+                    return;
+                }
+                const QString asset = m_pendingDraftAsset.take(area);
+                const QString source = m_pendingDraftSource.take(area);
+                const QString mode =
+                    asset.isEmpty() ? QStringLiteral("lowpoly") : QStringLiteral("modify");
+                const qint64 id = m_sessions->appendMessage(
+                    area, QStringLiteral("draft"), prompt,
+                    QJsonObject{{"state", "pending"}, {"origin", "generated"},
+                                {"mode", mode}, {"asset", asset}, {"source", source}});
                 m_ws->broadcastEvent(
                     QStringLiteral("draft.created"),
-                    QJsonObject{{"area", area},
-                                {"taskId", QStringLiteral("draft-%1").arg(++m_seq)},
-                                {"prompt", prompt}});
+                    QJsonObject{{"area", area}, {"id", id}, {"prompt", prompt},
+                                {"origin", "generated"}, {"mode", mode}, {"asset", asset}});
             });
     connect(m_summarizer, &SummarizerAgent::failed, this,
             [this](const QString& area, const QString& reason) {
+                // 重新生成失败也要点名是哪张卡：前端靠它停转圈、恢复按钮
+                if (const qint64 regenId = m_regenDraft.take(area); regenId > 0) {
+                    m_ws->broadcastEvent(
+                        QStringLiteral("draft.failed"),
+                        QJsonObject{{"area", area}, {"id", regenId}, {"reason", reason}});
+                }
                 m_ws->broadcastEvent(QStringLiteral("error.card"),
                                      QJsonObject{{"area", area}, {"reason", reason}});
             });
@@ -123,6 +148,9 @@ bool CoreApp::start()
                                      QJsonObject{{"area", area},
                                                  {"role", "assistant"},
                                                  {"content", text}});
+                // 导出回合正常结束（即使模型没产出新 glb）也要解锁预览
+                m_ws->broadcastEvent(QStringLiteral("export.finished"),
+                                     QJsonObject{{"area", area}, {"completed", true}});
             });
     connect(m_orch, &AgentOrchestrator::failed, this,
             [this](const QString& area, const QString& reason) {
@@ -155,13 +183,35 @@ bool CoreApp::start()
             [this](const QString& area, const QString& taskId, const QJsonObject& plan) {
                 if (m_planCancelled.remove(area))
                     return; // 已取消的规划不再弹卡
-                m_pendingPlans.insert(area, plan);
-                m_ws->broadcastEvent(QStringLiteral("plan.created"),
-                                     QJsonObject{{"area", area},
-                                                 {"taskId", taskId},
-                                                 {"rules", plan.value("rules")},
-                                                 {"groups", plan.value("groups")},
-                                                 {"totalSteps", plan.value("totalSteps")}});
+                // 计划卡也是一行：刷新后靠 content + meta.state 重建
+                const QJsonObject payload{
+                    {QStringLiteral("taskId"), taskId},
+                    {QStringLiteral("rules"), plan.value(QStringLiteral("rules"))},
+                    {QStringLiteral("groups"), plan.value(QStringLiteral("groups"))},
+                    {QStringLiteral("totalSteps"), plan.value(QStringLiteral("totalSteps"))}};
+                const qint64 planId = m_sessions->appendMessage(
+                    area, QStringLiteral("plan"),
+                    QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)),
+                    QJsonObject{{QStringLiteral("state"), QStringLiteral("pending")},
+                                {QStringLiteral("taskId"), taskId}});
+                // id 也放进暂存：历史遗留的旧 pending 卡点确认时能和当前计划对上
+                QJsonObject pending = plan;
+                pending.insert(QStringLiteral("id"), planId);
+                m_pendingPlans.insert(area, pending);
+                m_ws->broadcastEvent(
+                    QStringLiteral("plan.created"),
+                    QJsonObject{{QStringLiteral("area"), area},
+                                {QStringLiteral("id"), planId},
+                                {QStringLiteral("taskId"), taskId},
+                                {QStringLiteral("rules"), plan.value(QStringLiteral("rules"))},
+                                {QStringLiteral("groups"), plan.value(QStringLiteral("groups"))},
+                                {QStringLiteral("totalSteps"), plan.value(QStringLiteral("totalSteps"))}});
+            });
+    connect(m_orch, &AgentOrchestrator::exportStarted, this,
+            [this](const QString& area, const QString& folder) {
+                // 预览面板先挂“导出中”：glb 还在写，不能直接加载
+                m_ws->broadcastEvent(QStringLiteral("export.started"),
+                                     QJsonObject{{"area", area}, {"folder", folder}});
             });
     connect(m_orch, &AgentOrchestrator::artifactsReady, this,
             [this](const QString& area, const QStringList& absoluteGlbs) {
@@ -226,54 +276,136 @@ bool CoreApp::start()
                               [this](const QJsonObject& params) {
                                   return handleChatSend(params);
                               });
+    m_router->registerHandler(QStringLiteral("draft.save"),
+                              [this](const QJsonObject& params) {
+                                  const qint64 id = params.value(QStringLiteral("id")).toInteger();
+                                  const QString content =
+                                      params.value(QStringLiteral("content")).toString();
+                                  if (id <= 0)
+                                      return QJsonValue(QJsonObject{{"ok", false}});
+                                  // 编辑失焦即存：刷新后看到的是改过的版本
+                                  return QJsonValue(
+                                      QJsonObject{{"ok", m_sessions->updateMessageContent(id,
+                                                                                          content)}});
+                              });
     m_router->registerHandler(QStringLiteral("draft.send"),
                               [this](const QJsonObject& params) {
-                                  const QString area =
-                                      params.value(QStringLiteral("area")).toString();
-                                  const QString prompt =
-                                      params.value(QStringLiteral("prompt")).toString().trimmed();
-                                  if (area.isEmpty() || prompt.isEmpty())
-                                      return QJsonValue(QJsonObject{
-                                          {"accepted", false}, {"reason", "invalid-draft"}});
-                                  const LlmConfig cfg = primaryAgentConfig();
-                                  if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty()
-                                      || cfg.model.isEmpty())
-                                      return QJsonValue(QJsonObject{
-                                          {"accepted", false}, {"reason", "agent-not-configured"}});
-                                  // 草稿确认后成为正式指令：落库 + 进历史（规格 5.2）
-                                  m_sessions->saveDraft(area, prompt);
-                                  m_sessions->appendMessage(area, QStringLiteral("user"), prompt);
-                                  m_ws->broadcastEvent(
-                                      QStringLiteral("chat.message"),
-                                      QJsonObject{{"area", area},
-                                                  {"role", "user"},
-                                                  {"content", prompt}});
-                                  // 规划用不含本次指令的历史，指令已由 plan() 拼在末尾
-                                  m_planPrompts.insert(area, prompt);
-                                  m_planCancelled.remove(area);
-                                  m_orch->setModelConfig(cfg);
-                                  m_orch->setConversationHistory(historyForPrompt(area, prompt, 20));
-                                  m_orch->plan(QStringLiteral("plan-%1").arg(++m_seq), nullptr,
-                                               prompt, area);
-                                  return QJsonValue(QJsonObject{{"accepted", true}});
+        const qint64 id = params.value(QStringLiteral("id")).toInteger();
+        const QString prompt = params.value(QStringLiteral("prompt")).toString().trimmed();
+        const QJsonObject row = id > 0 ? m_sessions->messageById(id) : QJsonObject{};
+        if (row.isEmpty() || prompt.isEmpty())
+            return QJsonValue(QJsonObject{{"accepted", false}, {"reason", "invalid-draft"}});
+
+        const QString area = row.value(QStringLiteral("area")).toString();
+        const QString asset = row.value(QStringLiteral("meta")).toObject()
+                                  .value(QStringLiteral("asset")).toString();
+
+        // 草稿阶段不拦 Blender（写方案只需 LLM）；点执行才检查，没开就弹提示且不占门禁
+        const PreflightResult pre = m_preflight->checkLowpoly();
+        if (!pre.ok) {
+            m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                 QJsonObject{{"area", area}, {"reason", pre.reason}});
+            return QJsonValue(QJsonObject{{"accepted", false}, {"reason", pre.reason}});
+        }
+
+        // 先确认源文件在，再转正：否则草稿卡消失了但执行失败，用户无法回头改
+        if (!asset.isEmpty()) {
+            QFileInfo src(m_library->absoluteFor(asset));
+            if (src.suffix().toLower() != QLatin1String("blend"))
+                src = QFileInfo(src.dir().filePath(src.completeBaseName()
+                                                   + QStringLiteral(".blend")));
+            if (!src.exists())
+                return QJsonValue(QJsonObject{{"accepted", false},
+                                              {"error", "no-blend-source"}});
+        }
+        // 草稿转正：改角色而不是新增 user 消息，否则历史里同一段文本出现两次
+        m_sessions->updateMessageContent(id, prompt);
+        m_sessions->setMessageRole(id, QStringLiteral("user"));
+        m_ws->broadcastEvent(QStringLiteral("draft.done"),
+                             QJsonObject{{"area", area}, {"id", id}});
+        m_ws->broadcastEvent(QStringLiteral("chat.message"),
+                             QJsonObject{{"area", area}, {"role", "user"},
+                                         {"content", prompt}});
+
+        if (!asset.isEmpty())
+            return startModify(area, asset, prompt);
+        // plan.confirm 要用用户最后编辑过的提示词去执行，不是 Summarizer 的初稿
+        m_planPrompts.insert(area, prompt);
+        // 新指令作废上一次「取消规划」标记，否则 planReady 会把这次的新计划也丢掉
+        m_planCancelled.remove(area);
+        m_orch->setModelConfig(primaryAgentConfig());
+        // 本次指令已由草稿行转正落库，plan() 会把它拼在末尾：历史里去掉同一条避免重复
+        m_orch->setConversationHistory(historyForPrompt(area, prompt, 20));
+        m_orch->plan(QStringLiteral("plan-%1").arg(++m_seq), nullptr, prompt, area);
+        return QJsonValue(QJsonObject{{"accepted", true}});
                               });
     m_router->registerHandler(QStringLiteral("draft.cancel"),
                               [this](const QJsonObject& params) {
-                                  const QString area =
-                                      params.value(QStringLiteral("area")).toString();
-                                  // content 列 NOT NULL：清空用空串，不能传 null QString
-                                  if (!area.isEmpty()) {
-                                      m_sessions->saveDraft(area, QStringLiteral(""));
-                                      m_planCancelled.insert(area);
-                                      m_pendingPlans.remove(area);
-                                      m_pendingPicks.remove(area);
-                                  }
-                                  return QJsonValue(QJsonObject{{"ok", true}});
+        const qint64 id = params.value(QStringLiteral("id")).toInteger();
+        const QJsonObject row = id > 0 ? m_sessions->messageById(id) : QJsonObject{};
+        if (row.isEmpty())
+            return QJsonValue(QJsonObject{{"ok", false}});
+        QJsonObject meta = row.value(QStringLiteral("meta")).toObject();
+        meta.insert(QStringLiteral("state"), QStringLiteral("cancelled"));
+        m_sessions->updateMessageMeta(id, meta);
+        m_ws->broadcastEvent(
+            QStringLiteral("draft.done"),
+            QJsonObject{{"area", row.value(QStringLiteral("area")).toString()},
+                        {"id", id}, {"cancelled", true}});
+        return QJsonValue(QJsonObject{{"ok", true}});
+                              });
+    m_router->registerHandler(QStringLiteral("draft.regenerate"),
+                              [this](const QJsonObject& params) {
+        const qint64 id = params.value(QStringLiteral("id")).toInteger();
+        const QJsonObject row = id > 0 ? m_sessions->messageById(id) : QJsonObject{};
+        if (row.isEmpty())
+            return QJsonValue(QJsonObject{{"accepted", false}});
+
+        const QString area = row.value(QStringLiteral("area")).toString();
+        const QJsonObject meta = row.value(QStringLiteral("meta")).toObject();
+        const QString asset = meta.value(QStringLiteral("asset")).toString();
+        const QString source = meta.value(QStringLiteral("source")).toString();
+        // 讨论产出的正文本身就是讨论结论；SummarizerAgent 产出的不能再当讨论喂回去
+        const QString discussion =
+            meta.value(QStringLiteral("origin")).toString() == QLatin1String("discussion")
+                ? row.value(QStringLiteral("content")).toString()
+                : QString();
+
+        m_regenDraft.insert(area, id);
+        m_summarizer->generate({area, source.isEmpty() ? discussion : source,
+                                asset.isEmpty() ? QStringLiteral("lowpoly")
+                                                : QStringLiteral("modify"),
+                                QFileInfo(asset).completeBaseName(), discussion});
+        return QJsonValue(QJsonObject{{"accepted", true}});
                               });
     m_router->registerHandler(QStringLiteral("plan.confirm"),
                               [this](const QJsonObject& params) {
                                   const QString area =
                                       params.value(QStringLiteral("area")).toString();
+                                  // 先核对 id 是不是当前这张；历史遗留卡只置灰自己
+                                  const qint64 requestedId =
+                                      params.value(QStringLiteral("id")).toInteger();
+                                  const qint64 pendingId = m_pendingPlans.value(area)
+                                                               .value(QStringLiteral("id"))
+                                                               .toInteger();
+                                  if (requestedId > 0 && requestedId != pendingId) {
+                                      // pendingId==0：应用重启后内存里没计划；不相等：点的是旧卡。
+                                      // 只改仍为 pending 的卡，避免把已 started 的卡又改回 cancelled
+                                      const QJsonObject row =
+                                          m_sessions->messageById(requestedId);
+                                      QJsonObject meta = row.value(QStringLiteral("meta"))
+                                                             .toObject();
+                                      if (row.value(QStringLiteral("role")).toString()
+                                              == QLatin1String("plan")
+                                          && meta.value(QStringLiteral("state")).toString()
+                                                 == QLatin1String("pending")) {
+                                          meta.insert(QStringLiteral("state"),
+                                                      QStringLiteral("cancelled"));
+                                          m_sessions->updateMessageMeta(requestedId, meta);
+                                      }
+                                      return QJsonValue(QJsonObject{{"ok", false},
+                                                                    {"error", "plan-not-found"}});
+                                  }
                                   const QJsonObject json = m_pendingPlans.value(area);
                                   if (json.isEmpty())
                                       return QJsonValue(QJsonObject{
@@ -287,6 +419,17 @@ bool CoreApp::start()
                                           {"ok", false}, {"error", "blender-busy"}});
                                   }
                                   m_pendingPlans.remove(area);
+                                  // 只有真正开始选目录才置 started；blender-busy 保持 pending
+                                  const QJsonObject row = m_sessions->messageById(requestedId);
+                                  if (requestedId > 0
+                                      && row.value(QStringLiteral("role")).toString()
+                                             == QLatin1String("plan")) {
+                                      QJsonObject meta = row.value(QStringLiteral("meta"))
+                                                             .toObject();
+                                      meta.insert(QStringLiteral("state"),
+                                                  QStringLiteral("started"));
+                                      m_sessions->updateMessageMeta(requestedId, meta);
+                                  }
                                   m_pendingPicks.insert(
                                       area, PendingPick{area, QStringLiteral("lowpoly"),
                                                         m_planPrompts.value(area),
@@ -298,9 +441,45 @@ bool CoreApp::start()
                               [this](const QJsonObject& params) {
                                   const QString area =
                                       params.value(QStringLiteral("area")).toString();
+                                  // 历史遗留卡只置灰自己，不取消当前计划
+                                  const qint64 requestedId =
+                                      params.value(QStringLiteral("id")).toInteger();
+                                  const qint64 pendingId = m_pendingPlans.value(area)
+                                                               .value(QStringLiteral("id"))
+                                                               .toInteger();
+                                  if (requestedId > 0 && requestedId != pendingId) {
+                                      const QJsonObject row =
+                                          m_sessions->messageById(requestedId);
+                                      QJsonObject meta = row.value(QStringLiteral("meta"))
+                                                             .toObject();
+                                      if (row.value(QStringLiteral("role")).toString()
+                                              == QLatin1String("plan")
+                                          && meta.value(QStringLiteral("state")).toString()
+                                                 == QLatin1String("pending")) {
+                                          meta.insert(QStringLiteral("state"),
+                                                      QStringLiteral("cancelled"));
+                                          m_sessions->updateMessageMeta(requestedId, meta);
+                                      }
+                                      return QJsonValue(QJsonObject{{"ok", true}});
+                                  }
                                   m_planCancelled.insert(area);
                                   m_pendingPlans.remove(area);
                                   m_pendingPicks.remove(area);
+                                  // 正常取消：只把 pending 的卡置灰
+                                  if (requestedId > 0) {
+                                      const QJsonObject row =
+                                          m_sessions->messageById(requestedId);
+                                      QJsonObject meta = row.value(QStringLiteral("meta"))
+                                                             .toObject();
+                                      if (row.value(QStringLiteral("role")).toString()
+                                              == QLatin1String("plan")
+                                          && meta.value(QStringLiteral("state")).toString()
+                                                 == QLatin1String("pending")) {
+                                          meta.insert(QStringLiteral("state"),
+                                                      QStringLiteral("cancelled"));
+                                          m_sessions->updateMessageMeta(requestedId, meta);
+                                      }
+                                  }
                                   m_ws->broadcastEvent(
                                       QStringLiteral("error.card"),
                                       QJsonObject{{"area", area}, {"reason", "user-cancelled"}});
@@ -436,6 +615,9 @@ bool CoreApp::start()
                     {"ok", true},
                     {"kind", "model"},
                     {"dataUrl", QUrl::fromLocalFile(abs).toString()},
+                    // 前端加载前轮询这两个字段，确认导出已经写完再交给 three.js
+                    {"size", static_cast<double>(info.size())},
+                    {"modified", info.lastModified().toString(Qt::ISODate)},
                     {"blendPath", blend.exists()
                                       ? m_library->relativeFor(blend.absoluteFilePath())
                                       : QString()}});
@@ -530,6 +712,10 @@ bool CoreApp::start()
                                       m_planCancelled.insert(area);
                                       m_pendingPlans.remove(area);
                                   }
+                                  // 导出回合被停止：预览面板解锁，别一直挂着“导出中”
+                                  m_ws->broadcastEvent(QStringLiteral("export.finished"),
+                                                       QJsonObject{{"area", area},
+                                                                   {"cancelled", true}});
                                   return QJsonValue(QJsonObject{{"ok", true}});
                               });
     m_router->registerHandler(QStringLiteral("chat.continue"),
@@ -643,7 +829,11 @@ QJsonArray CoreApp::recentMessages(const QString& area, int limit) const
     QJsonArray history;
     for (const QJsonValue& value : m_sessions->messagePage(area, limit).messages) {
         const QJsonObject message = value.toObject();
-        history.append(QJsonObject{{"role", message.value(QStringLiteral("role"))},
+        // 草稿卡 / 计划卡是 UI 行，不是对话：喂给 LLM 会得到未知 role
+        const QString role = message.value(QStringLiteral("role")).toString();
+        if (role != QLatin1String("user") && role != QLatin1String("assistant"))
+            continue;
+        history.append(QJsonObject{{"role", role},
                                    {"content", message.value(QStringLiteral("content"))}});
     }
     return history;
@@ -667,12 +857,9 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
     const QString text = params.value(QStringLiteral("text")).toString();
     const QString mode = params.value(QStringLiteral("mode")).toString(); // 空 = P2 通用流
 
-    // 前置检查先于任何落库/LLM 调用：链未就绪直接拒绝，不浪费总结/建模调用
-    if (mode == QLatin1String("lowpoly") || mode == QLatin1String("cloud3d")
-        || mode == QLatin1String("modify")) {
-        const PreflightResult pre = mode == QLatin1String("cloud3d")
-                                        ? m_preflight->checkCloud3d()
-                                        : m_preflight->checkLowpoly();
+    // 前置检查只留云 API：低模/修改在草稿阶段不需要 Blender，点执行时才检查
+    if (mode == QLatin1String("cloud3d")) {
+        const PreflightResult pre = m_preflight->checkCloud3d();
         if (!pre.ok) {
             m_ws->broadcastEvent(QStringLiteral("error.card"),
                                  QJsonObject{{"area", area}, {"reason", pre.reason}});
@@ -682,54 +869,158 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
 
     m_lastSend.insert(area, params);
 
-    // 修改已有资产：不进草稿/计划/选目录，单组计划直接执行
-    if (mode == QLatin1String("modify")) {
-        const QString asset = params.value(QStringLiteral("asset")).toString();
-        const QString request = text.trimmed();
-        // 修改锚点统一是 .blend：传 glb/fbx 时自动找同目录同名源文件
-        QFileInfo info;
-        if (!asset.isEmpty()) {
-            info = QFileInfo(m_library->absoluteFor(asset));
-            if (info.suffix().compare(QLatin1String("blend"), Qt::CaseInsensitive) != 0)
-                info = QFileInfo(info.dir().filePath(info.completeBaseName()
-                                                     + QStringLiteral(".blend")));
-        }
-        const QString blendRelative =
-            info.exists() ? m_library->relativeFor(info.absoluteFilePath()) : QString();
-        // 没有同名 .blend（云API 高模/外部导入）或指令为空：前端据此提示只能重新生成
-        if (request.isEmpty() || blendRelative.isEmpty()
-            || !m_library->isValidTarget(blendRelative))
-            return QJsonValue(QJsonObject{{"accepted", false}, {"error", "no-blend-source"}});
+    // 讨论模式：只聊天，不检查桥接、不占门禁、不写草稿以外的任务链
+    if (mode == QLatin1String("ask")) {
         if (appendUser) {
-            m_sessions->appendMessage(area, QStringLiteral("user"), request);
+            m_sessions->appendMessage(area, QStringLiteral("user"), text);
             m_ws->broadcastEvent(
                 QStringLiteral("chat.message"),
-                QJsonObject{{"area", area}, {"role", "user"}, {"content", request}});
+                QJsonObject{{QStringLiteral("area"), area}, {QStringLiteral("role"), "user"},
+                            {QStringLiteral("content"), text}});
         }
-        BuildPlan plan;
-        BuildGroup group;
-        group.title = QStringLiteral("修改资产");
-        group.acceptance = QStringLiteral("修改意图达成；同名 GLB/FBX/blend 已覆盖");
-        plan.groups = {group};
-        plan.maxSteps = 50;
-        plan.targetBase = info.completeBaseName(); // 导出回合据此覆盖同名文件
-        const QString prompt =
-            QStringLiteral("打开 .blend 源文件 %1。要求：%2。"
-                           "保留场景里已有的可导出动效（物体关键帧），不要删除或覆盖。"
-                           "完成后覆盖导出同名 GLB/FBX 并保存 .blend。")
-                .arg(info.absoluteFilePath(), request);
-        const QString targetFolder = info.absolutePath();
-        const QString taskId = QStringLiteral("chat-%1").arg(++m_seq);
+        const LlmConfig cfg = primaryAgentConfig();
+        if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty() || cfg.model.isEmpty()) {
+            m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                 QJsonObject{{"area", area}, {"reason", "agent-not-configured"}});
+            return QJsonValue(QJsonObject{{"accepted", false}, {"reason", "agent-not-configured"}});
+        }
+
+        const QString asset = params.value(QStringLiteral("asset")).toString();
+        QFile tpl(QStringLiteral(":/prompts/ask.md"));
+        QString system;
+        if (tpl.open(QIODevice::ReadOnly | QIODevice::Text))
+            system = QString::fromUtf8(tpl.readAll());
+        // 修改入口是同基名 .blend；只看所选文件会把只有 glb 的云资产误判成可修改
+        QFileInfo sourceFile;
+        if (!asset.isEmpty()) {
+            sourceFile = QFileInfo(m_library->absoluteFor(asset));
+            if (sourceFile.suffix().toLower() != QLatin1String("blend"))
+                sourceFile = QFileInfo(sourceFile.dir().filePath(
+                    sourceFile.completeBaseName() + QStringLiteral(".blend")));
+        }
+        const bool hasSource = sourceFile.exists();
+        system.replace(QStringLiteral("{{asset}}"),
+                       asset.isEmpty() ? QStringLiteral("（未选中）") : asset);
+        system.replace(
+            QStringLiteral("{{asset_state}}"),
+            asset.isEmpty()
+                ? QStringLiteral("无")
+                : (hasSource ? QStringLiteral("已选中的低模资产")
+                             : QStringLiteral("无 .blend 源文件，只能重新生成")));
+        // 资产清单：让模型能说「你库里有三个招牌」而不是瞎猜；glb/fbx/blend 同基名只列一次
+        QString assetLines;
+        QSet<QString> seenBases;
+        for (const QString& rel : m_library->scanAssets()) {
+            const QFileInfo fi(m_library->absoluteFor(rel));
+            if (fi.suffix().toLower() != QLatin1String("glb"))
+                continue;
+            const QString base = fi.completeBaseName();
+            if (seenBases.contains(base))
+                continue;
+            seenBases.insert(base);
+            const bool hasBlend =
+                QFileInfo(fi.dir().filePath(base + QStringLiteral(".blend"))).exists();
+            assetLines += QStringLiteral("- %1%2\n").arg(
+                rel, hasBlend ? QStringLiteral("（有 .blend，可修改）")
+                              : QStringLiteral("（无 .blend，只能重新生成）"));
+            if (seenBases.size() >= 30)
+                break;
+        }
+        system.replace(QStringLiteral("{{assets}}"),
+                       assetLines.isEmpty() ? QStringLiteral("（空）") : assetLines);
+
+        QJsonArray messages{
+            QJsonObject{{"role", "system"}, {"content", system}}};
+        // recentMessages 只放行 user/assistant：草稿卡与计划卡行不能喂给 LLM
+        for (const QJsonValue& value : recentMessages(area, 20))
+            messages.append(value);
+
+        const QString taskId = QStringLiteral("ask-%1").arg(++m_seq);
         m_tasks->enqueue(Task{
             taskId, area, QString(),
-            [this, plan, prompt, targetFolder, request, area](const QString& tid,
-                                                            TaskManager* tm) {
-                m_orch->setModelConfig(primaryAgentConfig());
-                m_orch->setConversationHistory(historyForPrompt(area, request, 20));
-                m_orch->execute(tid, tm, ToolBridge::mcpToolsToOpenAi(m_blenderTools), plan,
-                                prompt, targetFolder, area);
+            [this, area, cfg, messages, asset, text](const QString& tid, TaskManager* tm) {
+                // [[EXEC]] 之后整段都是草稿：流里一个字都不能发，等结束做卡片
+                auto buffer = std::make_shared<QString>();
+                auto filter = std::make_shared<AskStreamFilter>();
+                LlmGateway::StreamHandlers handlers;
+                handlers.onDelta = [this, area, buffer, filter](const QString& delta) {
+                    buffer->append(delta);
+                    const QString visible = filter->feed(delta);
+                    if (!visible.isEmpty())
+                        m_ws->broadcastEvent(QStringLiteral("chat.delta"),
+                                             QJsonObject{{"area", area}, {"text", visible}});
+                };
+                handlers.onDone = [this, area, tid, tm, buffer, filter, asset, text]() {
+                    if (tm->isCancelled(tid)) {
+                        m_sessions->upsertTask(tid, area, QStringLiteral("chat"),
+                                               QStringLiteral("cancelled"), {});
+                        tm->finish(tid);
+                        return;
+                    }
+                    const QString tail = filter->finish();
+                    if (!tail.isEmpty())
+                        m_ws->broadcastEvent(QStringLiteral("chat.delta"),
+                                             QJsonObject{{"area", area}, {"text", tail}});
+                    const AskReply reply = parseAskReply(*buffer);
+                    m_sessions->appendMessage(area, QStringLiteral("assistant"), reply.visible);
+                    m_ws->broadcastEvent(
+                        QStringLiteral("chat.message"),
+                        QJsonObject{{"area", area}, {"role", "assistant"},
+                                    {"content", reply.visible}});
+                    // 讨论产出的草稿也是一行 draft：刷新后靠它重建草稿卡
+                    if (!reply.executable.isEmpty()) {
+                        const qint64 draftId = m_sessions->appendMessage(
+                            area, QStringLiteral("draft"), reply.executable,
+                            QJsonObject{{"state", "pending"}, {"origin", "discussion"},
+                                        {"asset", asset}, {"source", text}});
+                        m_ws->broadcastEvent(
+                            QStringLiteral("draft.created"),
+                            QJsonObject{{"area", area}, {"id", draftId},
+                                        {"prompt", reply.executable},
+                                        {"origin", "discussion"}, {"asset", asset}});
+                    }
+                    m_sessions->upsertTask(tid, area, QStringLiteral("chat"),
+                                           QStringLiteral("done"), {},
+                                           QJsonObject{{"reply", reply.visible}});
+                    tm->finish(tid);
+                };
+                handlers.onError = [this, area, tid, tm](const QString& error) {
+                    if (tm->isCancelled(tid)) {
+                        m_sessions->upsertTask(tid, area, QStringLiteral("chat"),
+                                               QStringLiteral("cancelled"), {});
+                        tm->finish(tid);
+                        return;
+                    }
+                    m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                         QJsonObject{{"area", area}, {"reason", error}});
+                    tm->finish(tid);
+                };
+                m_llm->chatStream(cfg, messages, {}, handlers, area);
             }});
         return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
+    }
+
+    // 修改已有资产：执行模式也先出修改草稿，指令模糊时由修改模板收敛
+    if (mode == QLatin1String("modify")) {
+        const QString asset = params.value(QStringLiteral("asset")).toString();
+        if (appendUser) {
+            m_sessions->appendMessage(area, QStringLiteral("user"), text);
+            m_ws->broadcastEvent(
+                QStringLiteral("chat.message"),
+                QJsonObject{{"area", area}, {"role", "user"}, {"content", text}});
+        }
+        const LlmConfig cfg = primaryAgentConfig();
+        if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty() || cfg.model.isEmpty()) {
+            m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                 QJsonObject{{"area", area}, {"reason", "agent-not-configured"}});
+            return QJsonValue(
+                QJsonObject{{"accepted", false}, {"reason", "agent-not-configured"}});
+        }
+        m_pendingDraftAsset.insert(area, asset);
+        m_pendingDraftSource.insert(area, text);
+        m_summarizer->generate(
+            {area, text, QStringLiteral("modify"), QFileInfo(asset).completeBaseName(), {}});
+        return QJsonValue(QJsonObject{{"accepted", true}});
     }
 
     // 低模模式：先落库用户需求，再交给总结 agent 改写草稿（规格 5.2）
@@ -747,7 +1038,9 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
             return QJsonValue(
                 QJsonObject{{"accepted", false}, {"reason", "agent-not-configured"}});
         }
-        m_summarizer->generate(area, text); // 草稿经 draft.created 下发
+        m_pendingDraftAsset.insert(area, QString());
+        m_pendingDraftSource.insert(area, text);
+        m_summarizer->generate({area, text}); // 默认 mode=lowpoly
         return QJsonValue(QJsonObject{{"accepted", true}});
     }
 
@@ -833,6 +1126,50 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
             m_llm->chatStream(cfg, history, {}, handlers, area); // tag = 区名，供 abortTag 定点中止
         }});
 
+    return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
+}
+
+QJsonValue CoreApp::startModify(const QString& area, const QString& asset, const QString& text)
+{
+    // 修改锚点统一是 .blend：传 glb/fbx 时自动找同目录同名源文件
+    QFileInfo info;
+    if (!asset.isEmpty()) {
+        info = QFileInfo(m_library->absoluteFor(asset));
+        if (info.suffix().toLower() != QLatin1String("blend"))
+            info = QFileInfo(info.dir().filePath(info.completeBaseName()
+                                                 + QStringLiteral(".blend")));
+    }
+    const QString blendRelative =
+        info.exists() ? m_library->relativeFor(info.absoluteFilePath()) : QString();
+    if (asset.isEmpty() || text.isEmpty() || blendRelative.isEmpty()
+        || !m_library->isValidTarget(blendRelative))
+        return QJsonValue(QJsonObject{{"accepted", false}, {"error", "no-blend-source"}});
+
+    BuildPlan plan;
+    BuildGroup group;
+    group.title = QStringLiteral("修改资产");
+    group.acceptance = QStringLiteral("修改意图达成；同名 GLB/FBX/blend 已覆盖");
+    plan.groups.append(group);
+    plan.maxSteps = 50;
+    plan.targetBase = info.completeBaseName(); // 导出回合据此覆盖同名文件
+    const QString prompt = QStringLiteral("打开 .blend 源文件 %1。要求：%2。"
+                                          "保留场景里已有的可导出动效（物体关键帧），不要删除或覆盖。"
+                                          "过程中不要自行导出或保存；完成后由系统统一覆盖导出同名 "
+                                          "GLB/FBX 并保存 .blend。")
+                               .arg(info.absoluteFilePath(), text);
+    const QString taskId = QStringLiteral("chat-%1").arg(++m_seq);
+    const QString targetFolder = info.absolutePath();
+    // 草稿已转正成最后一条 user，prompt 还会拼在末尾：历史里去掉同一条避免重复
+    const QJsonArray history = historyForPrompt(area, text, 20);
+    m_tasks->enqueue(
+        Task{taskId, area, QString(),
+             [this, plan, prompt, targetFolder, area, history](const QString& tid,
+                                                               TaskManager* tm) {
+                 m_orch->setModelConfig(primaryAgentConfig());
+                 m_orch->setConversationHistory(history);
+                 m_orch->execute(tid, tm, ToolBridge::mcpToolsToOpenAi(m_blenderTools),
+                                 plan, prompt, targetFolder, area);
+             }});
     return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
 }
 
