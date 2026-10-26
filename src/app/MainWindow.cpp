@@ -33,10 +33,12 @@ protected:
 } // namespace
 
 MainWindow::MainWindow(const QUrl& uiUrl, QByteArray savedGeometry,
-                       std::function<void(const QByteArray&)> onGeometrySave, QWidget* parent)
+                       std::function<void(const QByteArray&)> onGeometrySave, bool softwareRender,
+                       QWidget* parent)
     : QMainWindow(parent)
     , m_host(new QWidget(this))
     , m_view(new SuppressedMenuWebView(m_host))
+    , m_softwareRender(softwareRender)
     , m_onGeometrySave(std::move(onGeometrySave))
 {
     setWindowTitle(QStringLiteral("SynthForge Studio"));
@@ -57,12 +59,13 @@ MainWindow::MainWindow(const QUrl& uiUrl, QByteArray savedGeometry,
     m_view->page()->setBackgroundColor(QColor(0x1e, 0x1e, 0x1e));
     m_view->setUrl(uiUrl);
 
-    // Qt WebEngine 的合成表面跟不上窗口尺寸：拖动时直接缩放会露出
-    // 未初始化的底色（Intel 核显上表现为蓝色块）。先把网页尺寸冻住，
-    // 停手 120ms 后再一次性对齐，页面只重排一次。
-    m_resizeTimer.setSingleShot(true);
-    m_resizeTimer.setInterval(120);
-    connect(&m_resizeTimer, &QTimer::timeout, this, &MainWindow::syncViewGeometry);
+    // GPU 合成下网页实时跟随窗口尺寸；只有退回软件合成时才需要先冻住尺寸，
+    // 停手 120ms 再一次性对齐，避免露出未初始化的合成表面（Intel 核显蓝块）。
+    if (m_softwareRender) {
+        m_resizeTimer.setSingleShot(true);
+        m_resizeTimer.setInterval(120);
+        connect(&m_resizeTimer, &QTimer::timeout, this, &MainWindow::syncViewGeometry);
+    }
 
     setCentralWidget(m_host);
     syncViewGeometry();
@@ -71,7 +74,10 @@ MainWindow::MainWindow(const QUrl& uiUrl, QByteArray savedGeometry,
 void MainWindow::resizeEvent(QResizeEvent* event)
 {
     QMainWindow::resizeEvent(event);
-    m_resizeTimer.start(); // 每次尺寸变化都重置，拖动期间不落定
+    if (m_softwareRender)
+        m_resizeTimer.start(); // 软件合成：等停手后再对齐，避免闪蓝块
+    else
+        syncViewGeometry(); // GPU 合成：实时跟手
 }
 
 void MainWindow::closeEvent(QCloseEvent* event)

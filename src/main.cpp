@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <QByteArray>
 #include <QCoreApplication>
 #include <QIcon>
 #include <QStringList>
@@ -20,9 +21,12 @@ int main(int argc, char* argv[])
     scheme.setFlags(QWebEngineUrlScheme::SecureScheme | QWebEngineUrlScheme::LocalAccessAllowed);
     QWebEngineUrlScheme::registerScheme(scheme); // 必须先于 QApplication
 
-    // Intel 核显 + D3D11 合成：拉伸窗口、首次流式重绘时会闪蓝色色块。
-    // 降一档到软件合成，聊天界面开销可忽略；用户显式设置时以用户为准。
-    if (qEnvironmentVariableIsEmpty("QTWEBENGINE_CHROMIUM_FLAGS"))
+    // 默认走 GPU 合成：软件合成下滚动聊天、拖拽 3D 预览都吃 CPU，建模时更明显。
+    // 个别机器拉伸窗口会闪蓝块，可用 --software-render 或 SYNTHFORGE_SOFTWARE_RENDER=1 退回。
+    bool softwareRender = qEnvironmentVariable("SYNTHFORGE_SOFTWARE_RENDER") == "1";
+    for (int i = 1; i < argc && !softwareRender; ++i)
+        softwareRender = QByteArray(argv[i]) == "--software-render";
+    if (softwareRender && qEnvironmentVariableIsEmpty("QTWEBENGINE_CHROMIUM_FLAGS"))
         qputenv("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu-compositing");
 
     QApplication app(argc, argv);
@@ -57,7 +61,8 @@ int main(int argc, char* argv[])
     MainWindow window(uiUrl, uiState.windowGeometry(),
                       [&uiState](const QByteArray& geometry) {
                           uiState.setWindowGeometry(geometry);
-                      }); // core 先声明：退出时窗口先销毁
+                      },
+                      softwareRender); // core 先声明：退出时窗口先销毁
     window.show();
     return app.exec();
 }
