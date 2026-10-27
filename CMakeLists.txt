@@ -31,6 +31,7 @@ add_library(synthforge_core STATIC
     src/core/assets/AssetLibrary.cpp
     src/core/cloud3d/Cloud3dProvider.cpp
     src/core/cloud3d/CustomProvider.cpp
+    src/core/cloud3d/HunyuanProvider.cpp
     src/core/cloud3d/Tc3Signature.cpp
     src/core/cloud3d/TripoProvider.cpp
     src/core/coreapp/CoreApp.cpp

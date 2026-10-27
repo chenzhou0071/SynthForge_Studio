@@ -1,10 +1,14 @@
 #include <QtTest>
 
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTcpServer>
+#include <QUrl>
 
 #include "core/cloud3d/CustomProvider.h"
+#include "core/cloud3d/HunyuanProvider.h"
+#include "core/cloud3d/Tc3Signature.h"
 #include "core/cloud3d/TripoProvider.h"
 #include "mock/MockCloud3dServer.h"
 
@@ -187,6 +191,128 @@ private slots:
         const Cloud3dStatus result = statusAt(status, 0);
         QCOMPARE(result.state, QStringLiteral("failed"));
         QCOMPARE(result.error, QStringLiteral("quota exceeded"));
+    }
+
+    void hunyuanSubmitSignsAndEmitsJobId()
+    {
+        MockCloud3dServer server;
+        QVERIFY(server.listen());
+        server.enqueue("POST", "/", 200,
+                       json({{"Response",
+                              QJsonObject{{"JobId", "j1"}, {"RequestId", "r1"}}}}));
+
+        HunyuanProvider provider("AKIDEXAMPLE", "SECRETKEY", "ap-guangzhou", QString(),
+                                 server.baseUrl());
+        QSignalSpy submitted(&provider, &HunyuanProvider::submitted);
+        provider.submit("a wooden crate", QString());
+
+        QTRY_COMPARE(submitted.count(), 1);
+        QCOMPARE(submitted.first().at(0).toString(), QStringLiteral("j1"));
+
+        const MockCloud3dServer::Request request = server.requests().first();
+        QCOMPARE(request.method, QByteArray("POST"));
+        QCOMPARE(request.path, QStringLiteral("/"));
+        QCOMPARE(headerValue(request.head, "x-tc-action"), QByteArray("SubmitHunyuanTo3DJob"));
+        QCOMPARE(headerValue(request.head, "x-tc-version"), QByteArray("2025-05-13"));
+        QCOMPARE(headerValue(request.head, "x-tc-region"), QByteArray("ap-guangzhou"));
+        QCOMPARE(headerValue(request.head, "content-type"),
+                 QByteArray("application/json; charset=utf-8"));
+
+        const qint64 timestamp = headerValue(request.head, "x-tc-timestamp").toLongLong();
+        QVERIFY(timestamp > 0);
+        const QString host = QUrl(server.baseUrl()).authority();
+        const QString expected = tc3Authorization("AKIDEXAMPLE", "SECRETKEY", "ai3d", host,
+                                                  request.body, timestamp);
+        QCOMPARE(headerValue(request.head, "authorization"), expected.toUtf8());
+
+        const QJsonObject body = QJsonDocument::fromJson(request.body).object();
+        QCOMPARE(body.value("Prompt").toString(), QStringLiteral("a wooden crate"));
+        QCOMPARE(body.value("ResultFormat").toString(), QStringLiteral("GLB"));
+    }
+
+    void hunyuanPollMapsStatusAndPicksGlb()
+    {
+        MockCloud3dServer server;
+        QVERIFY(server.listen());
+        server.enqueue("POST", "/", 200,
+                       json({{"Response", QJsonObject{{"Status", "WAIT"}}}}));
+        server.enqueue("POST", "/", 200,
+                       json({{"Response", QJsonObject{{"Status", "RUN"}}}}));
+        const QString modelUrl = QStringLiteral("http://example.test/a.glb");
+        QJsonArray files;
+        files.append(QJsonObject{{"Type", "OBJ"}, {"Url", "http://example.test/a.obj"}});
+        files.append(QJsonObject{{"Type", "GLB"}, {"Url", modelUrl}});
+        server.enqueue("POST", "/", 200,
+                       json({{"Response",
+                              QJsonObject{{"Status", "DONE"}, {"ResultFile3Ds", files}}}}));
+
+        HunyuanProvider provider("AKIDEXAMPLE", "SECRETKEY", "ap-guangzhou", QString(),
+                                 server.baseUrl());
+        QSignalSpy status(&provider, &HunyuanProvider::status);
+
+        provider.poll("j1");
+        QTRY_COMPARE(status.count(), 1);
+        QCOMPARE(statusAt(status, 0).state, QStringLiteral("queued"));
+        QCOMPARE(statusAt(status, 0).percent, 0);
+
+        provider.poll("j1");
+        QTRY_COMPARE(status.count(), 2);
+        QCOMPARE(statusAt(status, 1).state, QStringLiteral("running"));
+        QCOMPARE(statusAt(status, 1).percent, 50);
+
+        provider.poll("j1");
+        QTRY_COMPARE(status.count(), 3);
+        const Cloud3dStatus done = statusAt(status, 2);
+        QCOMPARE(done.state, QStringLiteral("success"));
+        QCOMPARE(done.percent, 100);
+        QCOMPARE(done.modelUrl, modelUrl);
+
+        const MockCloud3dServer::Request request = server.requests().at(2);
+        QCOMPARE(headerValue(request.head, "x-tc-action"), QByteArray("QueryHunyuanTo3DJob"));
+        const QJsonObject body = QJsonDocument::fromJson(request.body).object();
+        QCOMPARE(body.value("JobId").toString(), QStringLiteral("j1"));
+    }
+
+    void hunyuanFailStatusCarriesError()
+    {
+        MockCloud3dServer server;
+        QVERIFY(server.listen());
+        server.enqueue("POST", "/", 200,
+                       json({{"Response",
+                              QJsonObject{{"Status", "FAIL"},
+                                          {"ErrorCode", "FailedOperation"},
+                                          {"ErrorMessage", "quota exceeded"}}}}));
+
+        HunyuanProvider provider("AKIDEXAMPLE", "SECRETKEY", "ap-guangzhou", QString(),
+                                 server.baseUrl());
+        QSignalSpy status(&provider, &HunyuanProvider::status);
+        provider.poll("j1");
+
+        QTRY_COMPARE(status.count(), 1);
+        const Cloud3dStatus result = statusAt(status, 0);
+        QCOMPARE(result.state, QStringLiteral("failed"));
+        QCOMPARE(result.error, QStringLiteral("quota exceeded"));
+    }
+
+    void hunyuanBusinessErrorSurfacesMessage()
+    {
+        MockCloud3dServer server;
+        QVERIFY(server.listen());
+        server.enqueue("POST", "/", 200,
+                       json({{"Response",
+                              QJsonObject{{"Error",
+                                           QJsonObject{{"Code", "AuthFailure"},
+                                                       {"Message", "invalid secret id"}}}}}}));
+
+        HunyuanProvider provider("AKIDEXAMPLE", "SECRETKEY", "ap-guangzhou", QString(),
+                                 server.baseUrl());
+        QSignalSpy failed(&provider, &HunyuanProvider::failed);
+        provider.submit("a wooden crate", QString());
+
+        QTRY_COMPARE(failed.count(), 1);
+        const QString reason = failed.first().at(0).toString();
+        QVERIFY(reason.contains(QStringLiteral("invalid secret id")));
+        QVERIFY(!reason.startsWith(QStringLiteral("retryable:")));
     }
 };
 
