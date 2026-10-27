@@ -29,7 +29,10 @@ add_library(synthforge_core STATIC
     src/core/agent/AskReply.cpp
     src/core/agent/AgentOrchestrator.cpp
     src/core/assets/AssetLibrary.cpp
+    src/core/cloud3d/Cloud3dProvider.cpp
+    src/core/cloud3d/CustomProvider.cpp
     src/core/cloud3d/Tc3Signature.cpp
+    src/core/cloud3d/TripoProvider.cpp
     src/core/coreapp/CoreApp.cpp
 )
 target_include_directories(synthforge_core PUBLIC src)
@@ -242,4 +245,11 @@ add_executable(tst_tc3 tests/tst_tc3.cpp)
 target_link_libraries(tst_tc3 PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_tc3 COMMAND tst_tc3)
 set_tests_properties(tst_tc3 PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_cloud3d tests/tst_cloud3d.cpp tests/mock/MockCloud3dServer.cpp)
+target_include_directories(tst_cloud3d PRIVATE tests)
+target_link_libraries(tst_cloud3d PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_cloud3d COMMAND tst_cloud3d)
+set_tests_properties(tst_cloud3d PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
