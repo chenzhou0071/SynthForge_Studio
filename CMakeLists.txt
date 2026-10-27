@@ -29,6 +29,7 @@ add_library(synthforge_core STATIC
     src/core/agent/AskReply.cpp
     src/core/agent/AgentOrchestrator.cpp
     src/core/assets/AssetLibrary.cpp
+    src/core/cloud3d/Tc3Signature.cpp
     src/core/coreapp/CoreApp.cpp
 )
 target_include_directories(synthforge_core PUBLIC src)
@@ -235,4 +236,10 @@ add_executable(tst_blender_gate tests/tst_blender_gate.cpp)
 target_link_libraries(tst_blender_gate PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_blender_gate COMMAND tst_blender_gate)
 set_tests_properties(tst_blender_gate PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_tc3 tests/tst_tc3.cpp)
+target_link_libraries(tst_tc3 PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_tc3 COMMAND tst_tc3)
+set_tests_properties(tst_tc3 PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
