@@ -20,6 +20,7 @@
 #include "core/store/SessionStore.h"
 #include "core/ws/WsServer.h"
 #include "mock/MockLlmServer.h"
+#include "mock/MockCloud3dServer.h"
 
 namespace {
 
@@ -169,6 +170,11 @@ private:
     int m_nextId = 1;
     QList<QJsonObject> m_log;
 };
+
+QByteArray jsonBody(const QJsonObject& object)
+{
+    return QJsonDocument(object).toJson(QJsonDocument::Compact);
+}
 
 QJsonObject configureLlm(WsClient& client, const QString& baseUrl)
 {
@@ -990,6 +996,99 @@ private slots:
         QCOMPARE(store.messageById(planId).value(QStringLiteral("meta")).toObject()
                      .value(QStringLiteral("state")).toString(),
                  QStringLiteral("started"));
+    }
+
+    // 云模式：草稿 → 选目录 → 轮询 → GLB 落盘；全程不经过 Blender，也不出计划卡
+    void cloudModeDraftGoesToFolderPickAndCreatesGlb()
+    {
+        MockLlmServer llm({textTurn(QStringLiteral("一只木质板条箱，正面有金属扣件。"))});
+        QVERIFY(llm.listen());
+
+        MockCloud3dServer cloud;
+        QVERIFY(cloud.listen());
+        cloud.enqueue("POST", "/task", 200, jsonBody({{"task_id", "c1"}}));
+        const QString modelUrl = cloud.baseUrl() + QStringLiteral("/model.glb");
+        cloud.enqueue("GET", "/task/c1", 200,
+                      jsonBody({{"status", "success"},
+                                {"progress", 100},
+                                {"model_url", modelUrl}}));
+        cloud.enqueue("GET", "/model.glb", 200, QByteArray("glTF", 4));
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString library = dir.filePath(QStringLiteral("library"));
+
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        const QJsonObject saved = client.request(
+            QStringLiteral("settings.save"),
+            {{QStringLiteral("agent"),
+              QJsonObject{{
+                  QStringLiteral("primary"),
+                  QJsonObject{{QStringLiteral("provider"), QStringLiteral("deepseek")},
+                              {QStringLiteral("baseUrl"), llm.baseUrl()},
+                              {QStringLiteral("apiKey"), QStringLiteral("test-key")},
+                              {QStringLiteral("model"), QStringLiteral("deepseek-chat")}}}}},
+             {QStringLiteral("cloud3d"),
+              QJsonObject{{QStringLiteral("provider"), QStringLiteral("custom")},
+                          {QStringLiteral("custom"),
+                           QJsonObject{{QStringLiteral("baseUrl"), cloud.baseUrl()}}}}}});
+        QVERIFY(saved.contains(QStringLiteral("result")));
+
+        const int mark = client.mark();
+        const QJsonObject sent =
+            client.request(QStringLiteral("chat.send"),
+                           {{QStringLiteral("area"), QStringLiteral("blender")},
+                            {QStringLiteral("mode"), QStringLiteral("cloud3d")},
+                            {QStringLiteral("text"), QStringLiteral("做一只木质板条箱")}});
+        QVERIFY2(sent.value(QStringLiteral("result")).toObject()
+                     .value(QStringLiteral("accepted")).toBool(),
+                 "云模式不应因 Blender 未就绪被拒绝");
+
+        QTRY_VERIFY_WITH_TIMEOUT(!client.lastEvent(QStringLiteral("draft.created"), mark).isEmpty(),
+                                 10000);
+        const QJsonObject draft = client.lastEvent(QStringLiteral("draft.created"), mark);
+        QCOMPARE(draft.value(QStringLiteral("mode")).toString(), QStringLiteral("cloud3d"));
+        const qint64 draftId = draft.value(QStringLiteral("id")).toInteger();
+        QVERIFY(draftId > 0);
+
+        const QJsonObject run =
+            client.request(QStringLiteral("draft.send"),
+                           QJsonObject{{QStringLiteral("id"), draftId},
+                                       {QStringLiteral("prompt"),
+                                        draft.value(QStringLiteral("prompt")).toString()}})
+                .value(QStringLiteral("result"))
+                .toObject();
+        QVERIFY2(run.value(QStringLiteral("accepted")).toBool(),
+                 qPrintable(run.value(QStringLiteral("reason")).toString()));
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !client.lastEvent(QStringLiteral("folderPick.open"), mark).isEmpty(), 5000);
+        QVERIFY(client.lastEvent(QStringLiteral("plan.created"), mark).isEmpty());
+        const QString requestId = client.lastEvent(QStringLiteral("folderPick.open"), mark)
+                                      .value(QStringLiteral("requestId"))
+                                      .toString();
+
+        const QJsonObject picked =
+            client.request(QStringLiteral("folderPick.submit"),
+                           QJsonObject{{QStringLiteral("requestId"), requestId},
+                                       {QStringLiteral("relativePath"), QString()}})
+                .value(QStringLiteral("result"))
+                .toObject();
+        QVERIFY2(picked.value(QStringLiteral("ok")).toBool(),
+                 qPrintable(picked.value(QStringLiteral("error")).toString()));
+
+        QTRY_VERIFY_WITH_TIMEOUT(!client.lastEvent(QStringLiteral("asset.created"), mark).isEmpty(),
+                                 15000);
+        const QString relative = client.lastEvent(QStringLiteral("asset.created"), mark)
+                                     .value(QStringLiteral("path"))
+                                     .toString();
+        QVERIFY(relative.endsWith(QStringLiteral(".glb")));
+        QVERIFY(QFile::exists(QDir(library).filePath(relative)));
+        QVERIFY(!client.lastEvent(QStringLiteral("task.progress"), mark).isEmpty());
     }
 
     void bridgeRestartReportsNotRegistered()

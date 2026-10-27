@@ -6,11 +6,18 @@
 #include <QTcpServer>
 #include <QUrl>
 
+#include "core/assets/AssetLibrary.h"
+#include "core/cloud3d/Cloud3dService.h"
 #include "core/cloud3d/CustomProvider.h"
 #include "core/cloud3d/HunyuanProvider.h"
 #include "core/cloud3d/Tc3Signature.h"
 #include "core/cloud3d/TripoProvider.h"
+#include "core/settings/SettingsStore.h"
 #include "mock/MockCloud3dServer.h"
+
+#include <QDir>
+#include <QFile>
+#include <QTemporaryDir>
 
 namespace {
 QByteArray headerValue(const QByteArray& head, const QByteArray& name)
@@ -313,6 +320,158 @@ private slots:
         const QString reason = failed.first().at(0).toString();
         QVERIFY(reason.contains(QStringLiteral("invalid secret id")));
         QVERIFY(!reason.startsWith(QStringLiteral("retryable:")));
+    }
+
+    void servicePollsUntilSuccessAndWritesGlb()
+    {
+        MockCloud3dServer server;
+        QVERIFY(server.listen());
+        server.enqueue("POST", "/task", 200, json({{"task_id", "c1"}}));
+        server.enqueue("GET", "/task/c1", 200, json({{"status", "queued"}, {"progress", 0}}));
+        server.enqueue("GET", "/task/c1", 200,
+                       json({{"status", "running"}, {"progress", 60}}));
+        const QString modelUrl = server.baseUrl() + QStringLiteral("/model.glb");
+        server.enqueue("GET", "/task/c1", 200,
+                       json({{"status", "success"},
+                             {"progress", 100},
+                             {"model_url", modelUrl}}));
+        const QByteArray glb("glTFpayload", 10);
+        server.enqueue("GET", "/model.glb", 200, glb);
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        SettingsStore settings(dir.path());
+        settings.load();
+        AssetLibrary library(dir.path() + QStringLiteral("/ModelLibrary"));
+        QVERIFY(QDir().mkpath(library.root()));
+
+        Cloud3dService service(&settings, &library);
+        service.setProviderForTest(std::make_unique<CustomProvider>(server.baseUrl(), QString()));
+        service.setPollIntervalForTest(10);
+        QSignalSpy progress(&service, &Cloud3dService::progress);
+        QSignalSpy created(&service, &Cloud3dService::assetCreated);
+
+        service.start(QStringLiteral("wooden crate"), QString());
+
+        QTRY_COMPARE_WITH_TIMEOUT(created.count(), 1, 5000);
+        const QString path = created.first().at(0).toString();
+        QVERIFY(QFile::exists(path));
+        QFile written(path);
+        QVERIFY(written.open(QIODevice::ReadOnly));
+        QCOMPARE(written.readAll(), glb);
+        QVERIFY(path.endsWith(QStringLiteral(".glb")));
+        QVERIFY(progress.count() >= 3);
+        QCOMPARE(service.isRunning(), false);
+    }
+
+    void serviceBusinessFailureStopsAndCanRetry()
+    {
+        MockCloud3dServer server;
+        QVERIFY(server.listen());
+        server.enqueue("POST", "/task", 200, json({{"task_id", "c2"}}));
+        server.enqueue("GET", "/task/c2", 200,
+                       json({{"status", "failed"}, {"error", "quota exceeded"}}));
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        SettingsStore settings(dir.path());
+        settings.load();
+        AssetLibrary library(dir.path() + QStringLiteral("/ModelLibrary"));
+        QVERIFY(QDir().mkpath(library.root()));
+
+        Cloud3dService service(&settings, &library);
+        service.setProviderForTest(std::make_unique<CustomProvider>(server.baseUrl(), QString()));
+        service.setPollIntervalForTest(10);
+        QSignalSpy errors(&service, &Cloud3dService::errorCard);
+
+        service.start(QStringLiteral("wooden crate"), QString());
+        QTRY_COMPARE_WITH_TIMEOUT(errors.count(), 1, 5000);
+        QCOMPARE(errors.first().at(0).toString(), QStringLiteral("cloud3d-failed"));
+        QVERIFY(errors.first().at(1).toString().contains(QStringLiteral("quota exceeded")));
+        QCOMPARE(service.canRetry(), true);
+
+        // 重试只续轮询：已有 taskId 时不能再提交一次（会重复扣费）
+        const QString modelUrl = server.baseUrl() + QStringLiteral("/model.glb");
+        server.enqueue("GET", "/task/c2", 200,
+                       json({{"status", "success"},
+                             {"progress", 100},
+                             {"model_url", modelUrl}}));
+        server.enqueue("GET", "/model.glb", 200, QByteArray("glTF", 4));
+        QSignalSpy created(&service, &Cloud3dService::assetCreated);
+        QVERIFY(service.retry());
+        QTRY_COMPARE_WITH_TIMEOUT(created.count(), 1, 5000);
+
+        int submits = 0;
+        for (const MockCloud3dServer::Request& request : server.requests()) {
+            if (request.method == "POST" && request.path == QStringLiteral("/task"))
+                ++submits;
+        }
+        QCOMPARE(submits, 1);
+    }
+
+    void serviceCancelDropsLateResults()
+    {
+        MockCloud3dServer server;
+        QVERIFY(server.listen());
+        server.enqueue("POST", "/task", 200, json({{"task_id", "c3"}}));
+        server.enqueue("GET", "/task/c3", 200, json({{"status", "running"}, {"progress", 40}}));
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        SettingsStore settings(dir.path());
+        settings.load();
+        AssetLibrary library(dir.path() + QStringLiteral("/ModelLibrary"));
+        QVERIFY(QDir().mkpath(library.root()));
+
+        Cloud3dService service(&settings, &library);
+        service.setProviderForTest(std::make_unique<CustomProvider>(server.baseUrl(), QString()));
+        service.setPollIntervalForTest(10);
+        QSignalSpy errors(&service, &Cloud3dService::errorCard);
+        QSignalSpy created(&service, &Cloud3dService::assetCreated);
+        QSignalSpy progress(&service, &Cloud3dService::progress);
+
+        service.start(QStringLiteral("wooden crate"), QString());
+        QTRY_VERIFY_WITH_TIMEOUT(progress.count() >= 1, 5000);
+        service.cancel();
+
+        QCOMPARE(errors.count(), 1);
+        QCOMPARE(errors.first().at(0).toString(), QStringLiteral("user-cancelled"));
+        QTest::qWait(60);
+        QCOMPARE(created.count(), 0);
+        QCOMPARE(service.isRunning(), false);
+    }
+
+    void serviceRetriesRetryableFailure()
+    {
+        MockCloud3dServer server;
+        QVERIFY(server.listen());
+        server.enqueue("POST", "/task", 200, json({{"task_id", "c4"}}));
+        server.enqueue("GET", "/task/c4", 500, json({{"message", "gateway hiccup"}}));
+        const QString modelUrl = server.baseUrl() + QStringLiteral("/model.glb");
+        server.enqueue("GET", "/task/c4", 200,
+                       json({{"status", "success"},
+                             {"progress", 100},
+                             {"model_url", modelUrl}}));
+        server.enqueue("GET", "/model.glb", 200, QByteArray("glTF", 4));
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        SettingsStore settings(dir.path());
+        settings.load();
+        AssetLibrary library(dir.path() + QStringLiteral("/ModelLibrary"));
+        QVERIFY(QDir().mkpath(library.root()));
+
+        Cloud3dService service(&settings, &library);
+        service.setProviderForTest(std::make_unique<CustomProvider>(server.baseUrl(), QString()));
+        service.setPollIntervalForTest(10);
+        service.setRetryDelayForTest(10);
+        QSignalSpy errors(&service, &Cloud3dService::errorCard);
+        QSignalSpy created(&service, &Cloud3dService::assetCreated);
+
+        service.start(QStringLiteral("wooden crate"), QString());
+
+        QTRY_COMPARE_WITH_TIMEOUT(created.count(), 1, 5000);
+        QCOMPARE(errors.count(), 0);
     }
 };
 

@@ -25,6 +25,7 @@ class WsServer;
 class McpRuntime;
 class PreflightChecker;
 class SummarizerAgent;
+class Cloud3dService;
 
 struct CoreOptions
 {
@@ -38,7 +39,7 @@ struct CoreOptions
 struct PendingPick
 {
     QString area;
-    QString mode;   // lowpoly | modify（cloud3d 在 chat.send 早拦，到不了这里）
+    QString mode;   // lowpoly | modify | cloud3d
     QString prompt; // 草稿卡编辑后的提示词
     BuildPlan plan;
 };
@@ -81,6 +82,7 @@ private:
     McpRuntime* m_blender = nullptr; // QObject child，析构由 parent 负责
     std::unique_ptr<PreflightChecker> m_preflight;
     SummarizerAgent* m_summarizer = nullptr; // QObject child，析构由 parent 负责
+    std::unique_ptr<Cloud3dService> m_cloud;  // 云 3D 轮询与下载，独立于任务队列
     AgentOrchestrator* m_orch = nullptr;     // QObject child，析构由 parent 负责
     BlenderGate m_blenderGate; // Blender agent 任务与 unity 转换互斥
     QJsonArray m_blenderTools;
@@ -89,6 +91,7 @@ private:
     QHash<QString, QString> m_planPrompts;      // area -> 已确认提示词
     QHash<QString, QString> m_pendingDraftAsset;  // area -> 本次草稿针对的资产
     QHash<QString, QString> m_pendingDraftSource; // area -> 用户原始需求（供「重新生成」）
+    QHash<QString, QString> m_pendingDraftMode;   // area -> 本次草稿的模式（三种模板）
     QHash<QString, qint64> m_regenDraft;          // area -> 正在重新生成的草稿 id
     QSet<QString> m_planCancelled;              // area -> 规划取消标记
     QHash<QString, PendingPick> m_pendingPicks; // area -> 等待选目录的执行任务

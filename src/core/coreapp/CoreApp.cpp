@@ -4,6 +4,7 @@
 #include "core/agent/AskReply.h"
 #include "core/agent/SummarizerAgent.h"
 #include "core/assets/AssetLibrary.h"
+#include "core/cloud3d/Cloud3dService.h"
 #include "core/llm/LlmGateway.h"
 #include "core/llm/ToolBridge.h"
 #include "core/mcp/BridgeCommands.h"
@@ -84,6 +85,9 @@ bool CoreApp::start()
     m_summarizer = new SummarizerAgent(m_llm.get(), m_sessions.get(), m_settings.get(), this);
     connect(m_summarizer, &SummarizerAgent::draftReady, this,
             [this](const QString& area, const QString& prompt) {
+                const QString asset = m_pendingDraftAsset.take(area);
+                const QString source = m_pendingDraftSource.take(area);
+                const QString pendingMode = m_pendingDraftMode.take(area);
                 // 重新生成：同一条草稿原地换文本，不新增卡片
                 if (const qint64 regenId = m_regenDraft.take(area); regenId > 0) {
                     m_sessions->updateMessageContent(regenId, prompt);
@@ -92,10 +96,10 @@ bool CoreApp::start()
                         QJsonObject{{"area", area}, {"id", regenId}, {"prompt", prompt}});
                     return;
                 }
-                const QString asset = m_pendingDraftAsset.take(area);
-                const QString source = m_pendingDraftSource.take(area);
-                const QString mode =
-                    asset.isEmpty() ? QStringLiteral("lowpoly") : QStringLiteral("modify");
+                const QString mode = pendingMode.isEmpty()
+                    ? (asset.isEmpty() ? QStringLiteral("lowpoly")
+                                       : QStringLiteral("modify"))
+                    : pendingMode;
                 const qint64 id = m_sessions->appendMessage(
                     area, QStringLiteral("draft"), prompt,
                     QJsonObject{{"state", "pending"}, {"origin", "generated"},
@@ -104,6 +108,40 @@ bool CoreApp::start()
                     QStringLiteral("draft.created"),
                     QJsonObject{{"area", area}, {"id", id}, {"prompt", prompt},
                                 {"origin", "generated"}, {"mode", mode}, {"asset", asset}});
+            });
+    // 云 3D：服务自己轮询/下载，CoreApp 只做事件转发
+    m_cloud = std::make_unique<Cloud3dService>(m_settings.get(), m_library.get());
+    connect(m_cloud.get(), &Cloud3dService::progress, this,
+            [this](const QString& taskId, const QString& state, int percent) {
+                m_ws->broadcastEvent(QStringLiteral("task.progress"),
+                                     QJsonObject{{"area", "blender"},
+                                                 {"taskId", taskId},
+                                                 {"state", state},
+                                                 {"percent", percent}});
+            });
+    connect(m_cloud.get(), &Cloud3dService::errorCard, this,
+            [this](const QString& reason, const QString& message) {
+                QJsonObject data{{"area", "blender"}, {"reason", reason}};
+                if (!message.isEmpty())
+                    data.insert(QStringLiteral("message"), message);
+                m_ws->broadcastEvent(QStringLiteral("error.card"), data);
+            });
+    connect(m_cloud.get(), &Cloud3dService::assetCreated, this,
+            [this](const QString& glbPath) {
+                const QString relative = m_library->relativeFor(glbPath);
+                if (relative.isEmpty())
+                    return;
+                m_ws->broadcastEvent(
+                    QStringLiteral("asset.created"),
+                    QJsonObject{{"area", "blender"},
+                                {"name", QFileInfo(glbPath).completeBaseName()},
+                                {"path", relative},
+                                {"paths", QJsonObject{{"glb", relative}}}});
+                m_ws->broadcastEvent(
+                    QStringLiteral("fileTree.changed"),
+                    QJsonObject{{"area", "blender"},
+                                {"reason", "incremental"},
+                                {"paths", QJsonArray{QFileInfo(relative).path()}}});
             });
     connect(m_summarizer, &SummarizerAgent::failed, this,
             [this](const QString& area, const QString& reason) {
@@ -297,15 +335,20 @@ bool CoreApp::start()
             return QJsonValue(QJsonObject{{"accepted", false}, {"reason", "invalid-draft"}});
 
         const QString area = row.value(QStringLiteral("area")).toString();
-        const QString asset = row.value(QStringLiteral("meta")).toObject()
-                                  .value(QStringLiteral("asset")).toString();
+        const QJsonObject meta = row.value(QStringLiteral("meta")).toObject();
+        const QString asset = meta.value(QStringLiteral("asset")).toString();
+        const bool cloud =
+            meta.value(QStringLiteral("mode")).toString() == QLatin1String("cloud3d");
 
-        // 草稿阶段不拦 Blender（写方案只需 LLM）；点执行才检查，没开就弹提示且不占门禁
-        const PreflightResult pre = m_preflight->checkLowpoly();
-        if (!pre.ok) {
-            m_ws->broadcastEvent(QStringLiteral("error.card"),
-                                 QJsonObject{{"area", area}, {"reason", pre.reason}});
-            return QJsonValue(QJsonObject{{"accepted", false}, {"reason", pre.reason}});
+        // 草稿阶段不拦 Blender（写方案只需 LLM）；点执行才检查，没开就弹提示且不占门禁。
+        // 云模式不经过 Blender，跳过这项检查
+        if (!cloud) {
+            const PreflightResult pre = m_preflight->checkLowpoly();
+            if (!pre.ok) {
+                m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                     QJsonObject{{"area", area}, {"reason", pre.reason}});
+                return QJsonValue(QJsonObject{{"accepted", false}, {"reason", pre.reason}});
+            }
         }
 
         // 先确认源文件在，再转正：否则草稿卡消失了但执行失败，用户无法回头改
@@ -327,6 +370,13 @@ bool CoreApp::start()
                              QJsonObject{{"area", area}, {"role", "user"},
                                          {"content", prompt}});
 
+        // 云模式直接选目录，不经过低模的 plan 阶段
+        if (cloud) {
+            m_pendingPicks.insert(area,
+                                  PendingPick{area, QStringLiteral("cloud3d"), prompt, {}});
+            openFolderPick(area);
+            return QJsonValue(QJsonObject{{"accepted", true}});
+        }
         if (!asset.isEmpty())
             return startModify(area, asset, prompt);
         // plan.confirm 要用用户最后编辑过的提示词去执行，不是 Summarizer 的初稿
@@ -365,6 +415,10 @@ bool CoreApp::start()
         const QJsonObject meta = row.value(QStringLiteral("meta")).toObject();
         const QString asset = meta.value(QStringLiteral("asset")).toString();
         const QString source = meta.value(QStringLiteral("source")).toString();
+        const QString draftMode = meta.value(QStringLiteral("mode")).toString();
+        const QString mode = draftMode.isEmpty()
+            ? (asset.isEmpty() ? QStringLiteral("lowpoly") : QStringLiteral("modify"))
+            : draftMode;
         // 讨论产出的正文本身就是讨论结论；SummarizerAgent 产出的不能再当讨论喂回去
         const QString discussion =
             meta.value(QStringLiteral("origin")).toString() == QLatin1String("discussion")
@@ -372,9 +426,7 @@ bool CoreApp::start()
                 : QString();
 
         m_regenDraft.insert(area, id);
-        m_summarizer->generate({area, source.isEmpty() ? discussion : source,
-                                asset.isEmpty() ? QStringLiteral("lowpoly")
-                                                : QStringLiteral("modify"),
+        m_summarizer->generate({area, source.isEmpty() ? discussion : source, mode,
                                 QFileInfo(asset).completeBaseName(), discussion});
         return QJsonValue(QJsonObject{{"accepted", true}});
                               });
@@ -500,6 +552,16 @@ bool CoreApp::start()
                                       return QJsonValue(QJsonObject{
                                           {"ok", false}, {"error", "invalid-path"}});
                                   const PendingPick pick = m_pendingPicks.value(area);
+                                  // 云任务不占 Blender 门禁，选完目录直接提交
+                                  if (pick.mode == QLatin1String("cloud3d")) {
+                                      m_pickRequests.remove(requestId);
+                                      m_pendingPicks.remove(area);
+                                      if (!m_cloud)
+                                          return QJsonValue(QJsonObject{
+                                              {"ok", false}, {"error", "cloud3d-unavailable"}});
+                                      m_cloud->start(pick.prompt, relative);
+                                      return QJsonValue(QJsonObject{{"ok", true}});
+                                  }
                                   if (m_blenderGate.isBusy()) {
                                       // 保留 requestId 与 pendingPick：弹窗不关，空闲后可再确认
                                       m_ws->broadcastEvent(
@@ -698,6 +760,12 @@ bool CoreApp::start()
                                   if (last.isEmpty())
                                       return QJsonValue(QJsonObject{
                                           {"accepted", false}, {"error", "no-task-to-retry"}});
+                                  // 云任务不在任务队列：续轮询/重新下载，不重复提交
+                                  if (last.value(QStringLiteral("mode")).toString()
+                                          == QLatin1String("cloud3d")
+                                      && m_cloud && m_cloud->canRetry())
+                                      return QJsonValue(
+                                          QJsonObject{{"accepted", m_cloud->retry()}});
                                   // 不重复落库同一句 user 消息
                                   return handleChatSend(last, /*appendUser=*/false);
                               });
@@ -712,6 +780,10 @@ bool CoreApp::start()
                                       m_planCancelled.insert(area);
                                       m_pendingPlans.remove(area);
                                   }
+                                  // 云生成不在任务队列：停轮询并丢弃迟到回调
+                                  if (area == QLatin1String("blender") && m_cloud
+                                      && m_cloud->isRunning())
+                                      m_cloud->cancel();
                                   // 导出回合被停止：预览面板解锁，别一直挂着“导出中”
                                   m_ws->broadcastEvent(QStringLiteral("export.finished"),
                                                        QJsonObject{{"area", area},
@@ -1051,11 +1123,18 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
                 QStringLiteral("chat.message"),
                 QJsonObject{{"area", area}, {"role", "user"}, {"content", text}});
         }
-        // P5 接管云 API 生成：先占位拒绝，避免落到通用流
-        m_ws->broadcastEvent(QStringLiteral("error.card"),
-                             QJsonObject{{"area", area}, {"reason", "cloud3d-not-implemented"}});
-        return QJsonValue(QJsonObject{{"accepted", false},
-                                      {"reason", "cloud3d-not-implemented"}});
+        const LlmConfig cfg = primaryAgentConfig();
+        if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty() || cfg.model.isEmpty()) {
+            m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                 QJsonObject{{"area", area}, {"reason", "agent-not-configured"}});
+            return QJsonValue(
+                QJsonObject{{"accepted", false}, {"reason", "agent-not-configured"}});
+        }
+        m_pendingDraftAsset.insert(area, QString());
+        m_pendingDraftSource.insert(area, text);
+        m_pendingDraftMode.insert(area, QStringLiteral("cloud3d"));
+        m_summarizer->generate({area, text, QStringLiteral("cloud3d"), {}, {}});
+        return QJsonValue(QJsonObject{{"accepted", true}});
     }
 
     // 通用流（无模式兼容路径）：user 消息在这里落库

@@ -30,6 +30,7 @@ add_library(synthforge_core STATIC
     src/core/agent/AgentOrchestrator.cpp
     src/core/assets/AssetLibrary.cpp
     src/core/cloud3d/Cloud3dProvider.cpp
+    src/core/cloud3d/Cloud3dService.cpp
     src/core/cloud3d/CustomProvider.cpp
     src/core/cloud3d/HunyuanProvider.cpp
     src/core/cloud3d/Tc3Signature.cpp
@@ -45,6 +46,7 @@ qt_add_resources(synthforge_core "prompts"
     BASE "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts"
     FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/summarizer.md"
           "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/summarizer-modify.md"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/summarizer-cloud3d.md"
           "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/ask.md")
 
 enable_testing()
@@ -221,7 +223,8 @@ add_test(NAME tst_asset_library COMMAND tst_asset_library)
 set_tests_properties(tst_asset_library PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
-add_executable(tst_headless_ws tests/tst_headless_ws.cpp tests/mock/MockLlmServer.cpp)
+add_executable(tst_headless_ws tests/tst_headless_ws.cpp tests/mock/MockLlmServer.cpp
+    tests/mock/MockCloud3dServer.cpp)
 target_include_directories(tst_headless_ws PRIVATE tests)
 target_link_libraries(tst_headless_ws PRIVATE synthforge_core Qt6::Test)
 # 假 Blender 桥接：mock_mcp_server 让 preflight 走真实握手
