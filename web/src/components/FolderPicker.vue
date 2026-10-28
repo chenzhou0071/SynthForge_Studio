@@ -7,7 +7,7 @@ export interface FolderNode {
 </script>
 
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import type { WsClient } from "../ws/WsClient";
 
 const props = defineProps<{
@@ -96,10 +96,22 @@ function cancel() {
     // 取消失败不阻断 UI：弹窗已关，pendingPick 会在下一次确认时被覆盖
   });
 }
+
+// 选目录是流程中间步骤：只接受显式关闭（取消/×/Esc）。
+// 点遮罩不关闭——激活窗口的那一下会落在全屏遮罩上，误触就等于取消整个任务。
+function onKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    cancel();
+  }
+}
+
+onMounted(() => window.addEventListener("keydown", onKeydown));
+onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 </script>
 
 <template>
-  <div class="dialog-mask" @click.self="cancel">
+  <div class="dialog-mask">
     <div class="dialog folder-picker" role="dialog" aria-modal="true" aria-label="选择存放位置">
       <header class="dialog-head">
         <h2>选择存放位置</h2>

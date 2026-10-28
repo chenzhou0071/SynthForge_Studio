@@ -51,10 +51,10 @@ private slots:
     {
         MockCloud3dServer server;
         QVERIFY(server.listen());
-        server.enqueue("POST", "/v2/openapi/task", 200,
+        server.enqueue("POST", "/v3/generation/text-to-model", 200,
                        json({{"code", 0}, {"data", QJsonObject{{"task_id", "t1"}}}}));
 
-        TripoProvider provider("tripo-key", "v2.5-20250123", server.baseUrl());
+        TripoProvider provider("tripo-key", "v3.1-20260211", server.baseUrl());
         QSignalSpy submitted(&provider, &TripoProvider::submitted);
         provider.submit("a wooden crate", QString());
 
@@ -64,13 +64,32 @@ private slots:
 
         const MockCloud3dServer::Request request = server.requests().first();
         QCOMPARE(request.method, QByteArray("POST"));
-        QCOMPARE(request.path, QStringLiteral("/v2/openapi/task"));
+        QCOMPARE(request.path, QStringLiteral("/v3/generation/text-to-model"));
         QCOMPARE(headerValue(request.head, "authorization"), QByteArray("Bearer tripo-key"));
 
         const QJsonObject body = QJsonDocument::fromJson(request.body).object();
-        QCOMPARE(body.value("type").toString(), QStringLiteral("text_to_model"));
         QCOMPARE(body.value("prompt").toString(), QStringLiteral("a wooden crate"));
-        QCOMPARE(body.value("model_version").toString(), QStringLiteral("v2.5-20250123"));
+        QCOMPARE(body.value("model").toString(), QStringLiteral("v3.1-20260211"));
+        QVERIFY(!body.contains("type")); // V3 端点按能力区分，不再需要 type
+    }
+
+    void tripoOmitsModelWhenVersionEmpty()
+    {
+        MockCloud3dServer server;
+        QVERIFY(server.listen());
+        server.enqueue("POST", "/v3/generation/text-to-model", 200,
+                       json({{"code", 0}, {"data", QJsonObject{{"task_id", "t1"}}}}));
+
+        // 版本留空时用服务端默认（v3.1-20260211），不传 model 字段
+        TripoProvider provider("tripo-key", QString(), server.baseUrl());
+        QSignalSpy submitted(&provider, &TripoProvider::submitted);
+        provider.submit("a wooden crate", QString());
+
+        QTRY_COMPARE(submitted.count(), 1);
+        const QJsonObject body =
+            QJsonDocument::fromJson(server.requests().first().body).object();
+        QVERIFY(!body.contains("model"));
+        QVERIFY(!body.contains("model_version"));
     }
 
     void tripoPollMapsStatusAndModelUrl()
@@ -78,17 +97,16 @@ private slots:
         MockCloud3dServer server;
         QVERIFY(server.listen());
         const QString modelUrl = QStringLiteral("http://example.test/t1.glb");
-        server.enqueue("GET", "/v2/openapi/task/t1", 200,
+        server.enqueue("GET", "/v3/tasks/t1", 200,
                        json({{"code", 0},
                              {"data", QJsonObject{{"status", "running"}, {"progress", 42}}}}));
-        server.enqueue("GET", "/v2/openapi/task/t1", 200,
+        server.enqueue("GET", "/v3/tasks/t1", 200,
                        json({{"code", 0},
                              {"data",
                               QJsonObject{{"status", "success"},
                                           {"progress", 100},
                                           {"output",
-                                           QJsonObject{{"p",
-                                                        QJsonObject{{"url", modelUrl}}}}}}}}));
+                                           QJsonObject{{"model_url", modelUrl}}}}}}));
 
         TripoProvider provider("tripo-key", QString(), server.baseUrl());
         QSignalSpy status(&provider, &TripoProvider::status);
@@ -113,7 +131,7 @@ private slots:
     {
         MockCloud3dServer server;
         QVERIFY(server.listen());
-        server.enqueue("POST", "/v2/openapi/task", 401,
+        server.enqueue("POST", "/v3/generation/text-to-model", 401,
                        json({{"code", 1004}, {"message", "invalid api key"}}));
 
         TripoProvider provider("bad-key", QString(), server.baseUrl());
@@ -361,6 +379,8 @@ private slots:
         QCOMPARE(written.readAll(), glb);
         QVERIFY(path.endsWith(QStringLiteral(".glb")));
         QVERIFY(progress.count() >= 3);
+        QCOMPARE(library.cloudAssets().value(library.relativeFor(path)),
+                 QStringLiteral("test")); // 来源落盘：文件树标「云 · glb」
         QCOMPARE(service.isRunning(), false);
     }
 
@@ -472,6 +492,61 @@ private slots:
 
         QTRY_COMPARE_WITH_TIMEOUT(created.count(), 1, 5000);
         QCOMPARE(errors.count(), 0);
+    }
+
+    void serviceRestartUsesLatestProviderSettings()
+    {
+        MockCloud3dServer first;
+        QVERIFY(first.listen());
+        first.enqueue("POST", "/task", 200, json({{"task_id", "a1"}}));
+
+        MockCloud3dServer second;
+        QVERIFY(second.listen());
+        second.enqueue("POST", "/task", 200, json({{"task_id", "b1"}}));
+        const QString secondModel = second.baseUrl() + QStringLiteral("/model.glb");
+        second.enqueue("GET", "/task/b1", 200,
+                       json({{"status", "success"},
+                             {"progress", 100},
+                             {"model_url", secondModel}}));
+        second.enqueue("GET", "/model.glb", 200, QByteArray("glTF", 4));
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        SettingsStore settings(dir.path());
+        settings.load();
+        AssetLibrary library(dir.path() + QStringLiteral("/ModelLibrary"));
+        QVERIFY(QDir().mkpath(library.root()));
+
+        QJsonObject data = settings.data();
+        data.insert(QStringLiteral("cloud3d"),
+                    QJsonObject{{"provider", "custom"},
+                                {"custom", QJsonObject{{"baseUrl", first.baseUrl()},
+                                                        {"apiToken", ""}}}});
+        settings.setData(data);
+
+        Cloud3dService service(&settings, &library);
+        service.setPollIntervalForTest(10);
+
+        service.start(QStringLiteral("wooden crate"), QString());
+        QTRY_VERIFY_WITH_TIMEOUT(!first.requests().isEmpty(), 5000);
+        service.cancel();
+        QTest::qWait(50); // 让在途的迟到轮询落地，避免计数竞争
+        const int firstCount = first.requests().size();
+
+        // 用户在设置里换成另一个服务地址后再次生成：不能复用第一次构造的 provider
+        data = settings.data();
+        data.insert(QStringLiteral("cloud3d"),
+                    QJsonObject{{"provider", "custom"},
+                                {"custom", QJsonObject{{"baseUrl", second.baseUrl()},
+                                                        {"apiToken", ""}}}});
+        settings.setData(data);
+
+        QSignalSpy created(&service, &Cloud3dService::assetCreated);
+        service.start(QStringLiteral("wooden crate"), QString());
+        // 新实例不仅要收到请求，还要把状态信号接回来，否则任务永远「生成中」
+        QTRY_VERIFY_WITH_TIMEOUT(!second.requests().isEmpty(), 5000);
+        QCOMPARE(first.requests().size(), firstCount);
+        QTRY_COMPARE_WITH_TIMEOUT(created.count(), 1, 5000);
     }
 };
 

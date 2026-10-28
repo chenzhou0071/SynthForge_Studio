@@ -26,6 +26,7 @@ class McpRuntime;
 class PreflightChecker;
 class SummarizerAgent;
 class Cloud3dService;
+class UiState;
 
 struct CoreOptions
 {
@@ -54,6 +55,8 @@ public:
 
     bool start();
     WsServer* ws() const { return m_ws.get(); }
+    // 窗口几何与界面偏好共用同一实例，避免同进程里两个 QSettings 写同一个 ui.ini
+    UiState* uiState() const { return m_uiState.get(); }
 
     using RestartFn = std::function<bool()>;
     // 由 P4（blender）/ P6（unity）注入桥接重启回调
@@ -74,6 +77,7 @@ private:
 
     CoreOptions m_options;
     std::unique_ptr<SettingsStore> m_settings;
+    std::unique_ptr<UiState> m_uiState;
     std::unique_ptr<SessionStore> m_sessions;
     std::unique_ptr<TaskManager> m_tasks;
     std::unique_ptr<ProtocolRouter> m_router;

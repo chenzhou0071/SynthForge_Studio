@@ -9,9 +9,9 @@ class TripoProvider : public Cloud3dProvider
 {
     Q_OBJECT
 public:
-    // baseUrl 可指向本地 mock；生产默认 Tripo OpenAPI 域名
+    // baseUrl 可指向本地 mock；生产默认 Tripo OpenAPI 域名（.com 为中文站，国际站是 .ai）
     explicit TripoProvider(QString apiKey, QString version,
-                           QString baseUrl = QStringLiteral("https://api.tripo3d.ai"),
+                           QString baseUrl = QStringLiteral("https://openapi.tripo3d.com"),
                            QObject* parent = nullptr);
 
     void submit(const QString& prompt, const QString& model) override;

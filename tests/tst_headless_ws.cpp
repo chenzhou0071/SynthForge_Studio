@@ -288,6 +288,46 @@ private slots:
         QVERIFY(unknown.contains("error"));
     }
 
+    // 输入区两个开关改走后端 ui.ini：页面的 localStorage 在 app:// 下重启就丢
+    void uiStatePrefsSurviveRestart()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        {
+            CoreApp app({dir.path(), true});
+            QVERIFY(app.start());
+            WsClient client;
+            QVERIFY(client.connectTo(app));
+
+            const QJsonObject defaults = client.request(QStringLiteral("uiState.get"), {})
+                                             .value(QStringLiteral("result"))
+                                             .toObject();
+            QCOMPARE(defaults.value("blenderMode").toString(), QStringLiteral("lowpoly"));
+            QCOMPARE(defaults.value("chatMode").toString(), QStringLiteral("exec"));
+
+            const QJsonObject saved = client.request(
+                QStringLiteral("uiState.set"),
+                {{"blenderMode", "cloud3d"}, {"chatMode", "ask"}});
+            QVERIFY(saved.contains(QStringLiteral("result")));
+
+            // 非法值直接报错，不能把界面写成两个按钮都不选中的状态
+            const QJsonObject bad =
+                client.request(QStringLiteral("uiState.set"), {{"blenderMode", "cloud9"}});
+            QVERIFY(bad.contains(QStringLiteral("error")));
+        }
+
+        // 重启：新 CoreApp 用同一个 data-dir，仍读回上次的选择
+        CoreApp app({dir.path(), true});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+        const QJsonObject restored = client.request(QStringLiteral("uiState.get"), {})
+                                          .value(QStringLiteral("result"))
+                                          .toObject();
+        QCOMPARE(restored.value("blenderMode").toString(), QStringLiteral("cloud3d"));
+        QCOMPARE(restored.value("chatMode").toString(), QStringLiteral("ask"));
+    }
+
     // 讨论模式：Blender 未连接也能答；[[EXEC]] 不进正文，草稿成一行 draft
     void askModeSplitsExecDraftAndKeepsCardsOutOfHistory()
     {
@@ -439,6 +479,49 @@ private slots:
                 found = true;
         }
         QVERIFY2(found, "刷新后 assets.list 里没有外部写入的 chair.glb");
+    }
+
+    // 云生成的来源要在 assets.list 里带出来：文件树据此标「云 · glb」
+    void assetsListReportsCloudSource()
+    {
+        QTemporaryDir dir;
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library + QStringLiteral("/Props")));
+        QFile glb(library + QStringLiteral("/Props/crate.glb"));
+        QVERIFY(glb.open(QIODevice::WriteOnly));
+        glb.write("glTF");
+        glb.close();
+        QVERIFY(QDir().mkpath(library + QStringLiteral("/.synthforge")));
+        QFile meta(library + QStringLiteral("/.synthforge/cloud-assets.json"));
+        QVERIFY(meta.open(QIODevice::WriteOnly));
+        meta.write(R"({"version":1,"assets":{"Props/crate.glb":{"provider":"tripo"}}})");
+        meta.close();
+
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        const QJsonArray items = client.request(QStringLiteral("assets.list"),
+                                                {{"area", "blender"}})
+                                     .value(QStringLiteral("result"))
+                                     .toArray();
+        bool found = false;
+        for (const QJsonValue& value : items) {
+            const QJsonObject item = value.toObject();
+            if (item.value(QStringLiteral("relativePath")).toString()
+                == QLatin1String("Props/crate.glb")) {
+                QCOMPARE(item.value(QStringLiteral("source")).toString(),
+                         QStringLiteral("cloud"));
+                QCOMPARE(item.value(QStringLiteral("provider")).toString(),
+                         QStringLiteral("tripo"));
+                found = true;
+            }
+            // 元数据目录本身不能出现在目录列表里
+            QVERIFY(item.value(QStringLiteral("relativePath")).toString()
+                    != QLatin1String(".synthforge"));
+        }
+        QVERIFY(found);
     }
 
     // 只有 glb 的云资产：讨论时必须说明没有 .blend、只能重新生成

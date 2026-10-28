@@ -12,6 +12,7 @@
 #include "core/mcp/StdioTransport.h"
 #include "core/preflight/PreflightChecker.h"
 #include "core/settings/SettingsStore.h"
+#include "core/settings/UiState.h"
 #include "core/store/SessionStore.h"
 #include "core/tasks/TaskManager.h"
 #include "core/ws/ProtocolRouter.h"
@@ -36,6 +37,7 @@ CoreApp::CoreApp(const CoreOptions& options, QObject* parent)
     : QObject(parent)
     , m_options(options)
     , m_settings(std::make_unique<SettingsStore>(options.dataDir))
+    , m_uiState(std::make_unique<UiState>(options.dataDir))
     , m_sessions(
           std::make_unique<SessionStore>(options.dataDir + QStringLiteral("/sessions.db")))
     , m_tasks(std::make_unique<TaskManager>())
@@ -295,6 +297,26 @@ bool CoreApp::start()
                                       throw std::runtime_error("settings save failed");
                                   return QJsonValue(QJsonObject{{"ok", true}});
                               });
+    // 界面偏好存 ui.ini：页面 localStorage 在 app:// 下重启不保留
+    m_router->registerHandler(QStringLiteral("uiState.get"), [this](const QJsonObject&) {
+        return QJsonValue(QJsonObject{{"blenderMode", m_uiState->blenderMode()},
+                                      {"chatMode", m_uiState->chatMode()}});
+    });
+    m_router->registerHandler(QStringLiteral("uiState.set"), [this](const QJsonObject& params) {
+        if (params.contains(QStringLiteral("blenderMode"))) {
+            const QString mode = params.value(QStringLiteral("blenderMode")).toString();
+            if (mode != QLatin1String("lowpoly") && mode != QLatin1String("cloud3d"))
+                throw std::runtime_error("invalid blenderMode");
+            m_uiState->setBlenderMode(mode);
+        }
+        if (params.contains(QStringLiteral("chatMode"))) {
+            const QString mode = params.value(QStringLiteral("chatMode")).toString();
+            if (mode != QLatin1String("ask") && mode != QLatin1String("exec"))
+                throw std::runtime_error("invalid chatMode");
+            m_uiState->setChatMode(mode);
+        }
+        return QJsonValue(QJsonObject{{"ok", true}});
+    });
     m_router->registerHandler(QStringLiteral("session.load"),
                               [this](const QJsonObject& params) {
                                   const QString area =
@@ -628,13 +650,20 @@ bool CoreApp::start()
                                      {"size", 0},
                                      {"modified", info.lastModified().toString(Qt::ISODate)}});
         }
+        const QHash<QString, QString> cloudAssets = m_library->cloudAssets();
         for (const QString& relative : m_library->scanAssets()) {
             const QFileInfo info(m_library->absoluteFor(relative));
-            items.append(QJsonObject{{"name", info.completeBaseName()},
-                                     {"relativePath", relative},
-                                     {"kind", info.suffix().toLower()},
-                                     {"size", static_cast<double>(info.size())},
-                                     {"modified", info.lastModified().toString(Qt::ISODate)}});
+            QJsonObject item{{"name", info.completeBaseName()},
+                             {"relativePath", relative},
+                             {"kind", info.suffix().toLower()},
+                             {"size", static_cast<double>(info.size())},
+                             {"modified", info.lastModified().toString(Qt::ISODate)}};
+            // 云生成的文件带来源：文件树据此标「云 · glb」
+            if (const auto it = cloudAssets.constFind(relative); it != cloudAssets.cend()) {
+                item.insert(QStringLiteral("source"), QStringLiteral("cloud"));
+                item.insert(QStringLiteral("provider"), it.value());
+            }
+            items.append(item);
         }
         return QJsonValue(items);
     });

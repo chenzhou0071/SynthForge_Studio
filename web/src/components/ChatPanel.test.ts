@@ -230,6 +230,146 @@ describe("ChatPanel", () => {
     expect(divider.text()).toContain("底座");
   });
 
+  // 两个开关的偏好由后端 ui.ini 保存：Qt WebEngine 的 localStorage 在 app:// 下重启就丢
+  it("restores the saved modes from the backend", async () => {
+    const { wrapper } = mountPanel("blender", (fake) => {
+      fake.results.set("uiState.get", { blenderMode: "lowpoly", chatMode: "ask" });
+    });
+    await flushPromises();
+
+    const low = wrapper
+      .findAll(".chat-tools .mode-switch button")
+      .find((button) => button.text() === "低模");
+    expect(low!.classes()).toContain("active"); // 上次退出时的选择
+
+    const ask = wrapper
+      .findAll(".chat-mode .mode-switch button")
+      .find((button) => button.text() === "讨论");
+    expect(ask!.classes()).toContain("active");
+  });
+
+  // 云API 只走执行：先出云提示词草稿，没有“讨论后直接云生成”这条链路
+  it("disables discuss mode when cloud api is selected", async () => {
+    const { wrapper } = mountPanel("blender");
+    await flushPromises();
+
+    const cloud = wrapper
+      .findAll(".chat-tools .mode-switch button")
+      .find((button) => button.text() === "云API");
+    await cloud!.trigger("click");
+    await flushPromises();
+
+    const ask = wrapper
+      .findAll(".chat-mode .mode-switch button")
+      .find((button) => button.text() === "讨论");
+    expect(ask!.attributes("disabled")).toBeDefined();
+    expect(wrapper.find(".chat-mode-hint").text()).toContain("云API");
+  });
+
+  it("leaves discuss mode when the user switches to cloud api", async () => {
+    const { wrapper } = mountPanel("blender");
+    await flushPromises();
+
+    const ask = wrapper
+      .findAll(".chat-mode .mode-switch button")
+      .find((button) => button.text() === "讨论");
+    await ask!.trigger("click");
+    await flushPromises();
+    expect(ask!.classes()).toContain("active");
+
+    const cloud = wrapper
+      .findAll(".chat-tools .mode-switch button")
+      .find((button) => button.text() === "云API");
+    await cloud!.trigger("click");
+    await flushPromises();
+
+    const exec = wrapper
+      .findAll(".chat-mode .mode-switch button")
+      .find((button) => button.text() === "执行");
+    expect(exec!.classes()).toContain("active");
+    expect(ask!.attributes("disabled")).toBeDefined();
+  });
+
+  it("clamps a stored ask choice when cloud api is selected", async () => {
+    const { wrapper } = mountPanel("blender", (fake) => {
+      fake.results.set("uiState.get", { blenderMode: "cloud3d", chatMode: "ask" });
+    });
+    await flushPromises();
+
+    // 旧版本可能存下这个组合，恢复时不能停在不可用的讨论态
+    const exec = wrapper
+      .findAll(".chat-mode .mode-switch button")
+      .find((button) => button.text() === "执行");
+    expect(exec!.classes()).toContain("active");
+  });
+
+  it("saves the cloud mode choice to the backend", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.calls.length = 0; // 只看用户这次改动
+
+    const cloud = wrapper
+      .findAll(".chat-tools .mode-switch button")
+      .find((button) => button.text() === "云API");
+    await cloud!.trigger("click");
+    await flushPromises();
+
+    expect(client.callsOf("uiState.set").at(-1)!.params).toMatchObject({ blenderMode: "cloud3d" });
+  });
+
+  it("saves the discuss mode choice to the backend", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.calls.length = 0;
+
+    const ask = wrapper
+      .findAll(".chat-mode .mode-switch button")
+      .find((button) => button.text() === "讨论");
+    await ask!.trigger("click");
+    await flushPromises();
+
+    expect(client.callsOf("uiState.set").at(-1)!.params).toMatchObject({ chatMode: "ask" });
+  });
+
+  it("shows cloud progress percent while generating", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.results.set("chat.send", { accepted: true });
+
+    await wrapper.find("textarea").setValue("一棵树");
+    await wrapper.find("button.primary").trigger("click");
+    await flushPromises();
+
+    client.emit("task.progress", { area: "blender", state: "queued", percent: 0 });
+    await flushPromises();
+    expect(wrapper.find(".cloud-progress").exists()).toBe(true);
+    expect(wrapper.find("button.primary").text()).toContain("排队中");
+
+    client.emit("task.progress", { area: "blender", state: "running", percent: 45 });
+    await flushPromises();
+    expect(wrapper.find(".cloud-progress .fill").attributes("style")).toContain("45%");
+    expect(wrapper.find("button.primary").text()).toContain("生成中 45%");
+  });
+
+  it("clears cloud progress when the task finishes", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.results.set("chat.send", { accepted: true });
+
+    await wrapper.find("textarea").setValue("一棵树");
+    await wrapper.find("button.primary").trigger("click");
+    await flushPromises();
+
+    client.emit("task.progress", { area: "blender", state: "running", percent: 60 });
+    await flushPromises();
+    expect(wrapper.find(".cloud-progress").exists()).toBe(true);
+
+    client.emit("task.progress", { area: "blender", state: "success", percent: 100 });
+    await flushPromises();
+    expect(wrapper.find(".cloud-progress").exists()).toBe(false);
+    expect(wrapper.find("button.primary").text()).toContain("发送");
+  });
+
   it("renders assistant markdown tables", async () => {
     const { client, wrapper } = mountPanel("blender");
     await flushPromises();
@@ -416,6 +556,47 @@ describe("ChatPanel", () => {
     expect(wrapper.find(".bubble.pending").exists()).toBe(true);
   });
 
+  it("offers retry on cloud failure and continues through chat.retry", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.results.set("chat.send", { accepted: true });
+    client.results.set("chat.retry", { accepted: true });
+
+    await wrapper.find("textarea").setValue("一棵树");
+    await wrapper.find("button.primary").trigger("click");
+    await flushPromises();
+
+    client.emit("error.card", {
+      area: "blender",
+      reason: "cloud3d-failed",
+      message: "网络连接被拒绝",
+    });
+    await flushPromises();
+
+    const card = wrapper.find(".error-card");
+    expect(card.text()).toContain("网络连接被拒绝"); // 透传服务端原因，不只显示错误码
+    const retry = card.findAll("button").find((button) => button.text() === "重试");
+    expect(retry).toBeTruthy();
+
+    await retry!.trigger("click");
+    await flushPromises();
+
+    expect(client.callsOf("chat.retry")[0].params).toMatchObject({ area: "blender" });
+    expect(wrapper.find(".error-card button").exists()).toBe(false); // 已接续，别重复点
+    expect(wrapper.find("button.stop").exists()).toBe(true); // 续轮询期间保持进行中
+  });
+
+  it("does not offer retry when cloud is not configured", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+
+    client.emit("error.card", { area: "blender", reason: "cloud3d-not-configured" });
+    await flushPromises();
+
+    expect(wrapper.find(".error-card").text()).toContain("cloud3d-not-configured");
+    expect(wrapper.find(".error-card button").exists()).toBe(false);
+  });
+
   it("opens the folder picker and submits the selected path", async () => {
     const { client, wrapper } = mountPanel("blender");
     await flushPromises();
@@ -466,6 +647,31 @@ describe("ChatPanel", () => {
 
     expect(wrapper.find(".folder-picker").exists()).toBe(true);
     expect(wrapper.find(".pick-error").text()).toContain("忙");
+  });
+
+  it("only closes the folder picker on explicit cancel", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+
+    client.emit("folderPick.open", {
+      area: "blender",
+      requestId: "pick-mask",
+      rootName: "ModelLibrary",
+      tree: { name: "ModelLibrary", path: "", children: [] },
+    });
+    await flushPromises();
+
+    // 点窗口外再点回时，激活窗口的那一下会落在全屏遮罩上：不能当取消
+    await wrapper.find(".dialog-mask").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".folder-picker").exists()).toBe(true);
+    expect(client.callsOf("folderPick.cancel")).toHaveLength(0);
+
+    // 显式 Esc 才关闭，并真正取消后端待办
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await flushPromises();
+    expect(wrapper.find(".folder-picker").exists()).toBe(false);
+    expect(client.callsOf("folderPick.cancel")).toHaveLength(1);
   });
 
   it("stops following new output once the reader scrolls up", async () => {

@@ -5,7 +5,9 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QProcess>
+#include <QSaveFile>
 
 #include <functional>
 
@@ -15,6 +17,18 @@ bool hasIllegalName(const QString& name)
 {
     return name.isEmpty() || name == QLatin1String(".") || name == QLatin1String("..")
            || name.contains('/') || name.contains('\\');
+}
+
+// 云生成来源记在模型库内的隐藏目录，跟库一起搬家
+QString cloudMetaPath(const QString& root)
+{
+    return root + QStringLiteral("/.synthforge/cloud-assets.json");
+}
+
+bool isMetaFolder(const QString& relative)
+{
+    return relative == QLatin1String(".synthforge")
+           || relative.startsWith(QLatin1String(".synthforge/"));
 }
 
 } // namespace
@@ -34,6 +48,8 @@ QJsonObject AssetLibrary::folderTree() const
         const QFileInfoList entries =
             QDir(absolute).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
         for (const QFileInfo& entry : entries) {
+            if (entry.fileName() == QLatin1String(".synthforge"))
+                continue; // 元数据目录不进目录选择弹窗
             children.append(QJsonObject{{QStringLiteral("name"), entry.fileName()},
                                         {QStringLiteral("path"),
                                          relativeFor(entry.absoluteFilePath())},
@@ -79,8 +95,12 @@ QStringList AssetLibrary::scanAssets() const
     QDirIterator it(m_root, {QStringLiteral("*.glb"), QStringLiteral("*.fbx"),
                              QStringLiteral("*.blend")},
                     QDir::Files, QDirIterator::Subdirectories);
-    while (it.hasNext())
-        result << QDir(m_root).relativeFilePath(it.next()); // 统一正斜杠相对路径
+    while (it.hasNext()) {
+        const QString relative = QDir(m_root).relativeFilePath(it.next());
+        if (isMetaFolder(relative))
+            continue;
+        result << relative; // 统一正斜杠相对路径
+    }
     return result;
 }
 
@@ -88,9 +108,65 @@ QStringList AssetLibrary::scanFolders() const
 {
     QStringList result;
     QDirIterator it(m_root, QDir::Dirs | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
-    while (it.hasNext())
-        result << QDir(m_root).relativeFilePath(it.next());
+    while (it.hasNext()) {
+        const QString relative = QDir(m_root).relativeFilePath(it.next());
+        if (isMetaFolder(relative))
+            continue;
+        result << relative;
+    }
     return result;
+}
+
+QHash<QString, QString> AssetLibrary::cloudAssets() const
+{
+    QHash<QString, QString> result;
+    QFile file(cloudMetaPath(m_root));
+    if (!file.open(QIODevice::ReadOnly))
+        return result;
+    const QJsonObject assets = QJsonDocument::fromJson(file.readAll())
+                                   .object()
+                                   .value(QStringLiteral("assets"))
+                                   .toObject();
+    for (auto it = assets.begin(); it != assets.end(); ++it) {
+        const QString provider =
+            it.value().toObject().value(QStringLiteral("provider")).toString();
+        if (!provider.isEmpty())
+            result.insert(it.key(), provider);
+    }
+    return result;
+}
+
+void AssetLibrary::markCloudAsset(const QString& relative, const QString& provider)
+{
+    if (relative.isEmpty() || provider.isEmpty() || !isValidTarget(relative))
+        return;
+
+    QHash<QString, QString> assets = cloudAssets();
+    // 顺手清掉文件已不存在的记录，避免外部改名/删除留下孤儿
+    for (auto it = assets.begin(); it != assets.end();) {
+        if (!QFileInfo::exists(absoluteFor(it.key())))
+            it = assets.erase(it);
+        else
+            ++it;
+    }
+    assets.insert(relative, provider);
+    writeCloudAssets(assets);
+}
+
+void AssetLibrary::writeCloudAssets(const QHash<QString, QString>& assets)
+{
+    QJsonObject map;
+    for (auto it = assets.cbegin(); it != assets.cend(); ++it)
+        map.insert(it.key(), QJsonObject{{QStringLiteral("provider"), it.value()}});
+    const QJsonObject doc{{QStringLiteral("version"), 1},
+                          {QStringLiteral("assets"), map}};
+
+    QDir().mkpath(m_root + QStringLiteral("/.synthforge"));
+    QSaveFile file(cloudMetaPath(m_root));
+    if (!file.open(QIODevice::WriteOnly))
+        return;
+    file.write(QJsonDocument(doc).toJson(QJsonDocument::Compact));
+    file.commit();
 }
 
 QString AssetLibrary::makeFolder(const QString& parentRelative, const QString& name)
@@ -116,7 +192,30 @@ QString AssetLibrary::renameEntry(const QString& relative, const QString& newNam
     const QString target = QFileInfo(absolute).dir().filePath(newName);
     if (QFileInfo::exists(target))
         return QStringLiteral("already-exists");
-    return QDir().rename(absolute, target) ? QString() : QStringLiteral("io-error");
+    if (!QDir().rename(absolute, target))
+        return QStringLiteral("io-error");
+
+    // 云生成来源跟着改名走（文件或目录都按前缀迁移）
+    const QHash<QString, QString> assets = cloudAssets();
+    if (!assets.isEmpty()) {
+        const QString newRelative = QDir(m_root).relativeFilePath(target);
+        QHash<QString, QString> updated;
+        bool changed = false;
+        for (auto it = assets.cbegin(); it != assets.cend(); ++it) {
+            if (it.key() == relative) {
+                updated.insert(newRelative, it.value());
+                changed = true;
+            } else if (it.key().startsWith(relative + QLatin1Char('/'))) {
+                updated.insert(newRelative + it.key().mid(relative.size()), it.value());
+                changed = true;
+            } else {
+                updated.insert(it.key(), it.value());
+            }
+        }
+        if (changed)
+            writeCloudAssets(updated);
+    }
+    return {};
 }
 
 QString AssetLibrary::deleteEntry(const QString& relative)
@@ -126,7 +225,22 @@ QString AssetLibrary::deleteEntry(const QString& relative)
         return QStringLiteral("not-found");
     const QFileInfo info(absolute);
     const bool ok = info.isDir() ? QDir(absolute).removeRecursively() : QFile::remove(absolute);
-    return ok ? QString() : QStringLiteral("io-error");
+    if (!ok)
+        return QStringLiteral("io-error");
+
+    QHash<QString, QString> assets = cloudAssets();
+    bool changed = false;
+    for (auto it = assets.begin(); it != assets.end();) {
+        if (it.key() == relative || it.key().startsWith(relative + QLatin1Char('/'))) {
+            it = assets.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    }
+    if (changed)
+        writeCloudAssets(assets);
+    return {};
 }
 
 bool AssetLibrary::revealEntry(const QString& relative) const

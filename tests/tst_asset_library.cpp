@@ -1,5 +1,7 @@
 #include <QDir>
 #include <QFile>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QTemporaryDir>
 #include <QtTest>
 
@@ -77,6 +79,64 @@ private slots:
         QVERIFY(folders.contains(QStringLiteral("Empty")));
         QVERIFY(folders.contains(QStringLiteral("Empty/Nested")));
         QVERIFY(folders.contains(QStringLiteral("Props")));
+    }
+
+    // 云生成来源要落盘：重启应用后文件树仍能标出「云 · glb」
+    void cloudAssetSourceIsPersisted()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        AssetLibrary lib(dir.path());
+        QVERIFY(QDir().mkpath(dir.path() + QStringLiteral("/Props")));
+        QFile file(dir.path() + QStringLiteral("/Props/crate.glb"));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.close();
+
+        lib.markCloudAsset(QStringLiteral("Props/crate.glb"), QStringLiteral("tripo"));
+        QCOMPARE(lib.cloudAssets().value(QStringLiteral("Props/crate.glb")),
+                 QStringLiteral("tripo"));
+
+        AssetLibrary reopened(dir.path());
+        QCOMPARE(reopened.cloudAssets().value(QStringLiteral("Props/crate.glb")),
+                 QStringLiteral("tripo"));
+    }
+
+    void cloudAssetSourceFollowsRenameAndDelete()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        AssetLibrary lib(dir.path());
+        QVERIFY(QDir().mkpath(dir.path() + QStringLiteral("/Props")));
+        QFile file(dir.path() + QStringLiteral("/Props/crate.glb"));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.close();
+
+        lib.markCloudAsset(QStringLiteral("Props/crate.glb"), QStringLiteral("hunyuan"));
+        QVERIFY(lib.renameEntry(QStringLiteral("Props/crate.glb"), QStringLiteral("box.glb"))
+                    .isEmpty());
+        QCOMPARE(lib.cloudAssets().value(QStringLiteral("Props/box.glb")),
+                 QStringLiteral("hunyuan"));
+        QVERIFY(!lib.cloudAssets().contains(QStringLiteral("Props/crate.glb")));
+
+        QVERIFY(lib.deleteEntry(QStringLiteral("Props/box.glb")).isEmpty());
+        QVERIFY(lib.cloudAssets().isEmpty());
+    }
+
+    void metadataFolderStaysHidden()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        AssetLibrary lib(dir.path());
+        QVERIFY(QDir().mkpath(dir.path() + QStringLiteral("/Props")));
+        QFile file(dir.path() + QStringLiteral("/Props/crate.glb"));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.close();
+        lib.markCloudAsset(QStringLiteral("Props/crate.glb"), QStringLiteral("custom"));
+
+        QVERIFY(!lib.scanFolders().contains(QStringLiteral(".synthforge")));
+        for (const QJsonValue& child : lib.folderTree().value(QStringLiteral("children")).toArray())
+            QVERIFY(child.toObject().value(QStringLiteral("name")).toString()
+                    != QStringLiteral(".synthforge"));
     }
 };
 

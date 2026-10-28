@@ -55,6 +55,7 @@ Cloud3dService::~Cloud3dService() = default;
 void Cloud3dService::setProviderForTest(std::unique_ptr<Cloud3dProvider> provider)
 {
     m_provider = std::move(provider);
+    m_providerId = QStringLiteral("test");
     m_testProvider = true;
     bindProvider();
 }
@@ -137,12 +138,13 @@ void Cloud3dService::cancel()
 
 void Cloud3dService::createProvider()
 {
-    if (m_provider)
-        return; // 重试时复用已构造的实例
-
+    // 每次新提交都按最新设置重建：用户可能刚在设置里切换过服务商或地址。
+    // （重试走 retry()，不经过这里，仍复用原实例续轮询）
+    m_providerBound = false; // 新实例必须重新接信号，否则状态回调全丢
     const QJsonObject cloud =
         m_settings ? m_settings->data().value(QStringLiteral("cloud3d")).toObject() : QJsonObject{};
     const QString id = cloud.value(QStringLiteral("provider")).toString(QStringLiteral("tripo"));
+    m_providerId = id;
 
     if (id == QLatin1String("hunyuan")) {
         const QJsonObject cfg = cloud.value(QStringLiteral("hunyuan")).toObject();
@@ -275,6 +277,10 @@ void Cloud3dService::downloadModel(const QString& url)
 
         m_running = false;
         m_failed = false;
+        // 来源落盘：文件树据此标「云 · glb」，重启后还在
+        const QString relative = m_library->relativeFor(path);
+        if (!relative.isEmpty())
+            m_library->markCloudAsset(relative, m_providerId);
         emit assetCreated(path);
     });
 }

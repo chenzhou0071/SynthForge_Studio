@@ -257,3 +257,8 @@ target_link_libraries(tst_cloud3d PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_cloud3d COMMAND tst_cloud3d)
 set_tests_properties(tst_cloud3d PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+# 无 Key 验收用的可独立运行假云服务（见 tests/mock/mock_cloud3d_main.cpp）
+add_executable(mock_cloud3d_server tests/mock/mock_cloud3d_main.cpp)
+set_target_properties(mock_cloud3d_server PROPERTIES WIN32_EXECUTABLE OFF)
+target_link_libraries(mock_cloud3d_server PRIVATE Qt6::Core Qt6::Network)

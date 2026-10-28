@@ -83,7 +83,7 @@ function normalize(raw: unknown): any {
   const cloud = asObject(data.cloud3d);
   data.cloud3d = {
     provider: cloud.provider ?? "tripo",
-    tripo: { apiKey: "", version: "v2.5-20250123", ...asObject(cloud.tripo) },
+    tripo: { apiKey: "", version: "v3.1-20260211", ...asObject(cloud.tripo) },
     hunyuan: {
       secretId: "",
       secretKey: "",
@@ -237,9 +237,9 @@ function messageOf(cause: unknown) {
               </label>
               <label class="field">
                 <span>模型版本</span>
-                <input v-model="settings.cloud3d.tripo.version" placeholder="v2.5-20250123" />
+                <input v-model="settings.cloud3d.tripo.version" placeholder="v3.1-20260211" />
               </label>
-              <p class="field-hint">直连 Tripo OpenAPI（Bearer 认证）。</p>
+              <p class="field-hint">直连 Tripo OpenAPI V3（Bearer 认证）；版本留空则用服务端默认。</p>
             </template>
 
             <template v-else-if="settings.cloud3d.provider === 'hunyuan'">

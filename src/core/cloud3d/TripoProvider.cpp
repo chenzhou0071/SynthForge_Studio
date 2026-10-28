@@ -15,7 +15,8 @@ QString mapState(const QString& raw)
         return QStringLiteral("queued");
     if (raw == QLatin1String("success"))
         return QStringLiteral("success");
-    if (raw == QLatin1String("failed") || raw == QLatin1String("cancelled"))
+    if (raw == QLatin1String("failed") || raw == QLatin1String("cancelled")
+        || raw == QLatin1String("banned") || raw == QLatin1String("expired"))
         return QStringLiteral("failed");
     return QStringLiteral("running"); // running 及未知状态都继续轮询
 }
@@ -45,13 +46,13 @@ TripoProvider::TripoProvider(QString apiKey, QString version, QString baseUrl, Q
 void TripoProvider::submit(const QString& prompt, const QString& model)
 {
     QJsonObject body;
-    body.insert(QStringLiteral("type"), QStringLiteral("text_to_model"));
     body.insert(QStringLiteral("prompt"), prompt);
-    const QString version = model.isEmpty() ? m_version : model;
+    // V3 的 model 可选，留空即用服务端默认版本（v3.1-20260211）
+    const QString version = (model.isEmpty() ? m_version : model).trimmed();
     if (!version.isEmpty())
-        body.insert(QStringLiteral("model_version"), version);
+        body.insert(QStringLiteral("model"), version);
 
-    QNetworkRequest request(QUrl(m_baseUrl + QStringLiteral("/v2/openapi/task")));
+    QNetworkRequest request(QUrl(m_baseUrl + QStringLiteral("/v3/generation/text-to-model")));
     request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
     setBearer(request, m_apiKey);
 
@@ -86,7 +87,7 @@ void TripoProvider::submit(const QString& prompt, const QString& model)
 
 void TripoProvider::poll(const QString& taskId)
 {
-    QNetworkRequest request(QUrl(m_baseUrl + QStringLiteral("/v2/openapi/task/") + taskId));
+    QNetworkRequest request(QUrl(m_baseUrl + QStringLiteral("/v3/tasks/") + taskId));
     setBearer(request, m_apiKey);
 
     QNetworkReply* reply = m_nam.get(request);
@@ -115,12 +116,12 @@ void TripoProvider::poll(const QString& taskId)
         result.percent = qBound(0, payload.value(QStringLiteral("progress")).toInt(), 100);
         result.modelUrl = payload.value(QStringLiteral("output"))
                               .toObject()
-                              .value(QStringLiteral("p"))
-                              .toObject()
-                              .value(QStringLiteral("url"))
+                              .value(QStringLiteral("model_url"))
                               .toString();
         if (result.state == QLatin1String("failed")) {
-            result.error = payload.value(QStringLiteral("error")).toString();
+            result.error = payload.value(QStringLiteral("error_message")).toString();
+            if (result.error.isEmpty())
+                result.error = payload.value(QStringLiteral("error")).toString();
             if (result.error.isEmpty())
                 result.error = payload.value(QStringLiteral("message")).toString();
             if (result.error.isEmpty())

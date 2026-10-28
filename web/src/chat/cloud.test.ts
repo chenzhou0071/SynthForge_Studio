@@ -19,8 +19,10 @@ describe("isCloudConfigured", () => {
     expect(isCloudConfigured({ cloud3d: { ...cloud3d, hunyuan: { secretId: "id", secretKey: "key" } } })).toBe(true);
   });
 
-  it("requires base url and token for custom providers", () => {
-    expect(isCloudConfigured({ cloud3d: { provider: "custom", custom: { baseUrl: "https://x" } } })).toBe(false);
+  // 自定义服务的 token 可选（CustomProvider 只在非空时加 Bearer），判定以 baseUrl 为准
+  it("requires only a base url for custom providers", () => {
+    expect(isCloudConfigured({ cloud3d: { provider: "custom", custom: { baseUrl: "https://x" } } })).toBe(true);
+    expect(isCloudConfigured({ cloud3d: { provider: "custom", custom: { baseUrl: "   " } } })).toBe(false);
     expect(
       isCloudConfigured({ cloud3d: { provider: "custom", custom: { baseUrl: "https://x", apiToken: "tok" } } }),
     ).toBe(true);

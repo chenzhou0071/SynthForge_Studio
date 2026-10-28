@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QHash>
 #include <QJsonObject>
 #include <QString>
 #include <QStringList>
@@ -20,6 +21,10 @@ public:
     QStringList scanAssets() const;                      // glb + fbx + blend，统一正斜杠相对路径
     QStringList scanFolders() const;                     // 全部子目录（含空目录），供左栏树展示
 
+    // 云生成来源：落盘在 <root>/.synthforge/cloud-assets.json，重启后仍能标「云 · glb」
+    QHash<QString, QString> cloudAssets() const; // 相对路径 -> provider id
+    void markCloudAsset(const QString& relative, const QString& provider);
+
     // 文件操作：返回错误码，空串 = 成功
     QString makeFolder(const QString& parentRelative, const QString& name);
     QString renameEntry(const QString& relative, const QString& newName);
@@ -28,5 +33,6 @@ public:
 
 private:
     bool isInsideRoot(const QString& absolute) const;
+    void writeCloudAssets(const QHash<QString, QString>& assets);
     QString m_root;
 };

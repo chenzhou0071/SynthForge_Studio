@@ -9,6 +9,8 @@ interface FileEntry {
   name: string;
   path: string;
   kind: string;
+  source?: string;
+  provider?: string;
 }
 
 interface DirNode {
@@ -25,6 +27,8 @@ interface Row {
   label: string;
   path: string;
   fileKind?: string;
+  source?: string;
+  provider?: string;
 }
 
 const props = defineProps<{ area: Area; client: WsClient }>();
@@ -57,6 +61,8 @@ const rows = computed<Row[]>(() => {
         label: file.name,
         path: file.path,
         fileKind: file.kind,
+        source: file.source,
+        provider: file.provider,
       });
     }
   };
@@ -64,12 +70,27 @@ const rows = computed<Row[]>(() => {
   return result;
 });
 
+const providerNames: Record<string, string> = {
+  tripo: "Tripo",
+  hunyuan: "混元",
+  custom: "自定义服务",
+};
+
+function cloudTitle(provider?: string) {
+  return `云生成 · ${providerNames[provider ?? ""] ?? "云服务"}`;
+}
+
 // assets.list 是平铺列表（文件 + kind=dir 的目录）：按相对路径聚合成目录树，目录在前、文件在后
 function buildTree(items: unknown): DirNode {
   const root: DirNode = { name: "", path: "", dirs: [], files: [] };
   if (!Array.isArray(items)) return root;
   for (const raw of items) {
-    const item = raw as { relativePath?: unknown; kind?: unknown } | null;
+    const item = raw as {
+      relativePath?: unknown;
+      kind?: unknown;
+      source?: unknown;
+      provider?: unknown;
+    } | null;
     const relative = typeof item?.relativePath === "string" ? item.relativePath : "";
     const parts = relative.split("/").filter(Boolean);
     if (parts.length === 0) continue;
@@ -92,6 +113,8 @@ function buildTree(items: unknown): DirNode {
       path: relative,
       kind: (typeof item?.kind === "string" ? item.kind : (fileName.split(".").pop() ?? ""))
         .toLowerCase(),
+      source: typeof item?.source === "string" ? item.source : undefined,
+      provider: typeof item?.provider === "string" ? item.provider : undefined,
     });
   }
 
@@ -256,8 +279,13 @@ async function runOp(op: Op) {
         >
           <span class="tree-icon">{{ row.kind === "dir" ? (collapsed.has(row.path) ? "▸" : "▾") : "" }}</span>
           <span class="tree-name">{{ row.label }}</span>
-          <span v-if="row.fileKind" class="suffix" :class="{ muted: row.fileKind !== 'glb' }">
-            {{ row.fileKind }}
+          <span
+            v-if="row.fileKind"
+            class="suffix"
+            :class="{ muted: row.fileKind !== 'glb', cloud: row.source === 'cloud' }"
+            :title="row.source === 'cloud' ? cloudTitle(row.provider) : undefined"
+          >
+            {{ row.source === "cloud" ? `云 · ${row.fileKind}` : row.fileKind }}
           </span>
         </div>
         <p v-if="rows.length === 0" class="tree-empty">暂无资产，右键可新建文件夹</p>
@@ -343,6 +371,13 @@ async function runOp(op: Op) {
 
 .suffix.muted {
   opacity: 0.55;
+}
+
+/* 云生成来源：蓝字蓝边，和本地导出的灰标签区分 */
+.suffix.cloud {
+  color: #4daafc;
+  border-color: rgba(77, 170, 252, 0.45);
+  background: rgba(77, 170, 252, 0.12);
 }
 
 .tree-message {

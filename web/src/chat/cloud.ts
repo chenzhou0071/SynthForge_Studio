@@ -10,6 +10,7 @@ export function isCloudConfigured(settings: unknown): boolean {
   const provider = cloud.provider ?? "tripo";
   if (provider === "tripo") return filled(cloud.tripo?.apiKey);
   if (provider === "hunyuan") return filled(cloud.hunyuan?.secretId) && filled(cloud.hunyuan?.secretKey);
-  if (provider === "custom") return filled(cloud.custom?.baseUrl) && filled(cloud.custom?.apiToken);
+  // token 可选：PreflightChecker 与 CustomProvider 都只要求 baseUrl
+  if (provider === "custom") return filled(cloud.custom?.baseUrl);
   return false;
 }

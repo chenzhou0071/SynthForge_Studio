@@ -57,7 +57,7 @@ int main(int argc, char* argv[])
     QWebEngineProfile::defaultProfile()->installUrlSchemeHandler(QByteArrayLiteral("app"),
                                                                  handler);
 
-    UiState uiState(dataDir);
+    UiState& uiState = *core.uiState(); // 与 uiState.get/set 共用，避免双实例写同一个文件
     MainWindow window(uiUrl, uiState.windowGeometry(),
                       [&uiState](const QByteArray& geometry) {
                           uiState.setWindowGeometry(geometry);

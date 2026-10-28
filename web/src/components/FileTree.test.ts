@@ -60,6 +60,40 @@ describe("FileTree", () => {
     ]);
   });
 
+  it("marks cloud-generated assets with a blue 云 · glb tag", async () => {
+    const { wrapper } = mountTree("blender", (fake) => {
+      fake.results.set("assets.list", [
+        {
+          name: "crate",
+          relativePath: "Props/crate.glb",
+          kind: "glb",
+          source: "cloud",
+          provider: "tripo",
+        },
+      ]);
+    });
+    await flushPromises();
+
+    const tag = wrapper.find(".tree-file .suffix");
+    expect(tag.text()).toBe("云 · glb");
+    expect(tag.classes()).toContain("cloud");
+    expect(tag.attributes("title")).toBe("云生成 · Tripo");
+  });
+
+  it("keeps the plain glb tag for locally exported assets", async () => {
+    const { wrapper } = mountTree("blender", (fake) => {
+      fake.results.set("assets.list", [
+        { name: "chair", relativePath: "Props/chair.glb", kind: "glb" },
+      ]);
+    });
+    await flushPromises();
+
+    const tag = wrapper.find(".tree-file .suffix");
+    expect(tag.text()).toBe("glb");
+    expect(tag.classes()).not.toContain("cloud");
+    expect(tag.attributes("title")).toBeUndefined();
+  });
+
   it("shows empty folders even when they contain no model files", async () => {
     const { wrapper } = mountTree("blender", (fake) => {
       fake.results.set("assets.list", [

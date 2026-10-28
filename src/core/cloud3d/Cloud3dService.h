@@ -56,6 +56,7 @@ private:
     QTimer m_pollTimer;
     QElapsedTimer m_elapsed;
     QString m_lastPrompt;
+    QString m_providerId; // 落盘时把来源（tripo/hunyuan/custom）记进资产库元数据
     QString m_targetFolder;
     QString m_taskId;
     QString m_modelUrl;

@@ -11,6 +11,7 @@ import type { FolderNode } from "./FolderPicker.vue";
 import PlanCard from "./PlanCard.vue";
 
 type Area = "blender" | "unity";
+type ChatMode = "lowpoly" | "cloud3d";
 
 const props = defineProps<{
   area: Area;
@@ -23,9 +24,42 @@ const emit = defineEmits<{ clearAsset: [] }>();
 
 const messages = ref<ChatItem[]>([]);
 const draft = ref("");
-const mode = ref<"lowpoly" | "cloud3d">("lowpoly");
+const mode = ref<ChatMode>("lowpoly");
 // 讨论只聊方案、不碰 Blender；执行先出草稿卡，确认后才动手
 const chatMode = ref<"ask" | "exec">("exec");
+// 云API 只走“执行”：没有讨论链路，切过去时立刻退回执行态
+watch(mode, (value) => {
+  if (value === "cloud3d" && chatMode.value === "ask") chatMode.value = "exec";
+});
+// 两个开关存后端 ui.ini（uiState.get/set）：Qt WebEngine 的 localStorage 在 app:// 下重启就丢
+const prefsReady = ref(false);
+async function loadUiPrefs() {
+  try {
+    const prefs = await props.client.request<{ blenderMode?: string; chatMode?: string }>(
+      "uiState.get",
+    );
+    if (prefs?.blenderMode === "cloud3d" || prefs?.blenderMode === "lowpoly") {
+      mode.value = prefs.blenderMode;
+    }
+    if (prefs?.chatMode === "ask" || prefs?.chatMode === "exec") chatMode.value = prefs.chatMode;
+    // 旧版本可能存过 cloud3d + ask 的组合：恢复时纠正，别停在不可用的讨论态
+    if (mode.value === "cloud3d" && chatMode.value === "ask") chatMode.value = "exec";
+  } catch {
+    // 读不到偏好就用默认值，不影响对话
+  } finally {
+    await nextTick(); // 回填触发的 watcher 先跑完，别把刚读到的值再写回去
+    prefsReady.value = true;
+  }
+}
+// 用户改一下记一下；执行链路自动切到「执行」也算最近一次选择
+watch([mode, chatMode], () => {
+  if (!prefsReady.value) return;
+  void props.client
+    .request("uiState.set", { blenderMode: mode.value, chatMode: chatMode.value })
+    .catch(() => {
+      // 记忆失败不影响切换
+    });
+});
 const cloudConfigured = ref(false);
 // 目标资产 chip：只显示文件名，去掉目录与 .blend 后缀
 const assetName = computed(
@@ -33,6 +67,19 @@ const assetName = computed(
 );
 // 每区一个常驻实例：busy 属于本实例，切区只 v-show，状态不会串区
 const busy = ref(false);
+// 云任务百分比：有值才显示输入框下的细进度条；低模分组进度不经过这里
+const cloudPercent = ref<number | null>(null);
+const cloudState = ref("");
+const busyLabel = computed(() => {
+  if (cloudPercent.value === null) return "生成中…";
+  if (cloudState.value === "queued") return "排队中…";
+  return `生成中 ${cloudPercent.value}%`;
+});
+// 讨论按钮在云API下置灰，提示文案要跟着解释原因
+const chatHint = computed(() => {
+  if (mode.value === "cloud3d") return "云API 只走执行";
+  return chatMode.value === "ask" ? "只聊方案，不触碰 Blender" : "先出草稿卡，确认后才动手";
+});
 const scroller = ref<HTMLElement | null>(null);
 // 只有贴底时才跟随新输出；用户往上翻后不再抢视图
 const atBottom = ref(true);
@@ -90,12 +137,19 @@ function jumpToBottom() {
 
 function pushError(
   reason: string,
-  options: { resumable?: boolean; steps?: number; maxSteps?: number } = {},
+  options: { resumable?: boolean; message?: string; steps?: number; maxSteps?: number } = {},
 ) {
+  const cloud = reason.startsWith("cloud3d-");
   messages.value.push({
     role: "error",
-    content: reasonText(reason, options.steps, options.maxSteps),
+    // 云失败透传服务端原因；本地化文案只用于已知的低模失败
+    content:
+      cloud && options.message
+        ? options.message
+        : reasonText(reason, options.steps, options.maxSteps),
     resumable: options.resumable === true,
+    // 未配置是设置问题，重试没意义；其余云失败可续轮询/重下
+    retryable: cloud && reason !== "cloud3d-not-configured",
   });
 }
 
@@ -227,6 +281,7 @@ onMounted(() => {
       const progress = data as {
         area?: string;
         state?: string;
+        percent?: number;
         groupIndex?: number;
         groupCount?: number;
         title?: string;
@@ -241,6 +296,14 @@ onMounted(() => {
           title: progress.title ?? "",
         });
         scrollToBottom();
+      } else if (typeof progress.percent === "number") {
+        if (progress.state === "success" || progress.state === "failed") {
+          cloudPercent.value = null;
+          cloudState.value = "";
+        } else {
+          cloudPercent.value = progress.percent;
+          cloudState.value = progress.state ?? "";
+        }
       }
       busy.value = progress.state !== "success" && progress.state !== "failed";
     }),
@@ -334,6 +397,7 @@ onMounted(() => {
         area?: string;
         reason?: string;
         resumable?: boolean;
+        message?: string;
         steps?: number;
         maxSteps?: number;
       };
@@ -350,6 +414,7 @@ onMounted(() => {
       }
       pushError(card.reason ?? "unknown", {
         resumable: card.resumable,
+        message: card.message,
         steps: card.steps,
         maxSteps: card.maxSteps,
       });
@@ -358,6 +423,7 @@ onMounted(() => {
     }),
   );
 
+  if (props.area === "blender") void loadUiPrefs();
   void loadHistory();
   void refreshCloudBadge();
 });
@@ -376,6 +442,8 @@ async function send() {
   const text = draft.value.trim();
   if (!text || busy.value) return;
   cancelRequested = false;
+  cloudPercent.value = null; // 新一轮任务从零开始，不沿用上一轮的百分比
+  cloudState.value = "";
   draft.value = "";
   busy.value = true;
   // modifyTarget 只由 [修改此资产] / 右键菜单设定，点文件不会触发修改
@@ -446,6 +514,29 @@ function onPickClosed(started?: boolean) {
   if (started) {
     cancelRequested = false;
     busy.value = true;
+  }
+}
+
+// 云任务失败后重试：有 taskId 续轮询/重下，不重复提交；没有才重新提交
+async function retryCloudTask(item: ChatItem) {
+  if (busy.value) return;
+  try {
+    const result = await props.client.request<{ accepted?: boolean; error?: string }>(
+      "chat.retry",
+      { area: props.area },
+    );
+    if (result?.accepted) {
+      item.retryable = false; // 已接续，同一张卡不再重复点击
+      busy.value = true;
+      scrollToBottom(true);
+      return;
+    }
+    item.content =
+      result?.error === "no-task-to-retry"
+        ? "没有可重试的任务，请重新发送指令。"
+        : result?.error ?? "重试失败";
+  } catch (error) {
+    item.content = error instanceof Error ? error.message : "重试失败";
   }
 }
 
@@ -536,6 +627,14 @@ function onKeydown(event: KeyboardEvent) {
             >
               继续工作
             </button>
+            <button
+              v-else-if="message.retryable"
+              class="resume"
+              :disabled="busy"
+              @click="retryCloudTask(message)"
+            >
+              重试
+            </button>
           </div>
           <div v-else-if="message.role === 'draft'" class="draft-row">
             <DraftCard
@@ -590,12 +689,17 @@ function onKeydown(event: KeyboardEvent) {
     <footer class="chat-input">
       <div v-if="area === 'blender'" class="chat-mode">
         <div class="mode-switch">
-          <button :class="{ active: chatMode === 'ask' }" @click="chatMode = 'ask'">讨论</button>
+          <button
+            :class="{ active: chatMode === 'ask' }"
+            :disabled="mode === 'cloud3d'"
+            :title="mode === 'cloud3d' ? '云API 模式下不提供讨论，直接出云提示词草稿' : ''"
+            @click="chatMode = 'ask'"
+          >
+            讨论
+          </button>
           <button :class="{ active: chatMode === 'exec' }" @click="chatMode = 'exec'">执行</button>
         </div>
-        <span class="chat-mode-hint">
-          {{ chatMode === "ask" ? "只聊方案，不触碰 Blender" : "先出草稿卡，确认后才动手" }}
-        </span>
+        <span class="chat-mode-hint">{{ chatHint }}</span>
       </div>
       <div v-if="selectedAsset" class="asset-chip">
         <span>目标资产：{{ assetName }}</span>
@@ -611,10 +715,13 @@ function onKeydown(event: KeyboardEvent) {
         "
         @keydown="onKeydown"
       />
+      <div v-if="busy && cloudPercent !== null" class="cloud-progress">
+        <div class="fill" :style="{ width: `${cloudPercent}%` }"></div>
+      </div>
       <div class="chat-actions">
         <button v-if="busy" class="stop" @click="cancelTask">停止</button>
         <button class="primary" :disabled="busy || !draft.trim()" @click="send">
-          {{ busy ? "生成中…" : "发送" }}
+          {{ busy ? busyLabel : "发送" }}
         </button>
       </div>
     </footer>
@@ -708,10 +815,12 @@ function onKeydown(event: KeyboardEvent) {
 .chat-mode-hint {
   color: var(--muted);
   font-size: 12px;
+  min-width: 0; /* 弹提示换行，不要把开关挤成竖排 */
 }
 
 .mode-switch {
   display: inline-flex;
+  flex: none; /* 不被旁边的提示文案压缩 */
   border: 1px solid var(--border);
   border-radius: 4px;
   overflow: hidden;
@@ -722,6 +831,7 @@ function onKeydown(event: KeyboardEvent) {
   border-radius: 0;
   padding: 3px 10px;
   font-size: 12px;
+  white-space: nowrap;
   background: transparent;
   color: var(--muted);
 }
@@ -729,6 +839,12 @@ function onKeydown(event: KeyboardEvent) {
 .mode-switch button.active {
   background: var(--accent);
   color: #fff;
+}
+
+.mode-switch button:disabled {
+  opacity: 0.35;
+  background: transparent;
+  cursor: not-allowed;
 }
 
 .badge {
@@ -774,6 +890,19 @@ function onKeydown(event: KeyboardEvent) {
 
 .error-card .resume:disabled {
   opacity: 0.5;
+}
+
+.cloud-progress {
+  height: 2px;
+  margin-top: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.cloud-progress .fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease;
 }
 
 .chat-actions {

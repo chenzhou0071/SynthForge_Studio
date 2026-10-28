@@ -37,6 +37,8 @@ export interface ChatItem {
   title?: string;
   // 步数耗尽失败卡：可点「继续工作」接着跑，不清场
   resumable?: boolean;
+  // 云任务失败卡：可点「重试」续轮询/重下，不重复提交扣费
+  retryable?: boolean;
 }
 
 // session.load 返回 {messages, hasMore, nextCursor}；界面只认能渲染的角色
