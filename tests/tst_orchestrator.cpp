@@ -199,7 +199,10 @@ private slots:
         QVERIFY(server.requestAt(0).contains(QStringLiteral("只回 1 句结果"))); // 组完成只报结果
         QVERIFY(server.requestAt(2).contains(QStringLiteral("验收标准")));    // 自检指令已注入
         QVERIFY(server.requestAt(2).contains(QStringLiteral("树不遮挡招牌"))); // 任务约束注入自检
-        QVERIFY(server.requestAt(2).contains(QStringLiteral("只做一次自检"))); // 不反复体检
+        QVERIFY(server.requestAt(2).contains(QStringLiteral("盒式舞台自检"))); // 自检措辞按档位读表
+        QVERIFY(server.requestAt(2).contains(QStringLiteral("截图 1 次")));    // 不反复体检
+        QVERIFY(server.requestAt(2).contains(QStringLiteral("只体检一次")));   // 一趟，不是两轮
+        QVERIFY(!server.requestAt(2).contains(QStringLiteral("自检最多两轮"))); // 盒式舞台没被放宽
         QVERIFY(server.requestAt(2).contains(QStringLiteral("不要逐项复述"))); // 不复述坐标间隙
         QVERIFY(server.requestAt(2).contains(QStringLiteral("不要复述本条要求"))); // 别把提示词抄一遍
         QVERIFY(server.requestAt(3).contains(QStringLiteral("export_scene"))); // 导出指令已注入
@@ -590,6 +593,104 @@ private slots:
         QCOMPARE(plan.maxSteps, 30); // 1 组 × 30：盒式舞台档单组预算
         QVERIFY(plan.zones.isEmpty());
         QVERIFY(plan.motions.isEmpty());
+    }
+
+    // 道具档：通用 11 条里「场景中心在原点、主建筑朝 -Y、底座边长反推」是微缩舞台专属，
+    // 留在道具档就会把书桌拽回一个方框里
+    void propSystemPromptDropsDioramaLayoutRules()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("道具建好了")),
+                              textTurn(QStringLiteral("自检通过")),
+                              textTurn(QStringLiteral("导出完成"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+        orch.setModelConfig(server.config());
+
+        BuildPlan plan;
+        plan.shape = OutputShape::Prop;
+        plan.groups = {{QStringLiteral("主体"), {QStringLiteral("书桌")}, {},
+                        QStringLiteral("正视截图：桌面水平")}};
+        plan.maxSteps = shapeBudget(OutputShape::Prop, 1);
+        orch.execute(QStringLiteral("b1"), nullptr, openAiTools(), plan,
+                     QStringLiteral("一张书桌"), QStringLiteral("Props"),
+                     QStringLiteral("blender"));
+
+        // 清场走 MCP 直调、不产生 LLM 请求：第一个 LLM 请求就是第 1 组的建造轮
+        QTRY_VERIFY_WITH_TIMEOUT(server.requestCount() >= 1, 5000);
+        const QString system = server.requestAt(0);
+        QVERIFY2(system.contains(QStringLiteral("不要任何底座、地面、地平面对象")),
+                 "道具档纪律没接上");
+        QVERIFY(!system.contains(QStringLiteral("底座边长按真实尺度反推")));
+        QVERIFY(!system.contains(QStringLiteral("主建筑正面朝 -Y")));
+        // 通用纪律不能因为分档丢掉：Unity 导入依赖这三条
+        QVERIFY2(system.contains(QStringLiteral("1 Blender 单位 = 1 米")), "丢了单位约定");
+        QVERIFY2(system.contains(QStringLiteral("pack_all")), "丢了贴图打包约定");
+        QVERIFY(system.contains(QStringLiteral("本档产出形态：道具")));
+    }
+
+    // 开放场景：主轴分区与动线必须落到每一组的指令里，不然模型只能猜
+    void openGroupTurnInjectsZonesAndMotions()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("主轴建好了")),
+                              textTurn(QStringLiteral("自检通过")),
+                              textTurn(QStringLiteral("导出完成"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+        orch.setModelConfig(server.config());
+
+        BuildPlan plan;
+        plan.shape = OutputShape::OpenScene;
+        plan.zones = {QStringLiteral("主轴：轨道沿 +Y 延伸至 120 米"),
+                      QStringLiteral("近景：0~20 米 站台")};
+        plan.motions = {QStringLiteral("火车从 +Y 端驶入站台停下")};
+        plan.groups = {{QStringLiteral("地面与主轴"), {QStringLiteral("轨道")},
+                        {{QStringLiteral("轨道"), QStringLiteral("沿 +Y 延伸")}},
+                        QStringLiteral("沿主轴截图：轨道贯通")}};
+        plan.maxSteps = shapeBudget(OutputShape::OpenScene, 1);
+        orch.execute(QStringLiteral("b2"), nullptr, openAiTools(), plan,
+                     QStringLiteral("绿皮火车站"), QStringLiteral("Scenes"),
+                     QStringLiteral("blender"));
+
+        QTRY_VERIFY_WITH_TIMEOUT(server.requestCount() >= 1, 5000);
+        const QString userTurn = server.requestAt(0);
+        QVERIFY2(userTurn.contains(QStringLiteral("主轴：轨道沿 +Y 延伸至 120 米")),
+                 "分区没注入本组指令");
+        QVERIFY2(userTurn.contains(QStringLiteral("火车从 +Y 端驶入站台停下")),
+                 "动线没注入本组指令");
+    }
+
+    // 时序动画只截一张静图，模型永远发现不了火车穿模或原地不动
+    void openSelfCheckAsksForFrameSetShots()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("本组建好了")),
+                              textTurn(QStringLiteral("自检通过")),
+                              textTurn(QStringLiteral("导出完成"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+        orch.setModelConfig(server.config());
+
+        BuildPlan plan;
+        plan.shape = OutputShape::OpenScene;
+        plan.groups = {{QStringLiteral("近景分区"), {QStringLiteral("站台")}, {},
+                        QStringLiteral("近景截图：站台完整")}};
+        plan.maxSteps = shapeBudget(OutputShape::OpenScene, 1);
+        orch.execute(QStringLiteral("b3"), nullptr, openAiTools(), plan,
+                     QStringLiteral("火车站"), QStringLiteral("Scenes"),
+                     QStringLiteral("blender"));
+
+        // 建造轮 = 请求 0，自检轮 = 请求 1
+        QTRY_VERIFY_WITH_TIMEOUT(server.requestCount() >= 2, 5000);
+        const QString selfCheck = server.requestAt(1);
+        QVERIFY2(selfCheck.contains(QStringLiteral("frame_set")), "自检没要求按帧截图");
+        QVERIFY2(selfCheck.contains(QStringLiteral("起始帧")), "自检没给出取哪几帧");
+        // 档位没读错：盒式舞台那句自检不能套到动画档
+        QVERIFY(!selfCheck.contains(QStringLiteral("盒式舞台自检")));
     }
 };
 

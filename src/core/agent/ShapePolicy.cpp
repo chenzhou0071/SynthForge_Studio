@@ -153,7 +153,8 @@ QString shapeDiscipline(OutputShape shape)
         "与近景道具；不得为了压缩画面把主体、门窗或道具做小。\n"
         "D3. 构图紧凑、有近 / 中 / 远三层纵深，呈现小巧精致的模型感。\n"
         "D4. 氛围层（雾、体积光、粒子）照做，但必须放进名为 FX 的集合里"
-        "（FX 集合不会进入 glb/fbx，只在 .blend 里保留）。");
+        "（FX 集合不会进入 glb/fbx，只在 .blend 里保留）。\n"
+        "D5. 场景中心在原点，主建筑正面朝 -Y，人行道或主要动线沿 X 轴展开。");
 }
 
 QString shapeSelfCheck(OutputShape shape)

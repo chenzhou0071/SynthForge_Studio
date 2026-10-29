@@ -78,11 +78,13 @@ bool planAcceptable(const BuildPlan& plan)
     return true;
 }
 
-QString blenderSystemPrompt()
+QString blenderSystemPrompt(OutputShape shape)
 {
-    return QStringLiteral(
+    // 通用层只留「三档都成立」的条款：朝向、底座边长这类微缩舞台专属纪律
+    // 已经搬进 shapeDiscipline，留在通用层会把道具档框回方盒子。
+    const QString body = QStringLiteral(
         "你是 SynthForge Studio 的 Blender 建模 agent。使用提供的 MCP 工具"
-        "（execute_blender_code 等）完成低模场景：先清场再分组建造，"
+        "（execute_blender_code 等）完成低模建造：先清场再分组建造，"
         "必要时截图查看结果并修正。不要自行导出或保存文件："
         "导出与保存由系统在最后的导出回合统一执行。\n"
         "沟通方式（必须遵守）：全程用简体中文（对象名、代码、文件路径除外），"
@@ -96,22 +98,21 @@ QString blenderSystemPrompt()
         "1. 场景单位为米：1 Blender 单位 = 1 米（门高约 2.1，楼层约 3，人眼高 1.65）。\n"
         "2. 每个道具的 origin 落在包围盒底部中心，摆到平面上不悬空。\n"
         "3. 贴图必须打包进 .blend（导出前 pack_all），不得引用外部图片。\n"
-        "布局纪律（逐条执行，不得违反）：\n"
+        "通用布局纪律（逐条执行，不得违反）：\n"
         "4. 所有物体落地：object.location.z = 0，禁止悬空或埋地。\n"
         "5. 建每个新物体前，先用 execute_blender_code 遍历 bpy.data.objects，"
         "读出已有物体的 location 与 dimensions；新物体的水平投影不得与它们交叠。\n"
-        "6. 场景中心在原点，主建筑正面朝 -Y，人行道沿 X 轴展开。\n"
-        "7. 常用尺寸（米）：树 4~6，路灯 5，路牌 2.5，门 2.1，楼层 3，人 1.75。\n"
-        "8. 底座边长按真实尺度反推：必须放得下主体完整立面、入口前至少 2 米人行道"
-        "与近景道具；不得为了压缩画面把主体、门窗或道具做小。\n"
-        "9. 不得添加与主题无关的物体；贴合主题的合理补充（车辆、路牌、摊贩等）"
+        "6. 常用尺寸（米）：树 4~6，路灯 5，路牌 2.5，门 2.1，楼层 3，人 1.75。\n"
+        "7. 不得添加与主题无关的物体；贴合主题的合理补充（车辆、路牌、摊贩等）"
         "可作为独立物体加入，并在说明里交代。\n"
-        "10. 灯光必须是真实光源对象（AREA/POINT/SPOT/SUN），室内每个空间至少一盏；"
+        "8. 灯光必须是真实光源对象（AREA/POINT/SPOT/SUN），室内每个空间至少一盏；"
         "不要用自发光平面、光雾、飞虫、湿地面或贴图冒充照明。光粒子、光雾可以用粒子/着色器"
         "增强氛围，但必须有真实光源支撑；不要默认生成飞虫、湿地面、积水等元素，用户明确要求时"
         "才做，且不得用几何体冒充。\n"
-        "11. 建造与自检阶段禁止调用 export_scene / save_as_mainfile；"
+        "9. 建造与自检阶段禁止调用 export_scene / save_as_mainfile；"
         "收到系统的导出指令后再执行，且只执行一次。");
+    // 分档纪律接在最后：编号与通用条独立，避免改一处要重排全部编号
+    return body + shapeDiscipline(shape);
 }
 
 // 截图为 image content 时压成 JPEG base64：同一份结果既回喂模型又给前端展示
@@ -314,7 +315,7 @@ void AgentOrchestrator::execute(const QString& taskId, TaskManager* tm, const QJ
         m_gateHeld = true;
     }
     m_messages = initialMessages(
-        blenderSystemPrompt(),
+        blenderSystemPrompt(m_shape),
         QStringLiteral("已确认的专业提示词：\n%1\n目标存放目录：%2。").arg(prompt, targetFolder));
 
     // 清场：活会话里还留着上一次任务的模型，不清就会被 save_as_mainfile 一起存进新 blend
@@ -445,6 +446,17 @@ void AgentOrchestrator::startGroup()
             QStringLiteral("\n摆放要求（相对关系优先，具体坐标自行根据已有物体的包围盒推算）：\n%1")
                 .arg(lines.join('\n'));
     }
+    // 开放场景的主轴分区与动线只有规划器知道，不逐组复述模型就只能猜
+    if (!m_plan.zones.isEmpty()) {
+        content += QStringLiteral("\n本场景的空间结构（必须遵守，不得把物体堆回原点一圈）：\n- %1")
+                       .arg(m_plan.zones.join(QStringLiteral("\n- ")));
+    }
+    if (!m_plan.motions.isEmpty()) {
+        content +=
+            QStringLiteral("\n时序与运动（涉及本组物体时按此实现，位移关键帧必须做到路径终点）：\n- %1")
+                .arg(m_plan.motions.join(QStringLiteral("\n- ")));
+    }
+    content += QStringLiteral("\n本档产出形态：%1。").arg(shapeLabel(m_shape));
     content += QStringLiteral("\n放置前先查询场景中已有物体的位置与尺寸，避免重叠。"
                               "完成后停止调用工具；本组结束只回 1 句结果，不写验收报告。");
     m_messages.append(QJsonObject{{"role", "user"}, {"content", content}});
@@ -474,9 +486,13 @@ void AgentOrchestrator::onTurnFinished() // 一轮 LLM 无工具调用时进入
             content +=
                 QStringLiteral("\n本任务布局约束（逐条核对，不满足则修正后再结束）：\n- %1")
                     .arg(m_plan.rules.join(QStringLiteral("\n- ")));
-        content += QStringLiteral("\n只做一次自检：最多截图 1 次，只对照验收标准检查；发现问题才修，"
-                                  "修完最多再截 1 次确认。不要逐项复述物体坐标、间隙或贴图状态；"
-                                  "确认无误就回一句“自检通过”并立即停止调用工具；不要复述本条要求。");
+        // 自检怎么截几张图、截几次按档位读表；收尾这句三档共用，所以次数交给表、
+        // 这里只钉「一趟体检」的上限（写「最多两轮」等于给盒式舞台偷偷放宽）
+        content += QStringLiteral("\n%1\n"
+                                  "只体检一次：按上面的截图次数检查，发现问题才修，修完确认一次即可。"
+                                  "不要逐项复述物体坐标、间隙或贴图状态；"
+                                  "确认无误就回一句“自检通过”并立即停止调用工具；不要复述本条要求。")
+                       .arg(shapeSelfCheck(m_shape));
         m_messages.append(QJsonObject{{"role", "user"}, {"content", content}});
         m_stream.clear();
         tick();
