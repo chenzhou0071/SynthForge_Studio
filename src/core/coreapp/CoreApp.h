@@ -92,6 +92,7 @@ private:
     QJsonArray m_blenderTools;
     std::unique_ptr<AssetLibrary> m_library;    // 资产库根目录（ModelLibrary）
     QHash<QString, QJsonObject> m_pendingPlans; // area -> 计划卡 JSON
+    QHash<QString, OutputShape> m_shapeByArea;  // area -> 本次执行任务的档位（资产卡据此落 shape）
     QHash<QString, QString> m_planPrompts;      // area -> 已确认提示词
     QHash<QString, QString> m_pendingDraftAsset;  // area -> 本次草稿针对的资产
     QHash<QString, QString> m_pendingDraftSource; // area -> 用户原始需求（供「重新生成」）

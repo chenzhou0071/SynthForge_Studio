@@ -60,5 +60,8 @@ QJsonObject makeAssetCard(const AssetCardInput& input)
         card.insert(QStringLiteral("provider"), input.provider);
     if (!input.model.isEmpty())
         card.insert(QStringLiteral("model"), input.model);
+    // 讨论模式与计划卡都靠这个字段认档；缺省写 diorama，不能留空让前端判断
+    card.insert(QStringLiteral("shape"),
+                input.shape.isEmpty() ? QStringLiteral("diorama") : input.shape);
     return card;
 }

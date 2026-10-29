@@ -70,6 +70,38 @@ private slots:
                  QStringLiteral("v3.1-20260211"));
         QCOMPARE(card.value(QStringLiteral("files")).toArray().size(), 1);
     }
+
+    // 讨论模式靠资产卡知道这是哪一档，否则改书桌时还在按微缩场景的口吻聊
+    void cardCarriesShapeForDiscussionToPickTemplate()
+    {
+        AssetCardInput input;
+        input.name = QStringLiteral("desk");
+        input.source = QStringLiteral("lowpoly");
+        input.shape = QStringLiteral("prop");
+        input.prompt = QStringLiteral("主体与用途：一张实木书桌");
+        input.dir = QStringLiteral("Props");
+        input.createdAt = QStringLiteral("2026-10-29");
+        input.paths = QJsonObject{{QStringLiteral("glb"), QStringLiteral("d:/desk.glb")},
+                                  {QStringLiteral("blend"), QStringLiteral("d:/desk.blend")}};
+
+        const QJsonObject card = makeAssetCard(input);
+
+        QCOMPARE(card.value(QStringLiteral("shape")).toString(), QStringLiteral("prop"));
+        QCOMPARE(card.value(QStringLiteral("files")).toArray().size(), 2);
+    }
+
+    // 缺省必须写成 diorama：旧资产、旧任务没有档位，留空会让前端自己猜
+    void emptyShapeMeansDiorama()
+    {
+        AssetCardInput input;
+        input.name = QStringLiteral("shop");
+        input.source = QStringLiteral("lowpoly");
+        input.prompt = QStringLiteral("主题与视角：雨夜便利店");
+
+        const QJsonObject card = makeAssetCard(input);
+
+        QCOMPARE(card.value(QStringLiteral("shape")).toString(), QStringLiteral("diorama"));
+    }
 };
 
 QTEST_MAIN(AssetCardTest)

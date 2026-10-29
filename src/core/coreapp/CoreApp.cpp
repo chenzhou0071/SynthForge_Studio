@@ -158,6 +158,9 @@ bool CoreApp::start()
                 AssetCardInput input;
                 input.name = name;
                 input.source = QStringLiteral("cloud3d");
+                // 云端只产单体资产（一个 glb，没有场景概念）：固定记道具档，
+                // 只是给卡片打个档位标签好让讨论选对模板，不改云链路任何行为
+                input.shape = QStringLiteral("prop");
                 input.provider = provider;
                 input.model = model;
                 input.prompt = m_assetPrompts.take(area);
@@ -319,6 +322,11 @@ bool CoreApp::start()
                     AssetCardInput input;
                     input.name = base;
                     input.source = QStringLiteral("lowpoly");
+                    // QHash 取不到就是没记档（老任务或异常路径）：显式回落盒式舞台，
+                    // 不能靠枚举值 0（那恰好是 Prop）蒙对
+                    input.shape = m_shapeByArea.contains(area)
+                                      ? shapeKey(m_shapeByArea.value(area))
+                                      : QStringLiteral("diorama");
                     input.prompt = prompt;
                     input.paths = paths;
                     input.dir = dir == QLatin1String(".") ? QString() : dir;
@@ -572,10 +580,12 @@ bool CoreApp::start()
                                                   QStringLiteral("started"));
                                       m_sessions->updateMessageMeta(requestedId, meta);
                                   }
+                                  const BuildPlan plan = buildPlanFromJson(json);
+                                  // 产出形态要带到资产卡上：artifactsReady 时计划已经消费掉
+                                  m_shapeByArea.insert(area, plan.shape);
                                   m_pendingPicks.insert(
                                       area, PendingPick{area, QStringLiteral("lowpoly"),
-                                                        m_planPrompts.value(area),
-                                                        buildPlanFromJson(json)});
+                                                        m_planPrompts.value(area), plan});
                                   openFolderPick(area);
                                   return QJsonValue(QJsonObject{{"ok", true}});
                               });
@@ -1343,6 +1353,9 @@ QJsonValue CoreApp::startModify(const QString& area, const QString& asset, const
                                .arg(info.absoluteFilePath(), text);
     const QString taskId = QStringLiteral("chat-%1").arg(++m_seq);
     const QString targetFolder = info.absolutePath();
+    // 修改任务不走 plan.confirm，档位在这里记：不写就会留着上一次任务的档，
+    // 资产卡会挂着错的 shape 让讨论模式选错模板。今天修改恒为盒式舞台。
+    m_shapeByArea.insert(area, plan.shape);
     // 草稿已转正成最后一条 user，prompt 还会拼在末尾：历史里去掉同一条避免重复
     const QJsonArray history = historyForPrompt(area, text, 20);
     m_tasks->enqueue(

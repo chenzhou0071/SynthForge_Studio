@@ -692,6 +692,74 @@ private slots:
         // 档位没读错：盒式舞台那句自检不能套到动画档
         QVERIFY(!selfCheck.contains(QStringLiteral("盒式舞台自检")));
     }
+
+    // 氛围层要在 Blender 里看得见、在 Unity 里不碍事：靠集合级过滤，不靠模型自觉
+    void exportScriptExcludesFxCollectionFromGlbAndFbx()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("建好了")),
+                              textTurn(QStringLiteral("自检通过")),
+                              textTurn(QStringLiteral("导出完成"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+        orch.setModelConfig(server.config());
+
+        BuildPlan plan;
+        plan.shape = OutputShape::Diorama;
+        plan.groups = {{QStringLiteral("底座环境"), {}, {}, QStringLiteral("俯视截图")}};
+        plan.maxSteps = shapeBudget(OutputShape::Diorama, 1);
+        orch.execute(QStringLiteral("b4"), nullptr, openAiTools(), plan,
+                     QStringLiteral("便利店"), QStringLiteral("Shop"),
+                     QStringLiteral("blender"));
+
+        // 建造轮 0 → 自检轮 1 → 导出轮 2（脚本轮都只出文字、不调工具）
+        QTRY_VERIFY_WITH_TIMEOUT(server.requestCount() >= 3, 5000);
+        const QString exportTurn = server.requestAt(2);
+        QVERIFY2(exportTurn.contains(QStringLiteral("coll.name == 'FX'")),
+                 "导出脚本没识别 FX 集合");
+        QVERIFY2(exportTurn.contains(QStringLiteral("use_selection=True")),
+                 "glb/fbx 还在全量导出，FX 会跟着进 Unity");
+        // .blend 必须还带 FX：剔掉了就没有人在 Blender 里看效果的那份文件了
+        QVERIFY2(exportTurn.contains(QStringLiteral("bpy.ops.file.pack_all")),
+                 "丢了贴图打包");
+        QVERIFY2(exportTurn.contains(QStringLiteral("save_as_mainfile")), "丢了 .blend 保存");
+        // 全量保存不能被 use_selection 带跑：save_as_mainfile 没有选集过滤这回事
+        QVERIFY(!exportTurn.contains(QStringLiteral("save_as_mainfile(filepath=os.path.join("
+                                                    "folder, base + \".blend\"), use_selection")));
+        // 舞台档要告诉模型 FX 是被有意排除的，否则它会改名塞回 GLB
+        QVERIFY2(exportTurn.contains(QStringLiteral("已被有意排除")), "没交代 FX 的去向");
+    }
+
+    // 道具进 Unity 要能整体拖、也能拆开单用：根空对象必须留在导出选择集里
+    void propExportKeepsRootEmptyAndNoBaseplate()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("建好了")),
+                              textTurn(QStringLiteral("自检通过")),
+                              textTurn(QStringLiteral("导出完成"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+        orch.setModelConfig(server.config());
+
+        BuildPlan plan;
+        plan.shape = OutputShape::Prop;
+        plan.groups = {{QStringLiteral("主体"), {}, {}, QStringLiteral("正视截图")}};
+        plan.maxSteps = shapeBudget(OutputShape::Prop, 1);
+        orch.execute(QStringLiteral("b5"), nullptr, openAiTools(), plan,
+                     QStringLiteral("书桌"), QStringLiteral("Props"),
+                     QStringLiteral("blender"));
+
+        QTRY_VERIFY_WITH_TIMEOUT(server.requestCount() >= 3, 5000);
+        const QString exportTurn = server.requestAt(2);
+        QVERIFY2(exportTurn.contains(QStringLiteral("根空对象保持选中")),
+                 "道具档没保住根空对象（层级会散）");
+        QVERIFY2(exportTurn.contains(QStringLiteral("先删掉再导出")),
+                 "道具档没提醒清掉误长的底座");
+        // 道具没有氛围层，那句舞台档的 FX 交代不该出现
+        QVERIFY(!exportTurn.contains(QStringLiteral("已被有意排除")));
+    }
 };
 
 QTEST_MAIN(OrchestratorTest)

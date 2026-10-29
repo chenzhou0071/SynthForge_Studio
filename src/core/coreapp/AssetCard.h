@@ -11,6 +11,7 @@ struct AssetCardInput
     QString provider;  // 云服务商；低模为空
     QString model;     // 云模型/版本；低模为空
     QString prompt;    // 最终提示词，卡片只展示摘要
+    QString shape;     // 产出形态键名 prop|diorama|open；空 = diorama（旧资产与旧任务）
     QJsonObject paths; // glb / fbx / blend → 相对路径
     QString dir;       // 相对目录；根目录为空
     QString createdAt;

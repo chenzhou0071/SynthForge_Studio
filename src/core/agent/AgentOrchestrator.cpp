@@ -530,11 +530,26 @@ void AgentOrchestrator::onTurnFinished() // 一轮 LLM 无工具调用时进入
                                      "    n += 1\n"
                                      "    base = name + \"_\" + str(n)\n");
         }
+        // FX 集合是「人在 Blender 里看效果」的氛围层：雾和粒子进 Unity 只会挡视线，
+        // 但 .blend 必须留着它们，所以按选集导出 glb/fbx、.blend 仍旧全量保存
         prompt += QStringLiteral(
+            "fx = set()\n"
+            "def walk(coll):\n"
+            "    if coll.name == 'FX':\n"
+            "        fx.update(ob.name for ob in coll.objects)\n"
+            "    for child in coll.children:\n"
+            "        walk(child)\n"
+            "walk(bpy.context.scene.collection)\n"
+            "bpy.ops.object.select_all(action='DESELECT')\n"
+            "for ob in bpy.data.objects:\n"
+            "    if ob.name not in fx and not ob.hide_viewport:\n"
+            "        ob.select_set(True)\n"
             "bpy.ops.export_scene.gltf(filepath=os.path.join(folder, base + \".glb\"),\n"
             "                          export_format='GLB', export_animations=True,\n"
-            "                          export_animation_mode='ACTIONS', export_frame_range=True)\n"
-            "bpy.ops.export_scene.fbx(filepath=os.path.join(folder, base + \".fbx\"))\n"
+            "                          export_animation_mode='ACTIONS', export_frame_range=True,\n"
+            "                          use_selection=True)\n"
+            "bpy.ops.export_scene.fbx(filepath=os.path.join(folder, base + \".fbx\"),\n"
+            "                         use_selection=True)\n"
             "bpy.ops.file.pack_all()\n"
             "prefs = bpy.context.preferences.filepaths\n"
             "old_save_version = prefs.save_version\n"
@@ -544,6 +559,13 @@ void AgentOrchestrator::onTurnFinished() // 一轮 LLM 无工具调用时进入
             "finally:\n"
             "    prefs.save_version = old_save_version\n"
             "print('EXPORTED_BASE=' + base)\n");
+        // 不交代一句「FX 是被有意排除的」，模型为了让雾进 GLB 会把集合改名或把物体挪出去
+        prompt += m_shape == OutputShape::Prop
+                      ? QStringLiteral("道具档补充：根空对象保持选中（层级要进 Unity），"
+                                       "场景里本就不该有底座与地面；若有，先删掉再导出。")
+                      : QStringLiteral("本档补充：FX 集合（雾、体积光、粒子）已被有意排除在 "
+                                       "glb/fbx 之外，只保存在 .blend 里，不要为了让它们进 GLB "
+                                       "而改名或移出集合。");
         prompt += overwrite
                       ? QStringLiteral("不要删除场景里已有的关键帧动画（导出时它们会作为 GLB 动画保留）。"
                                        "三个文件必须同基名并覆盖原文件；本次任务只执行一次导出，"
