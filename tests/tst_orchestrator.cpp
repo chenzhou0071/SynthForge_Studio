@@ -475,6 +475,122 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(finalSpy.count(), 1, 5000);
         QVERIFY(!gate.isBusy()); // 成功出口必须释放
     }
+
+    // 道具档：规划器不该再拿到「底座环境 → 建筑外观」这套施工顺序，也不该被框回方盒子
+    void propPlanPromptHasNoSquareBaseplate()
+    {
+        MockLlmServer server({textTurn(QStringLiteral(
+            R"({"groups":[{"title":"书桌主体","items":["桌面","桌腿"],)"
+            R"("placements":[{"name":"桌面","where":"四腿顶端，离地 0.75 米"}],)"
+            R"("acceptance":"正视截图：桌面水平、四腿落地"}]})"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        AgentOrchestrator orch(&llm, nullptr, nullptr);
+        orch.setModelConfig(server.config());
+        QSignalSpy ready(&orch, &AgentOrchestrator::planReady);
+
+        orch.plan(QStringLiteral("t1"), nullptr, QStringLiteral("一张书桌"),
+                  QStringLiteral("blender"), OutputShape::Prop);
+
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
+        QVERIFY(!server.requestAt(0).contains(QStringLiteral("正方形")));
+        // 道具档的规划器不该再要求「底座环境 → 建筑外观」这类施工顺序
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("主体 → 附属小件")));
+        const QJsonObject plan = ready.first().at(2).toJsonObject();
+        QCOMPARE(plan.value(QStringLiteral("shape")).toString(), QStringLiteral("prop"));
+        // 1 组道具不需要 120 步：预算按档位走
+        QCOMPARE(plan.value(QStringLiteral("totalSteps")).toInt(), 20);
+    }
+
+    // 开放场景：主轴分区与动线要能进计划卡，预算按 40/组
+    void openPlanCarriesZonesAndBiggerBudget()
+    {
+        MockLlmServer server({textTurn(QStringLiteral(
+            R"({"rules":["轨道沿 +Y 延伸不中断"],)"
+            R"("zones":["主轴：轨道沿 +Y 至 120 米","近景：0~20 米 站台","远景：80 米外 隧道口"],)"
+            R"("motions":["火车 0~120 米进站"],)"
+            R"("groups":[{"title":"地面与主轴","items":["站台","轨道"],)"
+            R"("placements":[{"name":"轨道","where":"站台东侧，沿 +Y 延伸"}],)"
+            R"("acceptance":"沿主轴截图：轨道贯通不断裂"}]})"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        AgentOrchestrator orch(&llm, nullptr, nullptr);
+        orch.setModelConfig(server.config());
+        QSignalSpy ready(&orch, &AgentOrchestrator::planReady);
+
+        orch.plan(QStringLiteral("t2"), nullptr, QStringLiteral("绿皮火车站"),
+                  QStringLiteral("blender"), OutputShape::OpenScene);
+
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
+        const QJsonObject plan = ready.first().at(2).toJsonObject();
+        QCOMPARE(plan.value(QStringLiteral("shape")).toString(), QStringLiteral("open"));
+        QCOMPARE(plan.value(QStringLiteral("zones")).toArray().size(), 3);
+        QCOMPARE(plan.value(QStringLiteral("motions")).toArray().size(), 1);
+        QCOMPARE(plan.value(QStringLiteral("totalSteps")).toInt(), 40); // 40/组
+    }
+
+    // 没有主轴与分区的「开放场景」就是一堆撒开的积木：必须重试，还不行才降级
+    void openPlanWithoutZonesRetriesOnceThenFallsBack()
+    {
+        MockLlmServer server({
+            textTurn(QStringLiteral(
+                R"({"groups":[{"title":"一堆积木","items":["楼"],"placements":[)"
+                R"({"name":"楼","where":"随便"}],"acceptance":"截图看看"}]})")),
+            textTurn(QStringLiteral(
+                R"({"groups":[{"title":"一堆积木","items":["楼"],"placements":[)"
+                R"({"name":"楼","where":"随便"}],"acceptance":"截图看看"}]})")),
+        });
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        AgentOrchestrator orch(&llm, nullptr, nullptr);
+        orch.setModelConfig(server.config());
+        QSignalSpy ready(&orch, &AgentOrchestrator::planReady);
+
+        orch.plan(QStringLiteral("t3"), nullptr, QStringLiteral("一个公园"),
+                  QStringLiteral("blender"), OutputShape::OpenScene);
+
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
+        QCOMPARE(server.requestCount(), 2); // 缺 zones 触发一次重试
+        const QJsonObject plan = ready.first().at(2).toJsonObject();
+        // 仍缺就降级到该档默认分组：默认分组自带主轴与三段分区，不会产出无方向布局
+        QCOMPARE(plan.value(QStringLiteral("shape")).toString(), QStringLiteral("open"));
+        QVERIFY2(plan.value(QStringLiteral("zones")).toArray().size() >= 2,
+                 "降级分组没带分区，开放场景会变成无方向布局");
+    }
+
+    // 盒式舞台的降级路径一个行为都不许变：四组、120 步，只多一个 shape 字段
+    void dioramaPlanDefaultsKeepWorkingWhenLlmReturnsJunk()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("我不会输出 JSON")),
+                              textTurn(QStringLiteral("我还是不会"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        AgentOrchestrator orch(&llm, nullptr, nullptr);
+        orch.setModelConfig(server.config());
+        QSignalSpy ready(&orch, &AgentOrchestrator::planReady);
+
+        orch.plan(QStringLiteral("t4"), nullptr, QStringLiteral("雨夜便利店"),
+                  QStringLiteral("blender"), OutputShape::Diorama);
+
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
+        const QJsonObject plan = ready.first().at(2).toJsonObject();
+        QCOMPARE(plan.value(QStringLiteral("groups")).toArray().size(), 4); // 现状四组
+        QCOMPARE(plan.value(QStringLiteral("totalSteps")).toInt(), 120);
+        QCOMPARE(plan.value(QStringLiteral("shape")).toString(), QStringLiteral("diorama"));
+    }
+
+    // 重启后 m_pendingPlans 丢失，历史 plan 行的 JSON 还在：旧 JSON 没有 shape 字段必须回落
+    void buildPlanFromJsonDefaultsToDioramaForLegacyJson()
+    {
+        const BuildPlan plan = buildPlanFromJson(QJsonObject{
+            {"groups",
+             QJsonArray{QJsonObject{{"title", QStringLiteral("底座环境")},
+                                    {"acceptance", QStringLiteral("俯视")}}}}});
+        QVERIFY(plan.shape == OutputShape::Diorama);
+        QCOMPARE(plan.maxSteps, 30); // 1 组 × 30：盒式舞台档单组预算
+        QVERIFY(plan.zones.isEmpty());
+        QVERIFY(plan.motions.isEmpty());
+    }
 };
 
 QTEST_MAIN(OrchestratorTest)

@@ -75,6 +75,29 @@ private slots:
         QVERIFY(!planSystemPromptFor(OutputShape::OpenScene).contains(QStringLiteral("底座")));
         QVERIFY(planSystemPromptFor(OutputShape::OpenScene).contains(QStringLiteral("主轴")));
     }
+
+    // 黄金基线：盒式舞台这一档必须逐字不变。常量是从分档前
+    // AgentOrchestrator.cpp 的 kPlanSystemPrompt 原样抄下来的，
+    // 共用正文里丢一个字（哪怕只是举例的括号）这条就红。
+    void dioramaPlanPromptIsVerbatimLegacyText()
+    {
+        static const char* kLegacyPlanSystemPrompt =
+            "你是低模场景建造的规划器。只输出一个 JSON 对象，不要任何解释或代码块围栏，格式："
+            "{\"rules\":[\"本任务特有的跨组约束\"],\"groups\":[{\"title\":\"分组名\","
+            "\"items\":[\"物体1\"],"
+            "\"placements\":[{\"name\":\"物体1\",\"where\":\"相对位置与朝向\"}],"
+            "\"acceptance\":\"自检时截图检查什么\"}]}。"
+            "要求：3~6 组，覆盖用户提示词中全部必须独立的物体与数量下限；按施工顺序排列"
+            "（底座环境 → 建筑外观 → 室内陈设 → 灯光特效）。"
+            "可以在主题内合理补充道具（车辆、路牌、摊贩等），但不得添加与主题无关的物体，"
+            "也不得为凑组数拆出杂物组；留白优先于堆砌。"
+            "items 里的每个物体必须在 placements 里有一条同名条目；where 只写相对关系不写绝对坐标"
+            "（如「商店北侧边缘，正门朝 -Y」「招牌在正门上方，离地 2.8 米」）。"
+            "rules 只写本任务特有、跨组生效的约束（如「树不遮挡招牌」「路灯每 8 米一盏」），"
+            "不要重复贴地、不重叠、单位这类通用规则。";
+        QCOMPARE(planSystemPromptFor(OutputShape::Diorama),
+                 QString::fromUtf8(kLegacyPlanSystemPrompt));
+    }
 };
 
 QTEST_GUILESS_MAIN(ShapePolicyTest)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/agent/ShapePolicy.h"
 #include "core/llm/LlmGateway.h"
 
 #include <QDateTime>
@@ -34,6 +35,9 @@ struct BuildPlan
 {
     QVector<BuildGroup> groups;
     QStringList rules;                    // 本任务特有的跨组布局约束
+    QStringList zones;                    // 仅开放场景：主轴与各分区范围
+    QStringList motions;                  // 仅开放场景且要动画：谁沿哪条路径运动到哪里
+    OutputShape shape = OutputShape::Diorama;
     int maxSteps = 50;
     // 修改已有资产：导出时以此基名覆盖同名 glb/fbx/blend，不走“撞名加序号”
     QString targetBase;
@@ -51,7 +55,8 @@ public:
     AgentOrchestrator(LlmGateway* llm, McpClient* mcp, QObject* parent = nullptr);
 
     void setModelConfig(const LlmConfig& cfg) { m_cfg = cfg; }
-    void plan(const QString& taskId, TaskManager* tm, const QString& prompt, const QString& area);
+    void plan(const QString& taskId, TaskManager* tm, const QString& prompt, const QString& area,
+              OutputShape shape = OutputShape::Diorama);
     void execute(const QString& taskId, TaskManager* tm, const QJsonArray& tools,
                  const BuildPlan& plan, const QString& prompt, const QString& targetFolder,
                  const QString& area);
@@ -111,6 +116,7 @@ private:
     QJsonArray m_history;
     QJsonArray m_messages;
     BuildPlan m_plan;
+    OutputShape m_shape = OutputShape::Diorama; // 本次任务的产出形态：纪律、自检、预算都读这张表
     QString m_taskId;
     QString m_area;
     QString m_prompt;

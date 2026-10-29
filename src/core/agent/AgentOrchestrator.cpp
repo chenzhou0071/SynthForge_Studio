@@ -15,49 +15,67 @@
 
 namespace {
 
-const char* kPlanSystemPrompt =
-    "你是低模场景建造的规划器。只输出一个 JSON 对象，不要任何解释或代码块围栏，格式："
-    "{\"rules\":[\"本任务特有的跨组约束\"],\"groups\":[{\"title\":\"分组名\","
-    "\"items\":[\"物体1\"],"
-    "\"placements\":[{\"name\":\"物体1\",\"where\":\"相对位置与朝向\"}],"
-    "\"acceptance\":\"自检时截图检查什么\"}]}。"
-    "要求：3~6 组，覆盖用户提示词中全部必须独立的物体与数量下限；按施工顺序排列"
-    "（底座环境 → 建筑外观 → 室内陈设 → 灯光特效）。"
-    "可以在主题内合理补充道具（车辆、路牌、摊贩等），但不得添加与主题无关的物体，"
-    "也不得为凑组数拆出杂物组；留白优先于堆砌。"
-    "items 里的每个物体必须在 placements 里有一条同名条目；where 只写相对关系不写绝对坐标"
-    "（如「商店北侧边缘，正门朝 -Y」「招牌在正门上方，离地 2.8 米」）。"
-    "rules 只写本任务特有、跨组生效的约束（如「树不遮挡招牌」「路灯每 8 米一盏」），"
-    "不要重复贴地、不重叠、单位这类通用规则。";
-
-int planBudget(int groupCount)
-{
-    // 一组通常要对着 5~7 个物体反复建/截图/修正，一次工具调用不算一步，但一轮对话算一步：
-    // 30/组留足重试余量（4 组 120 步），封顶 200 防止计划器拆组过多时无限膨胀。
-    return qMin(30 * groupCount, 200);
-}
-
-BuildPlan parsePlan(const QString& text)
+// 取模型输出里的 JSON 对象；没有花括号就当解析失败（返回空对象）
+QJsonObject planJsonFrom(const QString& text)
 {
     const int start = text.indexOf('{');
     const int end = text.lastIndexOf('}');
     if (start < 0 || end <= start)
-        return {}; // 空计划 = 解析失败
-    return buildPlanFromJson(
-        QJsonDocument::fromJson(text.mid(start, end - start + 1).toUtf8()).object());
+        return {};
+    return QJsonDocument::fromJson(text.mid(start, end - start + 1).toUtf8()).object();
 }
 
-BuildPlan defaultPlan()
+// 各档的兜底分组：规划器不吐 JSON、或开放场景拿不出主轴分区时用它。
+// 盒式舞台沿用分档前的四组与逐字相同的验收文案，行为不能变。
+BuildPlan defaultPlan(OutputShape shape)
 {
     BuildPlan plan;
-    plan.groups = {
-        {QStringLiteral("底座环境"), {}, {}, QStringLiteral("俯视截图：底座完整、路面/标线齐全、无悬空凹陷")},
-        {QStringLiteral("建筑外观"), {}, {}, QStringLiteral("街角视角截图：主体、招牌、门窗齐全，比例协调")},
-        {QStringLiteral("店内陈设"), {}, {}, QStringLiteral("透过橱窗截图：按提示词店内清单逐项核对")},
-        {QStringLiteral("灯光特效"), {}, {}, QStringLiteral("夜景截图：招牌自发光、路灯、雨水粒子均已生效")},
-    };
-    plan.maxSteps = planBudget(plan.groups.size());
+    plan.shape = shape;
+    switch (shape) {
+    case OutputShape::Prop:
+        plan.groups = {
+            {QStringLiteral("主体"), {}, {}, QStringLiteral("正视截图：主体完整、各部件落地不悬空")},
+            {QStringLiteral("附属小件"), {}, {}, QStringLiteral("俯视截图：小件齐全且各自是独立物体")},
+        };
+        plan.rules = {QStringLiteral("不要底座与地面：资产之外的空处留空")};
+        break;
+    case OutputShape::OpenScene:
+        plan.groups = {
+            {QStringLiteral("地面与主轴"), {}, {}, QStringLiteral("沿主轴截图：主轴贯通、长度达标")},
+            {QStringLiteral("近景分区"), {}, {}, QStringLiteral("近景截图：入口与细节可见")},
+            {QStringLiteral("中景分区"), {}, {}, QStringLiteral("中景截图：主体构成完整")},
+            {QStringLiteral("远景分区"), {}, {}, QStringLiteral("朝远处截图：有纵深，不是空到天际")},
+        };
+        plan.zones = {QStringLiteral("主轴：主路径或轨道沿 +Y 方向延伸"),
+                      QStringLiteral("近景：0~20 米 入口与主体近处"),
+                      QStringLiteral("中景：20~60 米 主体区"),
+                      QStringLiteral("远景：60 米以上 纵深与剪影")};
+        plan.rules = {QStringLiteral("沿主轴展开，禁止把物体都堆在原点一圈"),
+                      QStringLiteral("远景分区必须有内容，不许用空地代替")};
+        break;
+    case OutputShape::Diorama:
+        break;
+    }
+    if (plan.groups.isEmpty()) { // 盒式舞台沿用现状四组
+        plan.groups = {
+            {QStringLiteral("底座环境"), {}, {}, QStringLiteral("俯视截图：底座完整、路面/标线齐全、无悬空凹陷")},
+            {QStringLiteral("建筑外观"), {}, {}, QStringLiteral("街角视角截图：主体、招牌、门窗齐全，比例协调")},
+            {QStringLiteral("店内陈设"), {}, {}, QStringLiteral("透过橱窗截图：按提示词店内清单逐项核对")},
+            {QStringLiteral("灯光特效"), {}, {}, QStringLiteral("夜景截图：招牌自发光、路灯、雨水粒子均已生效")},
+        };
+    }
+    plan.maxSteps = shapeBudget(plan.shape, plan.groups.size());
     return plan;
+}
+
+// 开放场景没有主轴与分区就等于「一堆楼随机撒开」：判为不合格，交给重试与降级
+bool planAcceptable(const BuildPlan& plan)
+{
+    if (plan.groups.isEmpty())
+        return false;
+    if (plan.shape == OutputShape::OpenScene && plan.zones.size() < 2)
+        return false;
+    return true;
 }
 
 QString blenderSystemPrompt()
@@ -147,8 +165,14 @@ QJsonObject toolResultMessage(const QString& callId, const QJsonValue& result,
 BuildPlan buildPlanFromJson(const QJsonObject& json)
 {
     BuildPlan plan;
+    // 旧 JSON（分档前落库的历史行）没有 shape：shapeFromString 回落盒式舞台
+    plan.shape = shapeFromString(json.value(QStringLiteral("shape")).toString());
     for (const QJsonValue& rule : json.value(QStringLiteral("rules")).toArray())
         plan.rules << rule.toString();
+    for (const QJsonValue& zone : json.value(QStringLiteral("zones")).toArray())
+        plan.zones << zone.toString();
+    for (const QJsonValue& motion : json.value(QStringLiteral("motions")).toArray())
+        plan.motions << motion.toString();
     for (const QJsonValue& value : json.value(QStringLiteral("groups")).toArray()) {
         const QJsonObject item = value.toObject();
         BuildGroup group;
@@ -168,7 +192,7 @@ BuildPlan buildPlanFromJson(const QJsonObject& json)
             plan.groups.push_back(group);
     }
     const int totalSteps = json.value(QStringLiteral("totalSteps")).toInt(); // 规划阶段已封顶
-    plan.maxSteps = totalSteps > 0 ? totalSteps : planBudget(plan.groups.size());
+    plan.maxSteps = totalSteps > 0 ? totalSteps : shapeBudget(plan.shape, plan.groups.size());
     return plan;
 }
 
@@ -190,12 +214,13 @@ void AgentOrchestrator::setConversationHistory(const QJsonArray& history)
 }
 
 void AgentOrchestrator::plan(const QString& taskId, TaskManager* tm, const QString& prompt,
-                             const QString& area)
+                             const QString& area, OutputShape shape)
 {
     m_taskId = taskId;
     m_tm = tm;
     m_prompt = prompt;
     m_area = area;
+    m_shape = shape;
     m_resumable = false; // 新指令作废旧的续跑现场
     m_planning.insert(area);
     attemptPlan(0);
@@ -207,8 +232,7 @@ void AgentOrchestrator::attemptPlan(int attempt)
         finishCancelled();
         return;
     }
-    const QJsonArray messages =
-        initialMessages(QString::fromUtf8(kPlanSystemPrompt), m_prompt);
+    const QJsonArray messages = initialMessages(planSystemPromptFor(m_shape), m_prompt);
     m_stream.clear();
     m_llm->chatStream(
         m_cfg, messages, {},
@@ -222,13 +246,19 @@ void AgentOrchestrator::attemptPlan(int attempt)
          },
          .onDone =
              [this, attempt]() {
-                 BuildPlan plan = parsePlan(m_stream);
-                 if (plan.groups.isEmpty() && attempt < 1) {
+                 const QJsonObject json = planJsonFrom(m_stream);
+                 BuildPlan plan = buildPlanFromJson(json);
+                 // 档位以本次任务为准：模型自己写了个 shape 也不能把这一单改成别的档
+                 plan.shape = m_shape;
+                 // 预算跟着档位走：模型没给 totalSteps 就必须按档重算（道具 20/组）
+                 if (json.value(QStringLiteral("totalSteps")).toInt() <= 0)
+                     plan.maxSteps = shapeBudget(m_shape, plan.groups.size());
+                 if (!planAcceptable(plan) && attempt < 1) {
                      attemptPlan(attempt + 1); // 解析失败重试 1 次
                      return;
                  }
-                 if (plan.groups.isEmpty())
-                     plan = defaultPlan(); // 仍失败 → 降级默认分组
+                 if (!planAcceptable(plan))
+                     plan = defaultPlan(m_shape); // 仍不合格 → 降级该档默认分组
                  QJsonArray groups;
                  for (const BuildGroup& g : plan.groups) {
                      QJsonArray placements;
@@ -244,7 +274,10 @@ void AgentOrchestrator::attemptPlan(int attempt)
                  m_planning.remove(m_area);
                  emit planReady(m_area, m_taskId,
                                 QJsonObject{{"taskId", m_taskId},
+                                            {"shape", shapeKey(plan.shape)},
                                             {"rules", QJsonArray::fromStringList(plan.rules)},
+                                            {"zones", QJsonArray::fromStringList(plan.zones)},
+                                            {"motions", QJsonArray::fromStringList(plan.motions)},
                                             {"groups", groups},
                                             {"totalSteps", plan.maxSteps}});
              }});
@@ -259,7 +292,9 @@ void AgentOrchestrator::execute(const QString& taskId, TaskManager* tm, const QJ
     m_tools = tools;
     m_plan = plan;
     m_area = area;
-    m_maxSteps = plan.maxSteps > 0 ? plan.maxSteps : 50;
+    // 建造阶段沿用规划时的档位：纪律、自检与预算都从这张表读
+    m_shape = plan.shape;
+    m_maxSteps = plan.maxSteps > 0 ? plan.maxSteps : shapeBudget(m_shape, m_plan.groups.size());
     m_steps = 0;
     m_groupIndex = 0;
     m_phase = GroupPhase::Build;
@@ -332,9 +367,10 @@ void AgentOrchestrator::resume(const QString& taskId, TaskManager* tm)
         m_gateHeld = true;
     }
     m_resumable = false;
-    // 用户显式授权继续：跟主预算同档（30/组），加上收尾余量，单次最多 200 步
+    // 用户显式授权继续：跟主预算同档（按档位单组步数），加上收尾余量，单次最多 200 步
+    const int perGroup = shapePolicy(m_shape).budgetPerGroup;
     const int remaining = qMax(1, m_plan.groups.size() - m_groupIndex);
-    m_maxSteps += qMin(30 * remaining + 20, 200);
+    m_maxSteps += qMin(perGroup * remaining + 20, 200);
     m_stream.clear();
     if (m_exporting) // 上次卡在导出回合：续跑时前端仍要挂“导出中”
         emit exportStarted(m_area, m_targetFolder);

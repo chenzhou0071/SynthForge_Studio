@@ -8,22 +8,26 @@ const char* kOpenKey = "open";
 
 // 三份规划器提示词共用一段「JSON 规范」说明，只在组数与施工顺序上分叉：
 // 复制三整份以后必然改一处漏两处。
+// 正文逐字沿用分档前的 kPlanSystemPrompt（含那几处便利店味的举例）：
+// 盒式舞台这一档的硬要求是「逐字不变」，丢一个字就是偷偷改了旧链路，
+// tst_shape_policy 的黄金基线测试会立刻红。举例只是格式示范，不会把火车站拽成商店，
+// 因此不为另外两档另写举例。
 QString planJsonSpec(int minGroups, int maxGroups, const QString& order)
 {
     return QStringLiteral(
-               "你是 SynthForge Studio 的低模建造规划器。只输出一个 JSON 对象，"
-               "不要任何解释或代码块围栏，格式："
+               "你是低模场景建造的规划器。只输出一个 JSON 对象，不要任何解释或代码块围栏，格式："
                "{\"rules\":[\"本任务特有的跨组约束\"],\"groups\":[{\"title\":\"分组名\","
                "\"items\":[\"物体1\"],"
                "\"placements\":[{\"name\":\"物体1\",\"where\":\"相对位置与朝向\"}],"
                "\"acceptance\":\"自检时截图检查什么\"}]}。"
-               "要求：%1~%2 组，覆盖用户提示词中全部必须独立的物体与数量下限；"
-               "按施工顺序排列（%3）。"
-               "可以在主题内合理补充道具，但不得添加与主题无关的物体，"
+               "要求：%1~%2 组，覆盖用户提示词中全部必须独立的物体与数量下限；按施工顺序排列"
+               "（%3）。"
+               "可以在主题内合理补充道具（车辆、路牌、摊贩等），但不得添加与主题无关的物体，"
                "也不得为凑组数拆出杂物组；留白优先于堆砌。"
                "items 里的每个物体必须在 placements 里有一条同名条目；"
-               "where 只写相对关系不写绝对坐标。"
-               "rules 只写本任务特有、跨组生效的约束，"
+               "where 只写相对关系不写绝对坐标"
+               "（如「商店北侧边缘，正门朝 -Y」「招牌在正门上方，离地 2.8 米」）。"
+               "rules 只写本任务特有、跨组生效的约束（如「树不遮挡招牌」「路灯每 8 米一盏」），"
                "不要重复贴地、不重叠、单位这类通用规则。")
         .arg(minGroups)
         .arg(maxGroups)
@@ -100,12 +104,12 @@ QString planSystemPromptFor(OutputShape shape)
     switch (shape) {
     case OutputShape::Prop:
         return planJsonSpec(policy.minGroups, policy.maxGroups,
-                            QStringLiteral("主体 → 附属小件（超过 2 组就是拆得太碎）"));
+                            QStringLiteral("主体 → 附属小件，超过 2 组就是拆得太碎"));
     case OutputShape::OpenScene:
         return planJsonSpec(policy.minGroups, policy.maxGroups,
                             QStringLiteral(
-                                "地面与主轴 → 近景分区 → 中景分区 → 远景分区"
-                                "（同一分区的物体放在同一组）"));
+                                "地面与主轴 → 近景分区 → 中景分区 → 远景分区，"
+                                "同一分区的物体放在同一组"));
     case OutputShape::Diorama:
         break;
     }
