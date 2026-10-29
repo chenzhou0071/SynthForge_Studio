@@ -20,6 +20,10 @@ public:
     QString chatMode() const; // ask | exec，缺失/未知回落 exec
     void setChatMode(const QString& mode);
 
+    // 产出形态三档：prop | diorama | open，缺失/未知回落 diorama（旧数据只有微缩场景）
+    QString shape() const;
+    void setShape(const QString& shape);
+
 private:
     QString m_path;
 };

@@ -88,6 +88,26 @@ private slots:
         QCOMPARE(restored.blenderMode(), QStringLiteral("lowpoly"));
         QCOMPARE(restored.chatMode(), QStringLiteral("exec"));
     }
+
+    // 三档产出形态（道具/盒式舞台/开放场景）跟两个开关一样存 ui.ini
+    void shapeDefaultsToDioramaAndSurvives()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QCOMPARE(UiState(dir.path()).shape(), QStringLiteral("diorama"));
+        UiState(dir.path()).setShape(QStringLiteral("prop"));
+        QCOMPARE(UiState(dir.path()).shape(), QStringLiteral("prop"));
+        UiState(dir.path()).setShape(QStringLiteral("open"));
+        QCOMPARE(UiState(dir.path()).shape(), QStringLiteral("open"));
+    }
+
+    void unknownShapeFallsBackToDiorama()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        UiState(dir.path()).setShape(QStringLiteral("cinema"));
+        QCOMPARE(UiState(dir.path()).shape(), QStringLiteral("diorama"));
+    }
 };
 
 QTEST_GUILESS_MAIN(UiStateTest)

@@ -2,6 +2,7 @@
 
 #include "core/agent/AgentOrchestrator.h"
 #include "core/agent/AskReply.h"
+#include "core/agent/ShapePolicy.h"
 #include "core/agent/SummarizerAgent.h"
 #include "core/assets/AssetLibrary.h"
 #include "core/cloud3d/Cloud3dService.h"
@@ -352,7 +353,8 @@ bool CoreApp::start()
     // 界面偏好存 ui.ini：页面 localStorage 在 app:// 下重启不保留
     m_router->registerHandler(QStringLiteral("uiState.get"), [this](const QJsonObject&) {
         return QJsonValue(QJsonObject{{"blenderMode", m_uiState->blenderMode()},
-                                      {"chatMode", m_uiState->chatMode()}});
+                                      {"chatMode", m_uiState->chatMode()},
+                                      {"shape", m_uiState->shape()}});
     });
     m_router->registerHandler(QStringLiteral("uiState.set"), [this](const QJsonObject& params) {
         if (params.contains(QStringLiteral("blenderMode"))) {
@@ -366,6 +368,13 @@ bool CoreApp::start()
             if (mode != QLatin1String("ask") && mode != QLatin1String("exec"))
                 throw std::runtime_error("invalid chatMode");
             m_uiState->setChatMode(mode);
+        }
+        if (params.contains(QStringLiteral("shape"))) {
+            const QString shape = params.value(QStringLiteral("shape")).toString();
+            // 合法键表只在 ShapePolicy 一份：往返不变就说明是三个键之一
+            if (shapeKey(shapeFromString(shape)) != shape)
+                throw std::runtime_error("invalid shape");
+            m_uiState->setShape(shape);
         }
         return QJsonValue(QJsonObject{{"ok", true}});
     });

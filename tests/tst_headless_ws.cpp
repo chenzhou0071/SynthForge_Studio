@@ -329,6 +329,36 @@ private slots:
         QCOMPARE(restored.value("chatMode").toString(), QStringLiteral("ask"));
     }
 
+    // 产出形态三档跟两个开关一样走 ui.ini；非法值必须报错而不是静默回落，
+    // 否则前端以为自己存成功了、下次开机档位变了
+    void uiStateCarriesShapeAndRejectsUnknown()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        CoreApp app({dir.path(), true});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        const QJsonObject defaults = client.request(QStringLiteral("uiState.get"), {})
+                                         .value(QStringLiteral("result"))
+                                         .toObject();
+        QCOMPARE(defaults.value("shape").toString(), QStringLiteral("diorama"));
+
+        const QJsonObject bad =
+            client.request(QStringLiteral("uiState.set"), {{"shape", "cinema"}});
+        QVERIFY2(bad.contains(QStringLiteral("error")), qPrintable(QJsonDocument(bad).toJson()));
+
+        QVERIFY(client.request(QStringLiteral("uiState.set"), {{"shape", "prop"}})
+                    .contains(QStringLiteral("result")));
+        QCOMPARE(client.request(QStringLiteral("uiState.get"), {})
+                     .value(QStringLiteral("result"))
+                     .toObject()
+                     .value("shape")
+                     .toString(),
+                 QStringLiteral("prop"));
+    }
+
     // 讨论模式：Blender 未连接也能答；[[EXEC]] 不进正文，草稿成一行 draft
     void askModeSplitsExecDraftAndKeepsCardsOutOfHistory()
     {

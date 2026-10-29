@@ -3,10 +3,13 @@
 #include <QDir>
 #include <QSettings>
 
+#include "core/agent/ShapePolicy.h"
+
 namespace {
 const QString kGeometryKey = QStringLiteral("window/geometry");
 const QString kBlenderModeKey = QStringLiteral("blender/mode");
 const QString kChatModeKey = QStringLiteral("chat/mode");
+const QString kShapeKey = QStringLiteral("output/shape");
 }
 
 UiState::UiState(QString dataDir)
@@ -51,4 +54,17 @@ void UiState::setChatMode(const QString& mode)
 {
     QSettings settings(m_path, QSettings::IniFormat);
     settings.setValue(kChatModeKey, mode);
+}
+
+QString UiState::shape() const
+{
+    QSettings settings(m_path, QSettings::IniFormat);
+    // 合法键表只在 ShapePolicy 一份：过一遍回落，免得 settings/handler/策略表三处各写一份
+    return shapeKey(shapeFromString(settings.value(kShapeKey).toString()));
+}
+
+void UiState::setShape(const QString& shape)
+{
+    QSettings settings(m_path, QSettings::IniFormat);
+    settings.setValue(kShapeKey, shape);
 }
