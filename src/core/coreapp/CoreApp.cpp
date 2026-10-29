@@ -93,6 +93,7 @@ bool CoreApp::start()
                 const QString asset = m_pendingDraftAsset.take(area);
                 const QString source = m_pendingDraftSource.take(area);
                 const QString pendingMode = m_pendingDraftMode.take(area);
+                const QString pendingShape = m_pendingDraftShape.take(area);
                 // 重新生成：同一条草稿原地换文本，不新增卡片
                 if (const qint64 regenId = m_regenDraft.take(area); regenId > 0) {
                     m_sessions->updateMessageContent(regenId, prompt);
@@ -108,11 +109,14 @@ bool CoreApp::start()
                 const qint64 id = m_sessions->appendMessage(
                     area, QStringLiteral("draft"), prompt,
                     QJsonObject{{"state", "pending"}, {"origin", "generated"},
-                                {"mode", mode}, {"asset", asset}, {"source", source}});
+                                {"mode", mode}, {"asset", asset}, {"source", source},
+                                // 档位跟着草稿存：改档位后「重新生成」不能换一档
+                                {"shape", pendingShape}});
                 m_ws->broadcastEvent(
                     QStringLiteral("draft.created"),
                     QJsonObject{{"area", area}, {"id", id}, {"prompt", prompt},
-                                {"origin", "generated"}, {"mode", mode}, {"asset", asset}});
+                                {"origin", "generated"}, {"mode", mode}, {"asset", asset},
+                                {"shape", pendingShape}});
             });
     // 云 3D：服务自己轮询/下载，CoreApp 只做事件转发
     m_cloud = std::make_unique<Cloud3dService>(m_settings.get(), m_library.get());
@@ -509,8 +513,11 @@ bool CoreApp::start()
                 : QString();
 
         m_regenDraft.insert(area, id);
+        // 档位读草稿自己那份：界面此刻切到别的档也不该改写这张旧草稿
+        const QString shape = meta.value(QStringLiteral("shape")).toString();
         m_summarizer->generate({area, source.isEmpty() ? discussion : source, mode,
-                                QFileInfo(asset).completeBaseName(), discussion});
+                                QFileInfo(asset).completeBaseName(), discussion,
+                                shape}); // 旧草稿没有 shape：空串回落盒式舞台
         return QJsonValue(QJsonObject{{"accepted", true}});
                               });
     m_router->registerHandler(QStringLiteral("plan.confirm"),
@@ -1182,6 +1189,8 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         }
         m_pendingDraftAsset.insert(area, asset);
         m_pendingDraftSource.insert(area, text);
+        // 改已有资产走 modify 模板，不看产出形态；清掉上一次的档位残留
+        m_pendingDraftShape.remove(area);
         m_summarizer->generate(
             {area, text, QStringLiteral("modify"), QFileInfo(asset).completeBaseName(), {}});
         return QJsonValue(QJsonObject{{"accepted", true}});
@@ -1204,7 +1213,10 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         }
         m_pendingDraftAsset.insert(area, QString());
         m_pendingDraftSource.insert(area, text);
-        m_summarizer->generate({area, text}); // 默认 mode=lowpoly
+        const QString shape = m_uiState->shape();
+        m_pendingDraftShape.insert(area, shape);
+        m_summarizer->generate({area, text, QStringLiteral("lowpoly"), {}, {},
+                                shape}); // 档位取界面开关，模板按三档分叉
         return QJsonValue(QJsonObject{{"accepted", true}});
     }
 
@@ -1225,6 +1237,7 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         m_pendingDraftAsset.insert(area, QString());
         m_pendingDraftSource.insert(area, text);
         m_pendingDraftMode.insert(area, QStringLiteral("cloud3d"));
+        m_pendingDraftShape.remove(area); // 云 3D 走自己的模板，与三档无关
         m_summarizer->generate({area, text, QStringLiteral("cloud3d"), {}, {}});
         return QJsonValue(QJsonObject{{"accepted", true}});
     }

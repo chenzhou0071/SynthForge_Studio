@@ -1,5 +1,6 @@
 #include "core/agent/SummarizerAgent.h"
 
+#include "core/agent/ShapePolicy.h"
 #include "core/llm/LlmGateway.h"
 #include "core/settings/SettingsStore.h"
 #include "core/store/SessionStore.h"
@@ -59,12 +60,15 @@ void SummarizerAgent::generate(const SummarizeRequest& request)
         return;
     }
 
-    // 三种模式三份模板：修改已有资产绝不能套用新建场景的骨架，否则 agent 会清场重建
-    QString templatePath = QStringLiteral(":/prompts/summarizer.md");
+    // 修改已有资产与云 3D 有自己的模板，优先于产出形态；低模新建才按三档分叉
+    const OutputShape shape = shapeFromString(request.shape);
+    QString templatePath;
     if (request.mode == QLatin1String("modify"))
         templatePath = QStringLiteral(":/prompts/summarizer-modify.md");
     else if (request.mode == QLatin1String("cloud3d"))
         templatePath = QStringLiteral(":/prompts/summarizer-cloud3d.md");
+    else
+        templatePath = shapePolicy(shape).summarizeTemplate;
 
     QFile tpl(templatePath);
     QString system;
@@ -76,6 +80,7 @@ void SummarizerAgent::generate(const SummarizeRequest& request)
     }
     system.replace(QStringLiteral("{{user_request}}"), request.userText);
     system.replace(QStringLiteral("{{mode}}"), request.mode);
+    system.replace(QStringLiteral("{{shape}}"), shapeLabel(shape));
     system.replace(QStringLiteral("{{asset}}"),
                    request.asset.isEmpty() ? QStringLiteral("（未指定）") : request.asset);
     // 讨论结论用代码拼接：模板里留空段会比留空行更难维护

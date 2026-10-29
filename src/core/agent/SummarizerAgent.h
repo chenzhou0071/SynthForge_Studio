@@ -15,6 +15,7 @@ struct SummarizeRequest
     QString mode = QStringLiteral("lowpoly");
     QString asset;
     QString discussion;
+    QString shape = QStringLiteral("diorama"); // 产出形态：prop | diorama | open
 };
 
 // 总结 agent：把口语化需求改写成可编辑的专业提示词草稿（规格 5.2）。

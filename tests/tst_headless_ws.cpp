@@ -217,13 +217,25 @@ BridgeCommand mockBlenderBridge()
     return command;
 }
 
-// 走低模链路必须带 mode：不传 mode 会落到 P2 的通用流，不会出草稿卡
+// 低模链路必须带 mode：不传 mode 会落到 P2 的通用流，不会出草稿卡
 QJsonObject sendLowpoly(WsClient& client, const QString& text)
 {
     return client.request(QStringLiteral("chat.send"),
                           {{QStringLiteral("area"), QStringLiteral("blender")},
                            {QStringLiteral("mode"), QStringLiteral("lowpoly")},
                            {QStringLiteral("text"), text}});
+}
+
+// 取第 index 次 LLM 请求的 system 正文：档位断言只关心喂进去的是哪份模板
+QString systemPromptAt(const MockLlmServer& server, int index)
+{
+    return server.requestObjectAt(index)
+        .value(QStringLiteral("messages"))
+        .toArray()
+        .first()
+        .toObject()
+        .value(QStringLiteral("content"))
+        .toString();
 }
 
 int messageCount(WsClient& client)
@@ -357,6 +369,62 @@ private slots:
                      .value("shape")
                      .toString(),
                  QStringLiteral("prop"));
+    }
+
+    // 档位要一路落到草稿行：chat.send 按界面档位选模板，
+    // 「重新生成」读的是草稿自己的 meta.shape，不是界面此刻的开关
+    void lowpolyDraftRemembersItsShapeTier()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("书桌提示词")),
+                              textTurn(QStringLiteral("书桌提示词二版"))});
+        QVERIFY(server.listen());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        CoreApp app({dir.path(), true});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+        QVERIFY(configureLlm(client, server.baseUrl()).contains(QStringLiteral("result")));
+        QVERIFY(client.request(QStringLiteral("uiState.set"), {{"shape", "prop"}})
+                    .contains(QStringLiteral("result")));
+
+        QVERIFY(sendLowpoly(client, QStringLiteral("一张书桌，上面有电脑和杯子"))
+                    .value(QStringLiteral("result"))
+                    .toObject()
+                    .value(QStringLiteral("accepted"))
+                    .toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(server.requestCount() == 1, 10000);
+        // 「不要底座」只在道具档模板里有：盒式舞台那份是「正方形底座」
+        QVERIFY2(systemPromptAt(server, 0).contains(QStringLiteral("不要底座")),
+                 "chat.send 没把界面档位传给摘要器");
+        QVERIFY(!systemPromptAt(server, 0).contains(QStringLiteral("正方形底座")));
+
+        QTRY_VERIFY_WITH_TIMEOUT(!client.lastEvent(QStringLiteral("draft.created")).isEmpty(),
+                                 10000);
+        const qint64 draftId =
+            client.lastEvent(QStringLiteral("draft.created")).value("id").toInteger();
+        QVERIFY(draftId > 0);
+        SessionStore store(dir.path() + QStringLiteral("/sessions.db"));
+        QVERIFY(store.open());
+        QCOMPARE(store.messageById(draftId)
+                     .value(QStringLiteral("meta"))
+                     .toObject()
+                     .value(QStringLiteral("shape"))
+                     .toString(),
+                 QStringLiteral("prop"));
+
+        // 界面切回默认档：重新生成仍必须按草稿当初的道具档出模板
+        QVERIFY(client.request(QStringLiteral("uiState.set"), {{"shape", "diorama"}})
+                    .contains(QStringLiteral("result")));
+        QVERIFY(client.request(QStringLiteral("draft.regenerate"), {{"id", draftId}})
+                    .value(QStringLiteral("result"))
+                    .toObject()
+                    .value(QStringLiteral("accepted"))
+                    .toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(server.requestCount() == 2, 10000);
+        QVERIFY2(systemPromptAt(server, 1).contains(QStringLiteral("不要底座")),
+                 "重新生成丢了草稿自己的档位");
+        QVERIFY(!systemPromptAt(server, 1).contains(QStringLiteral("正方形底座")));
     }
 
     // 讨论模式：Blender 未连接也能答；[[EXEC]] 不进正文，草稿成一行 draft

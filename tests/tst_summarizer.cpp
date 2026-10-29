@@ -42,6 +42,18 @@ MockLlmServer::Turn textTurn(const QString& text)
     return MockLlmServer::Turn{.frames = {MockLlm::textChunk(text), MockLlm::doneChunk()}};
 }
 
+// 取发给模型的那份 system 正文：档位断言只看模板内容，不被 user 消息干扰
+QString systemPrompt(const MockLlmServer& server, int index)
+{
+    return server.requestObjectAt(index)
+        .value(QStringLiteral("messages"))
+        .toArray()
+        .first()
+        .toObject()
+        .value(QStringLiteral("content"))
+        .toString();
+}
+
 } // namespace
 
 // 集成测试：总结 agent 走真实 HTTP + SSE（MockLlmServer 假服务端），
@@ -251,6 +263,66 @@ private slots:
                                    .toString();
         QVERIFY2(system.contains(QStringLiteral("用户已确认的讨论要点")), "缺讨论结论段");
         QVERIFY2(system.contains(QStringLiteral("自动门与积水")), "讨论结论未注入");
+    }
+
+    // 道具档：用户就要一张书桌，不该被拽进方形微缩世界
+    void propTemplateHasNoBaseplate()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("书桌提示词"))});
+        QVERIFY(server.listen());
+        m_settings.setData(agentSettings(server.baseUrl(), QStringLiteral("k-primary"),
+                                         QStringLiteral("primary-model")));
+        SummarizerAgent agent(&m_llm, &m_sessions, &m_settings);
+        QSignalSpy ready(&agent, &SummarizerAgent::draftReady);
+
+        agent.generate({QStringLiteral("blender"), QStringLiteral("一张书桌，上面有电脑和杯子"),
+                        QStringLiteral("lowpoly"), {}, {}, QStringLiteral("prop")});
+
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
+        const QString system = systemPrompt(server, 0);
+        QVERIFY2(system.contains(QStringLiteral("道具")), "没走道具档模板");
+        QVERIFY2(system.contains(QStringLiteral("不要底座")), "道具档没写死无底座");
+        QVERIFY2(!system.contains(QStringLiteral("正方形底座")), "串进了盒式舞台的骨架");
+    }
+
+    // 开放场景档：没有方形边界、必须有主轴与分区，氛围层走 FX 集合
+    void openSceneTemplateDemandsAxisAndZones()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("火车站提示词"))});
+        QVERIFY(server.listen());
+        m_settings.setData(agentSettings(server.baseUrl(), QStringLiteral("k-primary"),
+                                         QStringLiteral("primary-model")));
+        SummarizerAgent agent(&m_llm, &m_sessions, &m_settings);
+        QSignalSpy ready(&agent, &SummarizerAgent::draftReady);
+
+        agent.generate({QStringLiteral("blender"),
+                        QStringLiteral("绿皮火车站，有上车台、售票处、很远的铁轨"),
+                        QStringLiteral("lowpoly"), {}, {}, QStringLiteral("open")});
+
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
+        const QString system = systemPrompt(server, 0);
+        QVERIFY2(system.contains(QStringLiteral("开放场景")), "没走开放场景档模板");
+        QVERIFY2(system.contains(QStringLiteral("主轴")), "缺空间主轴要求");
+        QVERIFY2(system.contains(QStringLiteral("FX")), "氛围层没要求进 FX 集合");
+        QVERIFY2(!system.contains(QStringLiteral("正方形底座")), "串进了盒式舞台的骨架");
+    }
+
+    // 回归底线：不传档位（旧调用、旧 ui.ini）必须还是今天这份模板
+    void missingShapeStillYieldsLegacyDiorama()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("旧提示词"))});
+        QVERIFY(server.listen());
+        m_settings.setData(agentSettings(server.baseUrl(), QStringLiteral("k-primary"),
+                                         QStringLiteral("primary-model")));
+        SummarizerAgent agent(&m_llm, &m_sessions, &m_settings);
+        QSignalSpy ready(&agent, &SummarizerAgent::draftReady);
+
+        agent.generate({QStringLiteral("blender"), QStringLiteral("雨夜便利店")});
+
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
+        const QString system = systemPrompt(server, 0);
+        QVERIFY2(system.contains(QStringLiteral("正方形底座")), "缺省档位没回落到盒式舞台");
+        QVERIFY2(!system.contains(QStringLiteral("{{shape}}")), "shape 占位符残留");
     }
 };
 
