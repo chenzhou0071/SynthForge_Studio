@@ -32,6 +32,7 @@ public:
     void setProviderForTest(std::unique_ptr<Cloud3dProvider> provider);
     void setPollIntervalForTest(int ms);
     void setRetryDelayForTest(int ms);
+    void setTotalTimeoutForTest(int ms);
 
 signals:
     void progress(const QString& taskId, const QString& state, int percent);
@@ -63,6 +64,7 @@ private:
     int m_attempts = 0;
     int m_pollIntervalMs = 3000;
     int m_retryDelayMs = 5000;
+    qint64 m_totalTimeoutMs = 15 * 60 * 1000; // 整体预算：从提交起算 15 分钟
     bool m_running = false;
     bool m_cancelled = false;
     bool m_failed = false;

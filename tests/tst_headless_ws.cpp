@@ -3,6 +3,7 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QHostAddress>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QPointer>
@@ -1166,12 +1167,43 @@ private slots:
 
         QTRY_VERIFY_WITH_TIMEOUT(!client.lastEvent(QStringLiteral("asset.created"), mark).isEmpty(),
                                  15000);
-        const QString relative = client.lastEvent(QStringLiteral("asset.created"), mark)
-                                     .value(QStringLiteral("path"))
-                                     .toString();
+        const QJsonObject created = client.lastEvent(QStringLiteral("asset.created"), mark);
+        const QString relative = created.value(QStringLiteral("path")).toString();
         QVERIFY(relative.endsWith(QStringLiteral(".glb")));
         QVERIFY(QFile::exists(QDir(library).filePath(relative)));
         QVERIFY(!client.lastEvent(QStringLiteral("task.progress"), mark).isEmpty());
+
+        // 资产产出卡：同一事件带上卡片载荷与落库行号，历史里可恢复
+        const qint64 assetId = created.value(QStringLiteral("id")).toInteger();
+        QVERIFY(assetId > 0);
+        const QJsonObject card = created.value(QStringLiteral("card")).toObject();
+        QCOMPARE(card.value(QStringLiteral("source")).toString(),
+                 QStringLiteral("cloud3d"));
+        QCOMPARE(card.value(QStringLiteral("provider")).toString(), QStringLiteral("custom"));
+        const QString summary = card.value(QStringLiteral("prompt")).toString();
+        QVERIFY(!summary.isEmpty());
+        QVERIFY(summary.size() <= 21); // 约 20 字，超出加省略号
+        const QJsonArray files = card.value(QStringLiteral("files")).toArray();
+        QCOMPARE(files.size(), 1);
+        QCOMPARE(files.at(0).toObject().value(QStringLiteral("suffix")).toString(),
+                 QStringLiteral("glb"));
+        QVERIFY(!card.contains(QStringLiteral("faces")));
+
+        const QJsonObject page =
+            client.request(QStringLiteral("session.load"),
+                           QJsonObject{{QStringLiteral("area"), QStringLiteral("blender")},
+                                       {QStringLiteral("limit"), 30}})
+                .value(QStringLiteral("result"))
+                .toObject();
+        bool cardRowFound = false;
+        for (const QJsonValue& value : page.value(QStringLiteral("messages")).toArray()) {
+            const QJsonObject row = value.toObject();
+            if (row.value(QStringLiteral("id")).toInteger() != assetId)
+                continue;
+            cardRowFound = row.value(QStringLiteral("role")).toString()
+                == QLatin1String("asset");
+        }
+        QVERIFY(cardRowFound);
     }
 
     void bridgeRestartReportsNotRegistered()

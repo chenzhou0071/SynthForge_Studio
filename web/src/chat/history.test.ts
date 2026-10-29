@@ -75,6 +75,39 @@ describe("toChatItems", () => {
     expect(toChatItems(page)).toEqual([{ role: "user", content: "还在" }]);
   });
 
+  it("restores asset cards with files and metadata", () => {
+    const asset = {
+      name: "chair_01",
+      source: "lowpoly",
+      prompt: "一把木质餐椅，四条腿略微外八…",
+      files: [
+        { suffix: "glb", path: "props/chair_01.glb" },
+        { suffix: "blend", path: "props/chair_01.blend" },
+      ],
+      dir: "props",
+      createdAt: "2026-10-29 14:00",
+    };
+    const page = {
+      messages: [
+        { id: 21, role: "asset", content: JSON.stringify(asset), meta: { state: "done" } },
+      ],
+    };
+
+    expect(toChatItems(page)).toEqual([{ role: "asset", id: 21, asset }]);
+  });
+
+  it("skips malformed asset rows without losing the rest of the page", () => {
+    const page = {
+      messages: [
+        { id: 1, role: "asset", content: "{oops" },
+        { id: 2, role: "asset", content: JSON.stringify({ name: "", files: [] }) },
+        { id: 3, role: "user", content: "还在" },
+      ],
+    };
+
+    expect(toChatItems(page)).toEqual([{ role: "user", content: "还在" }]);
+  });
+
   it("restores draft cards with origin and state", () => {
     const page = {
       messages: [

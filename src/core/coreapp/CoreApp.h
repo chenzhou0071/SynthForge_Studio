@@ -96,6 +96,7 @@ private:
     QHash<QString, QString> m_pendingDraftAsset;  // area -> 本次草稿针对的资产
     QHash<QString, QString> m_pendingDraftSource; // area -> 用户原始需求（供「重新生成」）
     QHash<QString, QString> m_pendingDraftMode;   // area -> 本次草稿的模式（三种模板）
+    QHash<QString, QString> m_assetPrompts;       // area -> 本次执行的提示词（资产卡摘要）
     QHash<QString, qint64> m_regenDraft;          // area -> 正在重新生成的草稿 id
     QSet<QString> m_planCancelled;              // area -> 规划取消标记
     QHash<QString, PendingPick> m_pendingPicks; // area -> 等待选目录的执行任务

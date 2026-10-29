@@ -20,7 +20,6 @@
 
 namespace {
 constexpr int kMaxRetries = 3;
-constexpr qint64 kTotalTimeoutMs = 10 * 60 * 1000;
 
 // 落盘名只留 ASCII 字母数字与 -/_：中文会把整段压成一个横杠
 QString sanitizeName(const QString& prompt)
@@ -69,6 +68,11 @@ void Cloud3dService::setPollIntervalForTest(int ms)
 void Cloud3dService::setRetryDelayForTest(int ms)
 {
     m_retryDelayMs = ms;
+}
+
+void Cloud3dService::setTotalTimeoutForTest(int ms)
+{
+    m_totalTimeoutMs = ms;
 }
 
 void Cloud3dService::start(const QString& prompt, const QString& targetFolder)
@@ -228,10 +232,10 @@ void Cloud3dService::pollOnce()
     if (m_cancelled || !m_running || m_taskId.isEmpty())
         return;
     m_pollTimer.stop(); // 串行：本次没回来之前不发下一次，避免并发重复查询
-    if (m_elapsed.elapsed() > kTotalTimeoutMs) {
+    if (m_elapsed.elapsed() > m_totalTimeoutMs) {
         m_pollTimer.stop();
         finishWithError(QStringLiteral("cloud3d-timeout"),
-                        QStringLiteral("生成超时（超过 10 分钟）"));
+                        QStringLiteral("生成超时（超过 15 分钟）"));
         return;
     }
     m_provider->poll(m_taskId);

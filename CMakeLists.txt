@@ -35,6 +35,7 @@ add_library(synthforge_core STATIC
     src/core/cloud3d/HunyuanProvider.cpp
     src/core/cloud3d/Tc3Signature.cpp
     src/core/cloud3d/TripoProvider.cpp
+    src/core/coreapp/AssetCard.cpp
     src/core/coreapp/CoreApp.cpp
 )
 target_include_directories(synthforge_core PUBLIC src)
@@ -231,6 +232,12 @@ target_link_libraries(tst_headless_ws PRIVATE synthforge_core Qt6::Test)
 add_dependencies(tst_headless_ws mock_mcp_server)
 add_test(NAME tst_headless_ws COMMAND tst_headless_ws)
 set_tests_properties(tst_headless_ws PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_asset_card tests/tst_asset_card.cpp)
+target_link_libraries(tst_asset_card PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_asset_card COMMAND tst_asset_card)
+set_tests_properties(tst_asset_card PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
 add_executable(tst_ui_state tests/tst_ui_state.cpp)

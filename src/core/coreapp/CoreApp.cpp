@@ -5,6 +5,7 @@
 #include "core/agent/SummarizerAgent.h"
 #include "core/assets/AssetLibrary.h"
 #include "core/cloud3d/Cloud3dService.h"
+#include "core/coreapp/AssetCard.h"
 #include "core/llm/LlmGateway.h"
 #include "core/llm/ToolBridge.h"
 #include "core/mcp/BridgeCommands.h"
@@ -18,6 +19,7 @@
 #include "core/ws/ProtocolRouter.h"
 #include "core/ws/WsServer.h"
 
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -133,17 +135,50 @@ bool CoreApp::start()
                 const QString relative = m_library->relativeFor(glbPath);
                 if (relative.isEmpty())
                     return;
+                const QString area = QStringLiteral("blender");
+                const QString name = QFileInfo(glbPath).completeBaseName();
+                const QString dir = QFileInfo(relative).path();
+
+                // 卡片参数：服务商 + 模型/版本（Tripo 的模型位是 version）
+                const QJsonObject cloud =
+                    m_settings->data().value(QStringLiteral("cloud3d")).toObject();
+                const QString provider =
+                    cloud.value(QStringLiteral("provider")).toString();
+                const QJsonObject providerCfg =
+                    cloud.value(provider).toObject();
+                QString model = providerCfg.value(QStringLiteral("model")).toString();
+                if (model.isEmpty())
+                    model = providerCfg.value(QStringLiteral("version")).toString();
+
+                AssetCardInput input;
+                input.name = name;
+                input.source = QStringLiteral("cloud3d");
+                input.provider = provider;
+                input.model = model;
+                input.prompt = m_assetPrompts.take(area);
+                input.paths = QJsonObject{{"glb", relative}};
+                input.dir = dir == QLatin1String(".") ? QString() : dir;
+                input.createdAt =
+                    QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm"));
+                const QJsonObject card = makeAssetCard(input);
+                const qint64 cardId = m_sessions->appendMessage(
+                    area, QStringLiteral("asset"),
+                    QString::fromUtf8(QJsonDocument(card).toJson(QJsonDocument::Compact)),
+                    QJsonObject{{"state", "done"}});
+
                 m_ws->broadcastEvent(
                     QStringLiteral("asset.created"),
-                    QJsonObject{{"area", "blender"},
-                                {"name", QFileInfo(glbPath).completeBaseName()},
+                    QJsonObject{{"area", area},
+                                {"name", name},
                                 {"path", relative},
-                                {"paths", QJsonObject{{"glb", relative}}}});
+                                {"paths", QJsonObject{{"glb", relative}}},
+                                {"id", cardId},
+                                {"card", card}});
                 m_ws->broadcastEvent(
                     QStringLiteral("fileTree.changed"),
-                    QJsonObject{{"area", "blender"},
+                    QJsonObject{{"area", area},
                                 {"reason", "incremental"},
-                                {"paths", QJsonArray{QFileInfo(relative).path()}}});
+                                {"paths", QJsonArray{dir}}});
             });
     connect(m_summarizer, &SummarizerAgent::failed, this,
             [this](const QString& area, const QString& reason) {
@@ -258,6 +293,9 @@ bool CoreApp::start()
                 if (!m_library || area != QLatin1String("blender"))
                     return;
                 // 每个 GLB 配同基名的 fbx/blend 兄弟文件（不存在的后缀不收录），供前端自动预览
+                const QString prompt = m_assetPrompts.take(area);
+                const QString createdAt =
+                    QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm"));
                 QJsonArray changedDirs;
                 for (const QString& abs : absoluteGlbs) {
                     const QString relative = m_library->relativeFor(abs);
@@ -273,11 +311,25 @@ bool CoreApp::start()
                         if (QFileInfo::exists(m_library->absoluteFor(sibling)))
                             paths.insert(suffix, sibling);
                     }
+                    AssetCardInput input;
+                    input.name = base;
+                    input.source = QStringLiteral("lowpoly");
+                    input.prompt = prompt;
+                    input.paths = paths;
+                    input.dir = dir == QLatin1String(".") ? QString() : dir;
+                    input.createdAt = createdAt;
+                    const QJsonObject card = makeAssetCard(input);
+                    const qint64 cardId = m_sessions->appendMessage(
+                        area, QStringLiteral("asset"),
+                        QString::fromUtf8(QJsonDocument(card).toJson(QJsonDocument::Compact)),
+                        QJsonObject{{"state", "done"}});
                     m_ws->broadcastEvent(QStringLiteral("asset.created"),
                                          QJsonObject{{"area", area},
                                                      {"name", base},
                                                      {"path", relative},
-                                                     {"paths", paths}});
+                                                     {"paths", paths},
+                                                     {"id", cardId},
+                                                     {"card", card}});
                     changedDirs.append(dir);
                 }
                 if (!changedDirs.isEmpty())
@@ -581,6 +633,7 @@ bool CoreApp::start()
                                       if (!m_cloud)
                                           return QJsonValue(QJsonObject{
                                               {"ok", false}, {"error", "cloud3d-unavailable"}});
+                                      m_assetPrompts.insert(area, pick.prompt);
                                       m_cloud->start(pick.prompt, relative);
                                       return QJsonValue(QJsonObject{{"ok", true}});
                                   }
@@ -595,6 +648,7 @@ bool CoreApp::start()
                                   m_pickRequests.remove(requestId);
                                   m_pendingPicks.remove(area);
                                   const QString targetFolder = m_library->absoluteFor(relative);
+                                  m_assetPrompts.insert(area, pick.prompt);
                                   const QString taskId = QStringLiteral("build-%1").arg(++m_seq);
                                   m_tasks->enqueue(Task{
                                       taskId, area, QString(),

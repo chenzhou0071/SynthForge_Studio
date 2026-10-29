@@ -13,7 +13,12 @@ import type { WsClient } from "../ws/WsClient";
 type AgentGroup = "primary" | "summarizer";
 type CloudProvider = "tripo" | "hunyuan" | "custom";
 
-const props = defineProps<{ open: boolean; client: WsClient }>();
+const props = defineProps<{
+  open: boolean;
+  client: WsClient;
+  // 从错误卡「去设置」进来时直达对应页
+  initialTab?: "agent" | "cloud3d";
+}>();
 const emit = defineEmits<{
   (e: "update:open", value: boolean): void;
   (e: "saved"): void;
@@ -56,7 +61,7 @@ watch(
 );
 
 async function load() {
-  tab.value = "agent";
+  tab.value = props.initialTab ?? "agent";
   error.value = "";
   savedHint.value = "";
   preview.value = false;

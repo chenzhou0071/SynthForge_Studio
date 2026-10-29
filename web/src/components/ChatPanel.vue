@@ -2,9 +2,10 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { isCloudConfigured } from "../chat/cloud";
 import { toChatItems } from "../chat/history";
-import type { ChatItem, PlanGroup } from "../chat/history";
+import type { AssetData, ChatItem, PlanGroup } from "../chat/history";
 import { renderMarkdown } from "../chat/markdown";
 import type { WsClient } from "../ws/WsClient";
+import AssetCard from "./AssetCard.vue";
 import DraftCard from "./DraftCard.vue";
 import FolderPicker from "./FolderPicker.vue";
 import type { FolderNode } from "./FolderPicker.vue";
@@ -20,7 +21,11 @@ const props = defineProps<{
   selectedAsset?: string;
 }>();
 // [修改此资产] / 右键菜单设定的目标；提交一条修改指令后清空
-const emit = defineEmits<{ clearAsset: [] }>();
+const emit = defineEmits<{
+  clearAsset: [];
+  preview: [path: string];
+  openSettings: [target: "agent" | "cloud"];
+}>();
 
 const messages = ref<ChatItem[]>([]);
 const draft = ref("");
@@ -102,6 +107,9 @@ function reasonText(reason: string, steps?: number, maxSteps?: number) {
   if (reason === "agent-not-configured") {
     return "未配置 Agent：请先在设置中填写服务商、模型与密钥。";
   }
+  if (reason === "cloud3d-not-configured") {
+    return "未配置云 API：请先在设置中填写 3D 服务商与密钥。";
+  }
   if (reason === "max-steps-exceeded") {
     const usage =
       typeof steps === "number" && typeof maxSteps === "number"
@@ -140,6 +148,13 @@ function pushError(
   options: { resumable?: boolean; message?: string; steps?: number; maxSteps?: number } = {},
 ) {
   const cloud = reason.startsWith("cloud3d-");
+  // 未配置类错误直达设置：Agent 页 / 3D 模型页
+  const settings =
+    reason === "agent-not-configured"
+      ? "agent"
+      : reason === "cloud3d-not-configured"
+        ? "cloud"
+        : undefined;
   messages.value.push({
     role: "error",
     // 云失败透传服务端原因；本地化文案只用于已知的低模失败
@@ -150,6 +165,7 @@ function pushError(
     resumable: options.resumable === true,
     // 未配置是设置问题，重试没意义；其余云失败可续轮询/重下
     retryable: cloud && reason !== "cloud3d-not-configured",
+    settings,
   });
 }
 
@@ -308,7 +324,14 @@ onMounted(() => {
       busy.value = progress.state !== "success" && progress.state !== "failed";
     }),
     props.client.on("asset.created", (data) => {
-      if ((data as { area?: string }).area === props.area) busy.value = false; // 落盘即任务结束
+      const event = data as { area?: string; id?: number; card?: AssetData };
+      if (event.area !== props.area) return;
+      busy.value = false; // 落盘即任务结束
+      // 后端已先落库再广播：这里补一张卡，刷新后从 session.load 恢复同一行
+      if (event.card && typeof event.id === "number") {
+        messages.value.push({ role: "asset", id: event.id, asset: event.card });
+        scrollToBottom();
+      }
     }),
     props.client.on("draft.created", (data) => {
       const d = data as { area?: string; id?: number; prompt?: string; origin?: string };
@@ -635,6 +658,16 @@ function onKeydown(event: KeyboardEvent) {
             >
               重试
             </button>
+            <button
+              v-else-if="message.settings"
+              class="resume"
+              @click="emit('openSettings', message.settings)"
+            >
+              去设置
+            </button>
+          </div>
+          <div v-else-if="message.role === 'asset' && message.asset" class="draft-row">
+            <AssetCard :asset="message.asset" @preview="emit('preview', $event)" />
           </div>
           <div v-else-if="message.role === 'draft'" class="draft-row">
             <DraftCard

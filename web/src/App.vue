@@ -17,6 +17,8 @@ type LampState = "off" | "ready" | "reconnecting";
 const client = new WsClient();
 const active = ref<Area>("blender");
 const settingsOpen = ref(false);
+// 「去设置」根据错误类型直达 Agent / 3D 模型页
+const settingsTab = ref<"agent" | "cloud3d">("agent");
 const importing = ref(false);
 // 预览内容由 file.read 填充；asset.created 到达时自动打开新资产
 const previewFile = ref<PreviewFile | null>(null);
@@ -54,6 +56,15 @@ function requestImport() {
   // Unity 工程导入在 P6 接入；P3 只保留入口与按钮状态。
 }
 
+function openSettings(target: "agent" | "cloud") {
+  settingsTab.value = target === "cloud" ? "cloud3d" : "agent";
+  settingsOpen.value = true;
+}
+
+function previewAsset(path: string) {
+  void openPreview(path, true);
+}
+
 async function readFile(path: string, area: Area = active.value) {
   return (await client.request("file.read", { area, path })) as {
     ok?: boolean; kind?: PreviewFile["kind"]; content?: string; dataUrl?: string;
@@ -62,14 +73,21 @@ async function readFile(path: string, area: Area = active.value) {
 }
 
 // 点文件只预览，不再等于修改（P4 的语义变更）
-async function openPreview(path: string) {
+async function openPreview(path: string, notifyMissing = false) {
   const area = active.value;
   const seq = ++previewSeq;
   // 导出中不加载半成品；asset.created 到达后会自动打开完整文件
   if (area === "blender" && exporting.value) return;
 
   const first = await readFile(path, area);
-  if (seq !== previewSeq || !first.ok || !first.kind) return;
+  if (!first.ok || !first.kind) {
+    // 资产卡上的文件可能已被手动删除/移动，点「查看」要给出明确提示
+    if (notifyMissing && seq === previewSeq) {
+      window.alert("无法预览：文件不存在或已被移动，请刷新文件树后重试。");
+    }
+    return;
+  }
+  if (seq !== previewSeq) return;
 
   if (first.kind === "model") {
     // 导出的 glb 会边写边变大：连续 300ms 大小与修改时间不变才交给 three.js
@@ -203,16 +221,24 @@ onBeforeUnmount(() => {
           :settings-version="settingsVersion"
           :selected-asset="modifyTarget ?? undefined"
           @clear-asset="modifyTarget = null"
+          @preview="previewAsset"
+          @open-settings="openSettings"
         />
         <ChatPanel
           v-show="active === 'unity'"
           area="unity"
           :client="client"
           :settings-version="settingsVersion"
+          @open-settings="openSettings"
         />
       </div>
       <!-- 两个 ChatPanel 均为常驻实例：切区只 v-show，不卸载、不重建、不丢后台事件 -->
     </div>
-    <SettingsDialog v-model:open="settingsOpen" :client="client" @saved="settingsVersion++" />
+    <SettingsDialog
+      v-model:open="settingsOpen"
+      :client="client"
+      :initial-tab="settingsTab"
+      @saved="settingsVersion++"
+    />
   </div>
 </template>

@@ -528,6 +528,48 @@ describe("ChatPanel", () => {
     expect(wrapper.find(".error-card").text()).toContain("未配置");
   });
 
+  it("shows an asset card when generation finishes and opens it for preview", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+
+    const card = {
+      name: "chair_01",
+      source: "lowpoly",
+      prompt: "一把木质餐椅…",
+      files: [{ suffix: "glb", path: "props/chair_01.glb" }],
+      dir: "props",
+      createdAt: "2026-10-29 14:00",
+    };
+    client.emit("asset.created", {
+      area: "blender",
+      id: 9,
+      path: "props/chair_01.glb",
+      card,
+    });
+    await flushPromises();
+
+    const asset = wrapper.find(".asset-card");
+    expect(asset.exists()).toBe(true);
+    expect(asset.text()).toContain("chair_01");
+    expect(asset.text()).toContain("一把木质餐椅…");
+
+    await asset.find("button.view").trigger("click");
+    expect(wrapper.emitted("preview")?.[0]).toEqual(["props/chair_01.glb"]);
+  });
+
+  it("offers a settings shortcut when the agent is not configured", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+
+    client.emit("error.card", { area: "blender", reason: "agent-not-configured" });
+    await flushPromises();
+
+    const button = wrapper.findAll(".error-card button").find((item) => item.text() === "去设置");
+    expect(button).toBeTruthy();
+    await button!.trigger("click");
+    expect(wrapper.emitted("openSettings")?.[0]).toEqual(["agent"]);
+  });
+
   it("offers to resume work after the step budget runs out", async () => {
     const { client, wrapper } = mountPanel("blender");
     await flushPromises();
@@ -586,15 +628,19 @@ describe("ChatPanel", () => {
     expect(wrapper.find("button.stop").exists()).toBe(true); // 续轮询期间保持进行中
   });
 
-  it("does not offer retry when cloud is not configured", async () => {
+  it("opens the cloud settings instead of retrying when cloud is not configured", async () => {
     const { client, wrapper } = mountPanel("blender");
     await flushPromises();
 
     client.emit("error.card", { area: "blender", reason: "cloud3d-not-configured" });
     await flushPromises();
 
-    expect(wrapper.find(".error-card").text()).toContain("cloud3d-not-configured");
-    expect(wrapper.find(".error-card button").exists()).toBe(false);
+    expect(wrapper.find(".error-card").text()).toContain("未配置云 API");
+    const button = wrapper.findAll(".error-card button").find((item) => item.text() === "去设置");
+    expect(button).toBeTruthy();
+    expect(wrapper.findAll(".error-card button").find((item) => item.text() === "重试")).toBeUndefined();
+    await button!.trigger("click");
+    expect(wrapper.emitted("openSettings")?.[0]).toEqual(["cloud"]);
   });
 
   it("opens the folder picker and submits the selected path", async () => {

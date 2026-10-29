@@ -37,6 +37,17 @@ async function save(wrapper: VueWrapper) {
 }
 
 describe("SettingsDialog 3D 页", () => {
+  it("opens the requested tab directly", async () => {
+    const client = new FakeClient();
+    client.results.set("settings.get", {});
+    const wrapper = mount(SettingsDialog, {
+      props: { open: false, client: client.asClient(), initialTab: "cloud3d" },
+    });
+    await openDialog(wrapper);
+
+    expect(wrapper.find(".tabs button.active").text()).toBe("3D 模型");
+  });
+
   it("shows tripo fields and the default model version", async () => {
     const { wrapper } = mountDialog();
     await openDialog(wrapper);

@@ -39,6 +39,26 @@ QByteArray json(const QJsonObject& object)
 {
     return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
+
+// 永远在跑的任务：不依赖网络时序，专门验证总时长预算与超时后停轮询
+class EndlessRunningProvider : public Cloud3dProvider
+{
+public:
+    void submit(const QString&, const QString&) override
+    {
+        emit submitted(QStringLiteral("t1"));
+    }
+    void poll(const QString&) override
+    {
+        ++polls;
+        Cloud3dStatus result;
+        result.state = QStringLiteral("running");
+        result.percent = 10;
+        emit status(result);
+    }
+
+    int polls = 0;
+};
 } // namespace
 
 class Cloud3dTest : public QObject
@@ -492,6 +512,79 @@ private slots:
 
         QTRY_COMPARE_WITH_TIMEOUT(created.count(), 1, 5000);
         QCOMPARE(errors.count(), 0);
+    }
+
+    void serviceStopsAfterThreeRetries()
+    {
+        MockCloud3dServer server;
+        QVERIFY(server.listen());
+        // 首次提交 + 3 次重试都撞同一个 500：重试预算必须见底就停
+        for (int i = 0; i < 4; ++i) {
+            server.enqueue("POST", "/task", 500, json({{"message", "gateway hiccup"}}));
+        }
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        SettingsStore settings(dir.path());
+        settings.load();
+        AssetLibrary library(dir.path() + QStringLiteral("/ModelLibrary"));
+        QVERIFY(QDir().mkpath(library.root()));
+
+        Cloud3dService service(&settings, &library);
+        service.setProviderForTest(std::make_unique<CustomProvider>(server.baseUrl(), QString()));
+        service.setPollIntervalForTest(10);
+        service.setRetryDelayForTest(10);
+        QSignalSpy errors(&service, &Cloud3dService::errorCard);
+
+        service.start(QStringLiteral("wooden crate"), QString());
+
+        QTRY_COMPARE_WITH_TIMEOUT(errors.count(), 1, 5000);
+        QCOMPARE(errors.first().at(0).toString(), QStringLiteral("cloud3d-failed"));
+        const QString message = errors.first().at(1).toString();
+        QVERIFY(message.contains(QStringLiteral("gateway hiccup")));
+        // 内部重试前缀不能漏进用户可见文案
+        QVERIFY(!message.startsWith(QStringLiteral("retryable:")));
+
+        int submits = 0;
+        for (const MockCloud3dServer::Request& request : server.requests()) {
+            if (request.method == "POST" && request.path == QStringLiteral("/task"))
+                ++submits;
+        }
+        QCOMPARE(submits, 4); // 首次 + 恰好 3 次重试，第 5 次不能再发
+        QCOMPARE(service.isRunning(), false);
+        QCOMPARE(service.canRetry(), true); // 预算耗尽后仍允许用户手动重试
+    }
+
+    void serviceTimesOutAfterTotalBudget()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        SettingsStore settings(dir.path());
+        settings.load();
+        AssetLibrary library(dir.path() + QStringLiteral("/ModelLibrary"));
+        QVERIFY(QDir().mkpath(library.root()));
+
+        Cloud3dService service(&settings, &library);
+        auto provider = std::make_unique<EndlessRunningProvider>();
+        EndlessRunningProvider* endless = provider.get();
+        service.setProviderForTest(std::move(provider));
+        service.setPollIntervalForTest(5);
+        service.setTotalTimeoutForTest(40); // 把 15 分钟的总预算压成 40ms
+        QSignalSpy errors(&service, &Cloud3dService::errorCard);
+
+        service.start(QStringLiteral("wooden crate"), QString());
+
+        QTRY_COMPARE_WITH_TIMEOUT(errors.count(), 1, 5000);
+        QCOMPARE(errors.first().at(0).toString(), QStringLiteral("cloud3d-timeout"));
+        QVERIFY(errors.first().at(1).toString().contains(QStringLiteral("超过 15 分钟")));
+        QCOMPARE(service.isRunning(), false);
+        QCOMPARE(service.canRetry(), true);
+
+        // 超时后必须彻底停轮询，不能让任务在后台继续烧钱
+        const int pollsAtTimeout = endless->polls;
+        QTest::qWait(60);
+        QCOMPARE(endless->polls, pollsAtTimeout);
+        QCOMPARE(errors.count(), 1);
     }
 
     void serviceRestartUsesLatestProviderSettings()
