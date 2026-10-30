@@ -13,9 +13,10 @@
 
 namespace {
 
-// 讨论里的工具调用上限：一次问答的「看」不该超过 6 次，
-// 否则模型会没完没了地截图确认，用户等一分钟出不来一句话。
-constexpr int kMaxAskToolCalls = 6;
+// 讨论里的「查看轮次」上限：一次问答最多看 5 轮（每轮可并行看多个对象），
+// 否则模型会没完没了地截图确认，用户等一分钟出不来一句话。按轮而非按单个调用计，
+// 免得一次并行 inspect 五六个对象就被误判成「用完」。
+constexpr int kMaxAskRounds = 5;
 
 const QStringList kToolWhitelist{QStringLiteral("get_scene_info"), QStringLiteral("look")};
 
@@ -134,15 +135,45 @@ void DiscussionAgent::ask(const QString& area, const QString& systemPrompt,
     m_stream.clear();
     m_visible.clear();
     m_toolCalls = 0;
+    m_rounds = 0;
     m_inFlight = 0;
     m_roundDone = false;
+    m_needSummary = false;
+    m_summaryAttempted = false;
     // 就绪与否由调用方（CoreApp）体现在 withTools 上，这里不再判 m_mcp->isReady()
-    m_tools = withTools && m_mcp ? discussionTools(m_mcpTools) : QJsonArray{};
+    const bool useTools = withTools && m_mcp;
+    m_tools = useTools ? discussionTools(m_mcpTools) : QJsonArray{};
     m_messages = QJsonArray{QJsonObject{{"role", "system"}, {"content", systemPrompt}}};
     for (const QJsonValue& item : history)
         m_messages.append(item);
     m_messages.append(QJsonObject{{"role", "user"}, {"content", userText}});
+    // 带工具时先替模型跑一次 get_scene_info，把真实物体清单塞进上下文：
+    // 模型不必再猜名字、也不会因为「猜错→没找到→再猜」把查看轮次空烧光
+    if (useTools) {
+        seedSceneInfoThen();
+        return;
+    }
     streamOnce();
+}
+
+void DiscussionAgent::seedSceneInfoThen()
+{
+    const QString callId = QStringLiteral("seed-get-scene-info");
+    m_mcp->callTool(QStringLiteral("get_scene_info"), QJsonObject{},
+                    [this, callId](const QJsonValue& result, const QJsonObject& error) {
+                        // 以「模型自己调了 get_scene_info 并拿到结果」的形式写进历史，
+                        // 这样它开口时就已知场景里到底有哪些对象名
+                        m_messages.append(QJsonObject{
+                            {"role", "assistant"},
+                            {"content", QString()},
+                            {"tool_calls", QJsonArray{QJsonObject{
+                                {"id", callId},
+                                {"type", "function"},
+                                {"function", QJsonObject{{"name", QStringLiteral("get_scene_info")},
+                                                          {"arguments", QStringLiteral("{}")}}}}}}});
+                        m_messages.append(toolResultMessage(callId, result, error, nullptr));
+                        streamOnce();
+                    });
 }
 
 void DiscussionAgent::streamOnce()
@@ -167,6 +198,19 @@ void DiscussionAgent::streamOnce()
             m_visible += tail;
             emit delta(m_area, tail);
         }
+        if (m_needSummary) {
+            // 预算用完：清掉工具、追加一句「直接给结论」，再走一轮，保证用户拿到答案而不是空括号
+            m_needSummary = false;
+            m_summaryAttempted = true;
+            m_tools = QJsonArray{};
+            m_messages.append(QJsonObject{
+                {"role", "user"},
+                {"content", QStringLiteral("查看次数已用完。请立即基于以上已获取的信息给出结论，"
+                                           "不要再调用任何工具；没查到的部分如实说明。")}});
+            m_stream.clear();
+            streamOnce();
+            return;
+        }
         finishRound();
     };
     m_llm->chatStream(m_cfg, m_messages, m_tools, handlers, m_area);
@@ -186,14 +230,32 @@ void DiscussionAgent::finishRound()
 
 void DiscussionAgent::executeCalls(const QJsonArray& calls)
 {
-    if (m_toolCalls >= kMaxAskToolCalls) {
-        // 预算用完：这一轮当作「无工具」收尾，不再回喂，避免无限看图
-        const QString note = QStringLiteral("（查看次数已达上限，以下结论基于已看到的内容。）");
+    if (m_rounds >= kMaxAskRounds) {
+        // 已经强制总结过还想调工具：直接收尾，绝不无限循环
+        if (m_summaryAttempted) {
+            finishRound();
+            return;
+        }
+        // 预算用完：把这次工具请求记进历史并回喂「已用完」，标记需要强制总结；
+        // 真正的「无工具总结轮」交给本轮 onDone 触发，避免与它抢着双发 finished
+        const QString note = QStringLiteral("（查看次数已达上限，下面基于已看到的内容直接给结论。）");
         m_visible += note;
         emit delta(m_area, note);
-        finishRound();
+        m_messages.append(QJsonObject{{"role", "assistant"},
+                                      {"content", m_stream},
+                                      {"tool_calls", ToolBridge::internalCallsToWire(calls)}});
+        for (const QJsonValue& value : calls) {
+            const QJsonObject call = value.toObject();
+            m_messages.append(QJsonObject{{"role", "tool"},
+                                          {"tool_call_id", call.value(QStringLiteral("id")).toString()},
+                                          {"content", QJsonArray{QJsonObject{
+                                              {"type", "text"},
+                                              {"text", QStringLiteral("查看次数已达上限，请基于已看到的信息作答。")}}}}});
+        }
+        m_needSummary = true;
         return;
     }
+    ++m_rounds; // 这一轮真的会去看：轮次 +1（一轮里并行几个调用都算一轮）
     // 回喂历史必须转回 OpenAI wire format（与 AgentOrchestrator 同规则）
     m_messages.append(QJsonObject{{"role", "assistant"},
                                   {"content", m_stream},

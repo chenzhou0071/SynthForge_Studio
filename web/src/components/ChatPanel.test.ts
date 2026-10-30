@@ -1227,6 +1227,33 @@ describe("ChatPanel", () => {
     expect(wrapper.text()).toContain("会替换 Blender 当前场景");
   });
 
+  // 载入闸门扣住问题后，后端广播 loaded 要自动把那句话补发出去（不用手点两次）
+  it("auto-sends the held question once the scene finishes loading", async () => {
+    const { client, wrapper } = mountPanel(
+      "blender",
+      (fake) => {
+        fake.results.set("chat.send", { accepted: true });
+        fake.results.set("sceneLoad.request", { accepted: true, requestId: "load-1" });
+      },
+      { selectedAsset: "Props/desk/desk.blend" },
+    );
+    await flushPromises();
+
+    await wrapper.findAll(".chat-mode button")[0]!.trigger("click"); // 讨论
+    await wrapper.find("textarea").setValue("桌面多宽？");
+    await wrapper.find("button.primary").trigger("click");
+    await flushPromises();
+    // 第一次被闸门扣住：没有真的发 chat.send
+    expect(client.callsOf("chat.send")).toHaveLength(0);
+
+    client.emit("sceneLoad.loaded", { area: "blender", file: "desk" });
+    await flushPromises();
+    // 载入好了 → 自动补发那句话
+    const sent = client.callsOf("chat.send").at(-1)?.params as Record<string, unknown>;
+    expect(sent?.text).toBe("桌面多宽？");
+    expect(sent?.mode).toBe("ask");
+  });
+
   // 计划卡要把后端 plan.created 带来的档位、分区、动线显示出来
   it("shows the output shape, zones and motions on the plan card", async () => {
     const { client, wrapper } = mountPanel("blender");

@@ -104,6 +104,8 @@ private slots:
         QCOMPARE(steps.at(0).at(1).toString(), QStringLiteral("inspect_object"));
         // 走的是 execute_blender_code，但对模型只暴露 inspect_object
         QVERIFY(mcp.calls.contains(QStringLiteral("execute_blender_code")));
+        // 开口前服务端已替它跑了一次 get_scene_info（预取真实物体清单，省得猜名空烧）
+        QCOMPARE(mcp.calls.first(), QStringLiteral("get_scene_info"));
         QVERIFY(finished.at(0).at(1).toString().contains(QStringLiteral("1.4")));
     }
 
@@ -127,12 +129,13 @@ private slots:
         QCOMPARE(mcp.calls.size(), 0);
     }
 
-    void toolCallsAreCappedAtSixAndWrapUp()
+    void toolCallsAreCappedAndStillSummarize()
     {
         QList<MockLlmServer::Turn> turns;
-        for (int i = 0; i < 8; ++i)
+        // 6 个工具轮：前 5 轮真跑，第 6 轮触发按轮封顶 → 强制一次无工具总结轮（末轮文本）
+        for (int i = 0; i < 6; ++i)
             turns << toolTurn(QStringLiteral("look"));
-        turns << textTurn(QStringLiteral("看完了，说结论。"));
+        turns << textTurn(QStringLiteral("看完了，结论是灯杆该居中。"));
         MockLlmServer server(turns);
         QVERIFY(server.listen());
         LlmGateway llm;
@@ -146,17 +149,19 @@ private slots:
         agent.ask(QStringLiteral("blender"), QStringLiteral("系统"), QJsonArray{},
                   QStringLiteral("再看看"), true);
 
-        // 不封顶的话模型能「我再看一眼」看到天黑，用户等一分钟出不来一句话
+        // 封顶后不能只甩一句空括号：必须再走一轮给出真正的结论
         QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 8000);
         int running = 0;
         for (const QVariantList& args : steps) {
             if (args.at(2).toString() == QLatin1String("running"))
                 ++running;
         }
-        QCOMPARE(running, 6); // 每个调用有 running + done 两条，只数发起的
-        // 封顶后不再回喂：收尾语必须出现，且不能双发 finished
-        QVERIFY(finished.at(0).at(1).toString().contains(QStringLiteral("查看次数已达上限")));
-        QCOMPARE(finished.count(), 1);
+        QCOMPARE(running, 5); // 只真跑了 5 轮，第 6 轮被按轮封顶拦下
+        const QString shown = finished.at(0).at(1).toString();
+        QVERIFY2(shown.contains(QStringLiteral("已达上限")), qPrintable(shown));
+        QVERIFY2(shown.contains(QStringLiteral("灯杆该居中")), // 结论确实出来了
+                 qPrintable(shown));
+        QCOMPARE(finished.count(), 1); // 不双发
     }
 
     void execBlockStaysOutOfStreamedText()

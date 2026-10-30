@@ -143,6 +143,10 @@ const pendingLoad = ref<{
   path: string;
 } | null>(null);
 const loadedScene = ref("");
+// 讨论闸门拦下的那句话：载入成功或用户取消后自动补发，省得手动点两次
+const pendingAsk = ref("");
+// 已就这个资产弹过一次载入确认：取消后不再重复弹，允许纯文字继续
+const loadAskedFor = ref("");
 const unsubscribers: Array<() => void> = [];
 let streaming: ChatItem | null = null; // 指向 messages 里的流式气泡；必须是 reactive 代理，否则收口不触发重渲染
 // 用户已点停止：abort 前发出的帧可能晚到，不能让它们把 busy/气泡重新拉起来
@@ -490,7 +494,9 @@ onMounted(() => {
     }),
     props.client.on("sceneLoad.loaded", (data) => {
       const payload = data as { area?: string; file?: string };
-      if (payload?.area === props.area) loadedScene.value = payload.file ?? "";
+      if (payload?.area !== props.area) return;
+      loadedScene.value = payload.file ?? "";
+      flushPendingAsk(); // 载入好了，把刚才那句被闸门拦下的问题自动发出去
     }),
     props.client.on("sceneLoad.notice", (data) => {
       const payload = data as { area?: string; reason?: string };
@@ -501,6 +507,7 @@ onMounted(() => {
           ? "未连接 Blender，本轮只能凭文字讨论。"
           : "载入该资产的 .blend 失败，本轮只能凭文字讨论。",
       );
+      flushPendingAsk(); // 看不见也得把话说出去，退化成纯文字讨论
     }),
     props.client.on("error.card", (data) => {
       const card = data as {
@@ -566,8 +573,11 @@ async function send() {
       params.shape = effectiveShape.value; // 讨论也要知道在聊哪一档
       if (props.selectedAsset) {
         params.asset = props.selectedAsset;
-        if (!loadedScene.value && !pendingLoad.value) {
-          // 先把「会清空 Blender」问清楚，再让模型开口；否则一句话就把人场景换了
+        if (!loadedScene.value && loadAskedFor.value !== props.selectedAsset) {
+          // 第一次讨论这个未载入的资产：先弹无超时确认，扣住这句话；
+          // 载入成功或用户取消后由 flushPendingAsk 自动补发，不用手点两次
+          loadAskedFor.value = props.selectedAsset;
+          pendingAsk.value = text;
           void props.client.request("sceneLoad.request", {
             area: props.area,
             asset: props.selectedAsset,
@@ -576,6 +586,7 @@ async function send() {
           busy.value = false;
           return;
         }
+        // 已弹过一次（取消后重来 → 纯文字）或场景已载入（→ 带只读工具）：正常发
       }
     } else if (modify) {
       params.mode = "modify";
@@ -600,6 +611,15 @@ async function send() {
     pushError(error instanceof Error ? error.message : "发送失败");
   }
   scrollToBottom(true);
+}
+
+// 载入确认结束后，把被闸门扣住的那句话补发出去（loaded / notice / 取消都会走到这里）
+function flushPendingAsk() {
+  if (!pendingAsk.value) return;
+  const question = pendingAsk.value;
+  pendingAsk.value = "";
+  draft.value = question;
+  void send();
 }
 
 // 草稿已转成正式指令：规划/修改在跑，显示停止与转圈
@@ -886,7 +906,11 @@ function onKeydown(event: KeyboardEvent) {
       v-if="pendingLoad"
       :client="client"
       :load="pendingLoad"
-      @decided="pendingLoad = null"
+      @accepted="pendingLoad = null"
+      @declined="
+        pendingLoad = null;
+        flushPendingAsk();
+      "
     />
   </section>
 </template>

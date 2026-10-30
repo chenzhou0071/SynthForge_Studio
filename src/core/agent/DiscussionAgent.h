@@ -40,6 +40,7 @@ signals:
 
 private:
     void streamOnce(); // 发一轮对话：流式过滤 + 工具回调 + 无工具时收尾
+    void seedSceneInfoThen(); // 先替模型跑一次 get_scene_info，把真实物体清单塞进上下文再开聊
     void executeCalls(const QJsonArray& calls);
     void finishRound();
 
@@ -53,6 +54,9 @@ private:
     QString m_stream;
     QString m_visible;
     int m_toolCalls = 0;
+    int m_rounds = 0; // 查看「轮次」：一轮可并行看多个对象，按轮封顶而不是按单个调用
     int m_inFlight = 0;      // 本轮在途工具调用数：归零才继续下一轮对话
     bool m_roundDone = false; // 防封顶收尾与 onDone 双发 finished
+    bool m_needSummary = false;    // 工具预算用完：本轮结束后强制一次「无工具直接总结」
+    bool m_summaryAttempted = false; // 已强制总结过：绝不再循环第二轮
 };

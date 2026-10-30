@@ -7,7 +7,7 @@ const props = defineProps<{
   // 后端 sceneLoad.confirm 下发的待确认载入
   load: { area: string; requestId: string; file: string; path: string };
 }>();
-const emit = defineEmits<{ (e: "decided"): void }>();
+const emit = defineEmits<{ (e: "accepted"): void; (e: "declined"): void }>();
 
 const error = ref("");
 const busy = ref(false);
@@ -27,7 +27,7 @@ async function accept() {
           : (res.error ?? "载入失败");
       return;
     }
-    emit("decided");
+    emit("accepted");
   } catch (e) {
     error.value = e instanceof Error ? e.message : "载入失败";
   } finally {
@@ -42,7 +42,7 @@ async function decline() {
     .catch(() => {
       /* 取消失败不阻断：窗口已关，后端最多留一个未被消费的 requestId */
     });
-  emit("decided");
+  emit("declined");
   busy.value = false;
 }
 </script>

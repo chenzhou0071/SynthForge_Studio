@@ -20,6 +20,7 @@ struct StreamState
 {
     SseParser parser;
     QHash<int, QJsonObject> toolCalls; // index -> {id, name, arguments(字符串累加)}
+    QByteArray rawHead;                // 截存响应开头字节：出错时 body 已被 SSE 解析器吃掉，靠它还原原因
     bool done = false;
 };
 
@@ -70,6 +71,9 @@ void LlmGateway::chatStream(const LlmConfig& cfg, const QJsonArray& messages,
                             const QString& tag)
 {
     QJsonObject body{{"model", cfg.model}, {"messages", messages}, {"stream", true}};
+    // 显式关闭思考模式：DeepSeek 新模型（flash 等）默认开启 thinking，会在多轮工具回喂时
+    // 强制要求把 reasoning_content 原样传回，否则 400。本项目按非思考用，直接关掉。
+    body.insert(QStringLiteral("thinking"), QJsonObject{{QStringLiteral("type"), QStringLiteral("disabled")}});
     if (!tools.isEmpty())
         body.insert(QStringLiteral("tools"), tools); // 已是 OpenAI tools，转换由调用方经 ToolBridge 完成
 
@@ -127,15 +131,25 @@ void LlmGateway::chatStream(const LlmConfig& cfg, const QJsonArray& messages,
     };
 
     connect(reply, &QNetworkReply::readyRead, this, [reply, state, process]() {
-        process(state->parser.feed(reply->readAll()));
+        const QByteArray chunk = reply->readAll();
+        if (state->rawHead.size() < 4096)
+            state->rawHead.append(chunk); // 只留开头 4KB：够装下错误 body，又不给正常长流占内存
+        process(state->parser.feed(chunk));
     });
     connect(reply, &QNetworkReply::finished, this,
             [this, reply, state, process, handlers]() {
                 m_replies.remove(reply);
                 m_tags.remove(reply);
                 if (reply->error() != QNetworkReply::NoError) {
-                    if (!state->done && handlers.onError)
-                        handlers.onError(reply->errorString());
+                    if (!state->done && handlers.onError) {
+                        // 只报 errorString 会丢掉服务端真正的原因（400 body 里写着哪条消息不合法）；
+                        // body 已被 readyRead 喂进 SSE 解析器，靠 rawHead 还原
+                        const QString detail = QString::fromUtf8(state->rawHead).trimmed();
+                        handlers.onError(detail.isEmpty()
+                                             ? reply->errorString()
+                                             : QStringLiteral("%1：%2")
+                                                   .arg(reply->errorString(), detail));
+                    }
                 } else if (!state->done) {
                     // 有些服务端最后一帧不带空行：补一个帧结束符冲出来
                     process(state->parser.feed("\n\n"));
