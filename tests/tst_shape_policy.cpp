@@ -1,4 +1,5 @@
 #include <QtTest>
+#include <QFile>
 
 #include "core/agent/ShapePolicy.h"
 
@@ -81,6 +82,19 @@ private slots:
             << QStringLiteral("diorama") << QStringLiteral("没有建筑主题就不要凭空造房子");
         QTest::newRow("diorama-balance-volume")
             << QStringLiteral("diorama") << QStringLiteral("并列元素按需求配平体量");
+        // 尺寸不锁死：用户给了数字就用用户的，微缩只是可选而非强制
+        QTest::newRow("diorama-user-size-wins")
+            << QStringLiteral("diorama") << QStringLiteral("用户显式指定了底座尺寸");
+        QTest::newRow("diorama-no-forced-miniature")
+            << QStringLiteral("diorama") << QStringLiteral("不强制微缩");
+        // 城镇/街景翻车复盘：两塔压全场、窗户用自发光面片、路建成歪平面，
+        // 这三条以前只在摘要提示词里，没进建造端纪律，模型照样犯
+        QTest::newRow("diorama-height-balance")
+            << QStringLiteral("diorama") << QStringLiteral("压垮全场");
+        QTest::newRow("diorama-no-emissive-window")
+            << QStringLiteral("diorama") << QStringLiteral("自发光面片");
+        QTest::newRow("diorama-road-not-tilted-plane")
+            << QStringLiteral("diorama") << QStringLiteral("歪斜的深色平面");
         // 开放场景：沿主轴展开、长条不许截断、动画要能带进 Unity
         QTest::newRow("open-no-square-boundary")
             << QStringLiteral("open") << QStringLiteral("不设方形边界");
@@ -154,6 +168,13 @@ private slots:
             << QStringLiteral("diorama") << QStringLiteral("截图 1 次");
         QTest::newRow("diorama-fix-then-confirm")
             << QStringLiteral("diorama") << QStringLiteral("修完最多再截 1 次确认");
+        // 盒式舞台那 1 张俯视截图必须真的核对配平 / 白发光窗片 / 歪平面路
+        QTest::newRow("diorama-check-balance-overhead")
+            << QStringLiteral("diorama") << QStringLiteral("体量是否配平");
+        QTest::newRow("diorama-check-emissive-window")
+            << QStringLiteral("diorama") << QStringLiteral("自发光面片");
+        QTest::newRow("diorama-check-road-tilt")
+            << QStringLiteral("diorama") << QStringLiteral("歪斜的深色平面");
         QTest::newRow("open-three-depths")
             << QStringLiteral("open") << QStringLiteral("近景、中景、远景各一次");
         QTest::newRow("open-frame-set") << QStringLiteral("open") << QStringLiteral("frame_set");
@@ -202,6 +223,8 @@ private slots:
         // 开放场景必须被要求输出真实 zones（否则分区永远走代码兜底的 0~20/20~60 套话）
         QVERIFY(planSystemPromptFor(OutputShape::OpenScene).contains(QStringLiteral("zones")));
         QVERIFY(planSystemPromptFor(OutputShape::OpenScene).contains(QStringLiteral("禁止套用")));
+        // 盒式舞台规划器必须被要求体量配平（否则又规划成两座塔压垮全场）
+        QVERIFY(planSystemPromptFor(OutputShape::Diorama).contains(QStringLiteral("压垮全场")));
     }
 
     // 基线：盒式舞台的规划器提示词锁死这份「主题驱动」文本（批次2 起取代旧的
@@ -224,9 +247,27 @@ private slots:
             "where 只写相对关系不写绝对坐标"
             "（如「主体靠后、正面朝 -Y，前方留空地」「并列元素分列主体两侧，互不遮挡」）。"
             "rules 只写本任务特有、跨组生效的约束（如「主体之间不互相遮挡」「重复元素等距排布」），"
-            "不要重复贴地、不重叠、单位这类通用规则。";
+            "不要重复贴地、不重叠、单位这类通用规则。"
+            "另外：盒式舞台的 groups 与 placements 必须保持体量配平——"
+            "不要规划成一两栋超高楼压垮全场、其余全是碎片；"
+            "并列主体按需求配平高度与占地，长条结构（道路、街边）按走向分段并贴齐底座边，"
+            "别规划成一整张歪斜平面。";
         QCOMPARE(planSystemPromptFor(OutputShape::Diorama),
                  QString::fromUtf8(kDioramaPlanBaseline));
+    }
+
+    // 摘要模板（summarizer.md）才是把 1.2m 这类小尺寸写进提示词的那一步：
+    // 它不能再逼模型「尺度不必大」，且必须把尺寸交给用户/主体反推。
+    void dioramaSummarizerLeavesScaleToUser()
+    {
+        Q_INIT_RESOURCE(prompts);
+        QFile file(QStringLiteral(":/prompts/summarizer.md"));
+        QVERIFY2(file.open(QIODevice::ReadOnly), "读不到盒式舞台摘要模板 summarizer.md");
+        const QString text = QString::fromUtf8(file.readAll());
+        QVERIFY2(!text.contains(QStringLiteral("尺度不必大")),
+                 "仍残留「尺度不必大」，会把底座压成微缩默认");
+        QVERIFY2(text.contains(QStringLiteral("用户显式指定")),
+                 "缺「用户显式指定尺寸优先」的授权，模型会自作主张缩成小摆件");
     }
 };
 

@@ -189,6 +189,9 @@ private slots:
         QVERIFY(server.requestAt(0).contains(QStringLiteral("简体中文"))); // 面向用户的话必须是中文
         QVERIFY(server.requestAt(0).contains(QStringLiteral("不要自行导出"))); // 中途导出会撞名生成 _2
         QVERIFY(server.requestAt(0).contains(QStringLiteral("底座边长按真实尺度反推"))); // 不能把主体做小
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("压垮全场"))); // 体量配平，别建两座塔
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("自发光面片"))); // 窗户招牌禁悬空自发光片
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("歪斜的深色平面"))); // 路/水别糊一张歪平面
         QVERIFY(server.requestAt(0).contains(QStringLiteral("与主题无关"))); // 合理补充也有限度
         QVERIFY(server.requestAt(0).contains(QStringLiteral("真实光源"))); // 灯光必须是真实光源
         QVERIFY(server.requestAt(0).contains(QStringLiteral("飞虫"))); // 不默认生成飞虫/湿地面
