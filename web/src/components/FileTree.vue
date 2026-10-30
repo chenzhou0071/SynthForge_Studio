@@ -47,6 +47,16 @@ watch(menu, async (m) => {
   menuTop.value = contextMenuTop(m.y, menuEl.value?.offsetHeight ?? 0, window.innerHeight);
 });
 const message = ref<{ text: string; kind: "notice" | "error" } | null>(null);
+// 提示几秒后自动消失：后台偶发的超时不该在树底常驻一条红字吓人
+let messageTimer: ReturnType<typeof setTimeout> | null = null;
+function flashMessage(kind: "notice" | "error", text: string, ms = 6000) {
+  message.value = { kind, text };
+  if (messageTimer) clearTimeout(messageTimer);
+  messageTimer = setTimeout(() => {
+    message.value = null;
+    messageTimer = null;
+  }, ms);
+}
 const tree = ref<DirNode>({ name: "", path: "", dirs: [], files: [] });
 // 默认全展开，只记收起的目录；树刷新后已有目录的展开状态不会被重置
 const collapsed = ref(new Set<string>());
@@ -260,9 +270,13 @@ async function runOp(op: Op) {
     if (op !== "reveal") void loadTree();
   } catch (cause) {
     const text = cause instanceof Error ? cause.message : String(cause);
-    message.value = text.includes("unknown method: fs.operate")
-      ? { kind: "notice", text: "文件操作尚未接入（P4 开发中）" }
-      : { kind: "error", text };
+    if (text.includes("unknown method: fs.operate")) {
+      flashMessage("notice", "文件操作尚未接入（P4 开发中）");
+    } else if (text.startsWith("timeout:")) {
+      flashMessage("notice", "后台正忙，文件操作超时了，稍后再试一次");
+    } else {
+      flashMessage("error", text);
+    }
   }
 }
 </script>

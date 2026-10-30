@@ -45,7 +45,7 @@ export class WsClient {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`timeout: ${method}`));
-      }, 30000);
+      }, 60000); // 60s：大场景导出/刷新时后端主线程会短暂无响应，30s 太容易误报超时
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
       const payload = JSON.stringify({ id, method, params });
       if (this.isOpen && this.socket) this.socket.send(payload);
