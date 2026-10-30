@@ -3,13 +3,10 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import { isCloudConfigured } from "../chat/cloud";
 import { toChatItems } from "../chat/history";
 import type { AssetData, ChatItem, PlanGroup } from "../chat/history";
-import { renderMarkdown } from "../chat/markdown";
 import type { WsClient } from "../ws/WsClient";
-import AssetCard from "./AssetCard.vue";
-import DraftCard from "./DraftCard.vue";
+import ChatMessage from "./ChatMessage.vue";
 import FolderPicker from "./FolderPicker.vue";
 import type { FolderNode } from "./FolderPicker.vue";
-import PlanCard from "./PlanCard.vue";
 import SceneLoadDialog from "./SceneLoadDialog.vue";
 
 type Area = "blender" | "unity";
@@ -783,69 +780,20 @@ function onKeydown(event: KeyboardEvent) {
         <div v-if="loadingOlder" class="older-loading">加载更早的消息…</div>
         <p v-if="messages.length === 0" class="chat-empty">描述你要生成的资产或要做的修改。</p>
 
-        <template v-for="(message, index) in messages" :key="index">
-          <div v-if="message.role === 'image'" class="bubble image">
-            <img class="shot" :src="message.dataUrl" :alt="message.caption ?? '任务截图'" />
-            <span v-if="message.caption" class="caption">{{ message.caption }}</span>
-          </div>
-          <div v-else-if="message.role === 'error'" class="error-card">
-            <strong>请求失败</strong>
-            <p>{{ message.content }}</p>
-            <button
-              v-if="message.resumable"
-              class="resume"
-              :disabled="busy"
-              @click="resumeWork(message)"
-            >
-              继续工作
-            </button>
-            <button
-              v-else-if="message.retryable"
-              class="resume"
-              :disabled="busy"
-              @click="retryCloudTask(message)"
-            >
-              重试
-            </button>
-            <button
-              v-else-if="message.settings"
-              class="resume"
-              @click="emit('openSettings', message.settings)"
-            >
-              去设置
-            </button>
-          </div>
-          <div v-else-if="message.role === 'asset' && message.asset" class="draft-row">
-            <AssetCard :asset="message.asset" @preview="emit('preview', $event)" />
-          </div>
-          <div v-else-if="message.role === 'draft'" class="draft-row">
-            <DraftCard
-              :client="client"
-              :id="message.id"
-              :content="message.content ?? ''"
-              :state="message.state === 'cancelled' ? 'cancelled' : 'pending'"
-              :origin="message.origin"
-              @sent="onDraftSent"
-            />
-          </div>
-          <div v-else-if="message.role === 'plan' && message.plan" class="draft-row">
-            <PlanCard
-              :client="client"
-              :area="area"
-              :plan="message.plan"
-              :id="message.id"
-              :state="message.state"
-            />
-          </div>
-          <div v-else-if="message.role === 'group'" class="group-divider">
-            <span>第 {{ message.groupIndex }}/{{ message.groupCount }} 组 · {{ message.title }}</span>
-          </div>
-          <div v-else class="bubble" :class="[message.role, { streaming: message.streaming }]">
-            <!-- 流式期间也走 markdown：否则 ** 和 ## 会原样露出 -->
-            <div class="md" v-html="renderMarkdown(message.content ?? '')" />
-            <i v-if="message.streaming" class="caret" />
-          </div>
-        </template>
+        <!-- 每条消息交给子组件渲染：流式时只有这一条因 item.content 变化而重渲，不牵动整个列表 -->
+        <ChatMessage
+          v-for="(message, index) in messages"
+          :key="index"
+          :item="message"
+          :area="area"
+          :client="client"
+          :busy="busy"
+          @preview="(path: string) => emit('preview', path)"
+          @open-settings="(target: 'agent' | 'cloud') => emit('openSettings', target)"
+          @resume="resumeWork"
+          @retry="retryCloudTask"
+          @draft-sent="onDraftSent"
+        />
 
         <div v-if="showPending" class="bubble assistant pending">
           <span class="dot" /><span class="dot" /><span class="dot" />
@@ -1087,38 +1035,6 @@ function onKeydown(event: KeyboardEvent) {
   color: #cca700;
 }
 
-.bubble.image {
-  padding: 6px;
-}
-
-.shot {
-  display: block;
-  max-width: 100%;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-}
-
-.caption {
-  display: block;
-  margin-top: 4px;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.error-card .resume {
-  margin-top: 6px;
-  background: var(--accent);
-  border: 0;
-  color: #fff;
-  border-radius: 3px;
-  padding: 4px 12px;
-  font-size: 12px;
-}
-
-.error-card .resume:disabled {
-  opacity: 0.5;
-}
-
 .cloud-progress {
   height: 2px;
   margin-top: 2px;
@@ -1169,21 +1085,6 @@ function onKeydown(event: KeyboardEvent) {
 .asset-chip button:hover {
   color: var(--text);
   border-color: var(--muted);
-}
-
-.group-divider {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.group-divider::before,
-.group-divider::after {
-  content: "";
-  flex: 1;
-  border-top: 1px solid var(--border);
 }
 
 .pending {
