@@ -73,7 +73,14 @@ private slots:
         QTest::newRow("diorama-fx-collection")
             << QStringLiteral("diorama") << QStringLiteral("必须放进名为 FX 的集合里");
         QTest::newRow("diorama-orientation")
-            << QStringLiteral("diorama") << QStringLiteral("主建筑正面朝 -Y");
+            << QStringLiteral("diorama") << QStringLiteral("主体正面朝 -Y");
+        // D6 主题驱动：盒式舞台不再预设建筑，公园/沙滩不能被迫长出房子
+        QTest::newRow("diorama-theme-driven")
+            << QStringLiteral("diorama") << QStringLiteral("主体由用户需求决定");
+        QTest::newRow("diorama-no-forced-building")
+            << QStringLiteral("diorama") << QStringLiteral("没有建筑主题就不要凭空造房子");
+        QTest::newRow("diorama-balance-volume")
+            << QStringLiteral("diorama") << QStringLiteral("并列元素按需求配平体量");
         // 开放场景：沿主轴展开、长条不许截断、动画要能带进 Unity
         QTest::newRow("open-no-square-boundary")
             << QStringLiteral("open") << QStringLiteral("不设方形边界");
@@ -110,7 +117,7 @@ private slots:
         QTest::newRow("prop-no-baseplate-rule")
             << QStringLiteral("prop") << QStringLiteral("正方形底座");
         QTest::newRow("prop-no-orientation-rule")
-            << QStringLiteral("prop") << QStringLiteral("主建筑正面朝 -Y");
+            << QStringLiteral("prop") << QStringLiteral("主体正面朝 -Y");
         QTest::newRow("prop-no-truncation-rule")
             << QStringLiteral("prop") << QStringLiteral("中途截断");
         QTest::newRow("prop-no-animation-rule")
@@ -194,27 +201,29 @@ private slots:
         QVERIFY(planSystemPromptFor(OutputShape::OpenScene).contains(QStringLiteral("主轴")));
     }
 
-    // 黄金基线：盒式舞台这一档必须逐字不变。常量是从分档前
-    // AgentOrchestrator.cpp 的 kPlanSystemPrompt 原样抄下来的，
-    // 共用正文里丢一个字（哪怕只是举例的括号）这条就红。
-    void dioramaPlanPromptIsVerbatimLegacyText()
+    // 基线：盒式舞台的规划器提示词锁死这份「主题驱动」文本（批次2 起取代旧的
+    // 「建筑/室内中心」基线）。它不再是「改造前逐字」，而是「此后不得无意漂移」——
+    // 共用正文或施工顺序里丢一个字（哪怕只是举例的括号）这条就红。
+    void dioramaPlanPromptMatchesApprovedBaseline()
     {
-        static const char* kLegacyPlanSystemPrompt =
+        static const char* kDioramaPlanBaseline =
             "你是低模场景建造的规划器。只输出一个 JSON 对象，不要任何解释或代码块围栏，格式："
             "{\"rules\":[\"本任务特有的跨组约束\"],\"groups\":[{\"title\":\"分组名\","
             "\"items\":[\"物体1\"],"
             "\"placements\":[{\"name\":\"物体1\",\"where\":\"相对位置与朝向\"}],"
             "\"acceptance\":\"自检时截图检查什么\"}]}。"
             "要求：3~6 组，覆盖用户提示词中全部必须独立的物体与数量下限；按施工顺序排列"
-            "（底座环境 → 建筑外观 → 室内陈设 → 灯光特效）。"
-            "可以在主题内合理补充道具（车辆、路牌、摊贩等），但不得添加与主题无关的物体，"
-            "也不得为凑组数拆出杂物组；留白优先于堆砌。"
-            "items 里的每个物体必须在 placements 里有一条同名条目；where 只写相对关系不写绝对坐标"
-            "（如「商店北侧边缘，正门朝 -Y」「招牌在正门上方，离地 2.8 米」）。"
-            "rules 只写本任务特有、跨组生效的约束（如「树不遮挡招牌」「路灯每 8 米一盏」），"
+            "（底座环境 → 主体元素 → 点缀细节 → 灯光氛围）。"
+            "可以在主题内合理补充贴合主题的点缀（如公园补长椅垃圾桶、沙滩补遮阳伞贝壳），"
+            "但不得添加与主题无关的物体（如给公园塞店铺摊贩），也不得为凑组数拆出杂物组；"
+            "留白优先于堆砌。"
+            "items 里的每个物体必须在 placements 里有一条同名条目；"
+            "where 只写相对关系不写绝对坐标"
+            "（如「主体靠后、正面朝 -Y，前方留空地」「并列元素分列主体两侧，互不遮挡」）。"
+            "rules 只写本任务特有、跨组生效的约束（如「主体之间不互相遮挡」「重复元素等距排布」），"
             "不要重复贴地、不重叠、单位这类通用规则。";
         QCOMPARE(planSystemPromptFor(OutputShape::Diorama),
-                 QString::fromUtf8(kLegacyPlanSystemPrompt));
+                 QString::fromUtf8(kDioramaPlanBaseline));
     }
 };
 

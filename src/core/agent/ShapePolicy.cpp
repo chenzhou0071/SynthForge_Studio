@@ -22,12 +22,13 @@ QString planJsonSpec(int minGroups, int maxGroups, const QString& order)
                "\"acceptance\":\"自检时截图检查什么\"}]}。"
                "要求：%1~%2 组，覆盖用户提示词中全部必须独立的物体与数量下限；按施工顺序排列"
                "（%3）。"
-               "可以在主题内合理补充道具（车辆、路牌、摊贩等），但不得添加与主题无关的物体，"
-               "也不得为凑组数拆出杂物组；留白优先于堆砌。"
+               "可以在主题内合理补充贴合主题的点缀（如公园补长椅垃圾桶、沙滩补遮阳伞贝壳），"
+               "但不得添加与主题无关的物体（如给公园塞店铺摊贩），也不得为凑组数拆出杂物组；"
+               "留白优先于堆砌。"
                "items 里的每个物体必须在 placements 里有一条同名条目；"
                "where 只写相对关系不写绝对坐标"
-               "（如「商店北侧边缘，正门朝 -Y」「招牌在正门上方，离地 2.8 米」）。"
-               "rules 只写本任务特有、跨组生效的约束（如「树不遮挡招牌」「路灯每 8 米一盏」），"
+               "（如「主体靠后、正面朝 -Y，前方留空地」「并列元素分列主体两侧，互不遮挡」）。"
+               "rules 只写本任务特有、跨组生效的约束（如「主体之间不互相遮挡」「重复元素等距排布」），"
                "不要重复贴地、不重叠、单位这类通用规则。")
         .arg(minGroups)
         .arg(maxGroups)
@@ -109,12 +110,13 @@ QString planSystemPromptFor(OutputShape shape)
         return planJsonSpec(policy.minGroups, policy.maxGroups,
                             QStringLiteral(
                                 "地面与主轴 → 近景分区 → 中景分区 → 远景分区，"
-                                "同一分区的物体放在同一组"));
+                                "同一分区的物体放在同一组；每组必须在 items 里列出该区的具体物体、"
+                                "并在 placements 给出各自相对位置，不能只写分组名与验收"));
     case OutputShape::Diorama:
         break;
     }
     return planJsonSpec(policy.minGroups, policy.maxGroups,
-                        QStringLiteral("底座环境 → 建筑外观 → 室内陈设 → 灯光特效"));
+                        QStringLiteral("底座环境 → 主体元素 → 点缀细节 → 灯光氛围"));
 }
 
 QString shapeDiscipline(OutputShape shape)
@@ -149,12 +151,15 @@ QString shapeDiscipline(OutputShape shape)
     return QStringLiteral(
         "盒式舞台档纪律（本档专用，逐条执行）：\n"
         "D1. 地面是一个完整的正方形底座，所有元素都落在底座内，不得伸出边缘。\n"
-        "D2. 底座边长按真实尺度反推：放得下主体完整立面、入口前至少 2 米人行道"
-        "与近景道具；不得为了压缩画面把主体、门窗或道具做小。\n"
+        "D2. 底座边长按真实尺度反推：放得下主体完整形态与近景元素；"
+        "不得为了压缩画面把主体或任何并列元素做小。\n"
         "D3. 构图紧凑、有近 / 中 / 远三层纵深，呈现小巧精致的模型感。\n"
         "D4. 氛围层（雾、体积光、粒子）照做，但必须放进名为 FX 的集合里"
         "（FX 集合不会进入 glb/fbx，只在 .blend 里保留）。\n"
-        "D5. 场景中心在原点，主建筑正面朝 -Y，人行道或主要动线沿 X 轴展开。");
+        "D5. 场景中心在原点，主体正面朝 -Y，主要动线沿 X 轴展开。\n"
+        "D6. 主体由用户需求决定，可以是建筑，也可以是自然景观（沙滩、公园、温泉等）；"
+        "没有建筑主题就不要凭空造房子或店铺；并列元素按需求配平体量，"
+        "不要为突出一个而压缩其它。");
 }
 
 QString shapeSelfCheck(OutputShape shape)
