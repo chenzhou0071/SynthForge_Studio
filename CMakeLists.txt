@@ -54,7 +54,9 @@ qt_add_resources(synthforge_core "prompts"
           "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/summarizer-cloud3d.md"
           "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/summarizer-prop.md"
           "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/summarizer-open.md"
-          "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/ask.md")
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/ask.md"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/ask-prop.md"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/prompts/ask-open.md")
 
 enable_testing()
 

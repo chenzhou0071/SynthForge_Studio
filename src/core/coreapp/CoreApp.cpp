@@ -1242,10 +1242,21 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         }
 
         const QString asset = params.value(QStringLiteral("asset")).toString();
-        QFile tpl(QStringLiteral(":/prompts/ask.md"));
+        // 讨论模板按档位选：道具/开放各有专属节标题与要点，混用会把草稿写成别的档
+        const OutputShape askShape =
+            shapeFromString(params.value(QStringLiteral("shape")).toString());
+        QFile tpl(shapePolicy(askShape).askTemplate);
         QString system;
         if (tpl.open(QIODevice::ReadOnly | QIODevice::Text))
             system = QString::fromUtf8(tpl.readAll());
+        if (system.isEmpty()) {
+            // 档位模板丢了不能继续聊：没有约束的讨论会把草稿写成别的档
+            m_ws->broadcastEvent(
+                QStringLiteral("error.card"),
+                QJsonObject{{"area", area}, {"reason", "prompt-template-missing"}});
+            return QJsonValue(QJsonObject{{"accepted", false},
+                                          {"reason", "prompt-template-missing"}});
+        }
         // 修改入口是同基名 .blend；只看所选文件会把只有 glb 的云资产误判成可修改
         QFileInfo sourceFile;
         if (!asset.isEmpty()) {
@@ -1284,6 +1295,13 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         }
         system.replace(QStringLiteral("{{assets}}"),
                        assetLines.isEmpty() ? QStringLiteral("（空）") : assetLines);
+        // 本轮到底能不能看 Blender：连上、已载入场景、门禁空闲三者齐备才行；
+        // 工具为空时必须让模型知道自己看不见，否则它会装作读过场景编参数
+        const bool canSee = m_blender->isReady() && !m_loadedScenes.value(area).isEmpty()
+                            && !m_blenderGate.isBusy();
+        system.replace(QStringLiteral("{{scene_access}}"),
+                       canSee ? QStringLiteral("可读取当前 Blender 场景（get_scene_info / look / inspect_object）")
+                              : QStringLiteral("无法读取：本轮无法读取 Blender 实际参数，只能凭文字讨论"));
 
         // 草稿行要靠这三个复原（资产、档位、原始需求）：与摘要草稿一致走 draft.meta
         m_askAsset.insert(area, asset);
@@ -1296,14 +1314,11 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         m_askWait.insert(area, taskId);
         m_tasks->enqueue(Task{
             taskId, area, QString(),
-            [this, area, cfg, system, history, text](const QString&, TaskManager*) {
-                // 就绪与否、有没有载入场景、Blender 忙不忙，决定这轮能不能真的「看」场景；
-                // 任一不满足就退回纯文字讨论，不报错打断聊天
-                const bool withTools = m_blender->isReady()
-                    && !m_loadedScenes.value(area).isEmpty() && !m_blenderGate.isBusy();
+            [this, area, cfg, system, history, text, canSee](const QString&, TaskManager*) {
+                // 与上面 scene_access 同一个 canSee：提示说「看不见」，就真的不发工具
                 m_ask->setModelConfig(cfg);
                 m_ask->setMcpTools(m_blenderTools); // McpRuntime::toolsChanged 缓存的原始 tools
-                m_ask->ask(area, system, history, text, withTools);
+                m_ask->ask(area, system, history, text, canSee);
             }});
         return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
     }
@@ -1350,7 +1365,9 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         }
         m_pendingDraftAsset.insert(area, QString());
         m_pendingDraftSource.insert(area, text);
-        const QString shape = m_uiState->shape();
+        // 优先取请求里的档位（前端刚点开关、ui.ini 可能还没落盘的竞态），取不到再读 ui.ini
+        const QString requestShape = params.value(QStringLiteral("shape")).toString();
+        const QString shape = requestShape.isEmpty() ? m_uiState->shape() : requestShape;
         m_pendingDraftShape.insert(area, shape);
         m_summarizer->generate({area, text, QStringLiteral("lowpoly"), {}, {},
                                 shape}); // 档位取界面开关，模板按三档分叉

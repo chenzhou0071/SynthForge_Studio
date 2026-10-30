@@ -498,6 +498,56 @@ private slots:
         }
     }
 
+    // 讨论模板按档位选：道具档不得带盒式舞台的「正方形底座」，且边界要在提示词里写死
+    void askUsesPropTemplateWhenShapeIsProp()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("先聊聊尺寸。"))});
+        QVERIFY(server.listen());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        CoreApp app({dir.path(), true, dir.filePath(QStringLiteral("library"))});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+        QVERIFY(configureLlm(client, server.baseUrl()).contains(QStringLiteral("result")));
+
+        client.request(QStringLiteral("chat.send"),
+                       {{QStringLiteral("area"), QStringLiteral("blender")},
+                        {QStringLiteral("mode"), QStringLiteral("ask")},
+                        {QStringLiteral("shape"), QStringLiteral("prop")},
+                        {QStringLiteral("text"), QStringLiteral("做个书桌怎么样？")}});
+        QTRY_VERIFY_WITH_TIMEOUT(server.requestCount() >= 1, 10000);
+        const QString sent = systemPromptAt(server, 0);
+        QVERIFY2(sent.contains(QStringLiteral("道具")), qPrintable(sent));
+        QVERIFY(!sent.contains(QStringLiteral("正方形底座")));
+        // 讨论的边界：能给「看」的能力，也必须禁「改」
+        QVERIFY(sent.contains(QStringLiteral("绝对不要修改场景")));
+        QVERIFY(sent.contains(QStringLiteral("inspect_object")));
+    }
+
+    // 没连 Blender：本轮没有只读工具，模板必须明说看不见场景，别让模型装作看过
+    void askWithoutBlendTellsModelItCannotLook()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("只能凭文字聊。"))});
+        QVERIFY(server.listen());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        CoreApp app({dir.path(), true, dir.filePath(QStringLiteral("library"))});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+        QVERIFY(configureLlm(client, server.baseUrl()).contains(QStringLiteral("result")));
+
+        client.request(QStringLiteral("chat.send"),
+                       {{QStringLiteral("area"), QStringLiteral("blender")},
+                        {QStringLiteral("mode"), QStringLiteral("ask")},
+                        {QStringLiteral("text"), QStringLiteral("这张桌子怎么改")}});
+        QTRY_VERIFY_WITH_TIMEOUT(server.requestCount() >= 1, 10000);
+        QVERIFY2(systemPromptAt(server, 0).contains(
+                     QStringLiteral("本轮无法读取 Blender 实际参数")),
+                 qPrintable(systemPromptAt(server, 0)));
+    }
+
     // 重新生成失败也要回一条 draft.failed：前端靠它停转圈、恢复按钮
     void draftRegenerateFailureEmitsFailedEvent()
     {
