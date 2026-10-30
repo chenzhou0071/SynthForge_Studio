@@ -2,6 +2,7 @@
 
 #include "core/agent/AgentOrchestrator.h"
 #include "core/agent/AskReply.h"
+#include "core/agent/DiscussionAgent.h"
 #include "core/agent/ShapePolicy.h"
 #include "core/agent/SceneLoader.h"
 #include "core/agent/SummarizerAgent.h"
@@ -203,6 +204,65 @@ bool CoreApp::start()
                 }
                 m_ws->broadcastEvent(QStringLiteral("error.card"),
                                      QJsonObject{{"area", area}, {"reason", reason}});
+            });
+
+    // 讨论模式：只读感知 Blender 的多轮问答（工具白名单 + inspect_object + 封顶降级）
+    m_ask = std::make_unique<DiscussionAgent>(m_llm.get(), m_blender->client(), this);
+    connect(m_ask.get(), &DiscussionAgent::delta, this,
+            [this](const QString& area, const QString& text) {
+                if (text.isEmpty())
+                    return;
+                m_ws->broadcastEvent(QStringLiteral("chat.delta"),
+                                     QJsonObject{{"area", area}, {"text", text}});
+            });
+    connect(m_ask.get(), &DiscussionAgent::toolStep, this,
+            [this](const QString& area, const QString& tool, const QString& status) {
+                m_ws->broadcastEvent(QStringLiteral("tool.step"),
+                                     QJsonObject{{"area", area}, {"tool", tool}, {"status", status}});
+            });
+    connect(m_ask.get(), &DiscussionAgent::imageReceived, this,
+            [this](const QString& area, const QString& dataUrl, const QString& tool) {
+                m_ws->broadcastEvent(QStringLiteral("chat.image"),
+                                     QJsonObject{{"area", area}, {"dataUrl", dataUrl},
+                                                 {"caption", tool}});
+            });
+    connect(m_ask.get(), &DiscussionAgent::failed, this,
+            [this](const QString& area, const QString& reason) {
+                m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                     QJsonObject{{"area", area}, {"reason", reason}});
+                if (const QString tid = m_askWait.take(area); !tid.isEmpty()) {
+                    m_sessions->upsertTask(tid, area, QStringLiteral("chat"),
+                                           QStringLiteral("failed"), {});
+                    m_tasks->finish(tid);
+                }
+            });
+    connect(m_ask.get(), &DiscussionAgent::finished, this,
+            [this](const QString& area, const QString& visible, const QString& executable) {
+                const QString tid = m_askWait.take(area);
+                const QString asset = m_askAsset.value(area);
+                const QString shape = m_askShape.value(area);
+                const QString source = m_askSource.value(area);
+                m_sessions->appendMessage(area, QStringLiteral("assistant"), visible);
+                m_ws->broadcastEvent(
+                    QStringLiteral("chat.message"),
+                    QJsonObject{{"area", area}, {"role", "assistant"}, {"content", visible}});
+                // 讨论产出的草稿也是一行 draft：刷新后靠它重建草稿卡（与改造前一致）
+                if (!executable.isEmpty()) {
+                    const qint64 draftId = m_sessions->appendMessage(
+                        area, QStringLiteral("draft"), executable,
+                        QJsonObject{{"state", "pending"}, {"origin", "discussion"},
+                                    {"asset", asset}, {"source", source}, {"shape", shape}});
+                    m_ws->broadcastEvent(
+                        QStringLiteral("draft.created"),
+                        QJsonObject{{"area", area}, {"id", draftId}, {"prompt", executable},
+                                    {"origin", "discussion"}, {"asset", asset}, {"shape", shape}});
+                }
+                if (!tid.isEmpty()) {
+                    m_sessions->upsertTask(tid, area, QStringLiteral("chat"),
+                                           QStringLiteral("done"), {},
+                                           QJsonObject{{"reply", visible}});
+                    m_tasks->finish(tid);
+                }
             });
 
     // 编排器：计划卡与分组执行。draft.send → plan()，plan.confirm → 选目录 → execute()
@@ -1164,6 +1224,9 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
 
     // 讨论模式：只聊天，不检查桥接、不占门禁、不写草稿以外的任务链
     if (mode == QLatin1String("ask")) {
+        // 历史快照必须在写本次 user 之前取：DiscussionAgent 会自己把 userText 追加到消息尾部，
+        // 若这里带上本次 user，模型会看到同一条问题两遍
+        const QJsonArray history = recentMessages(area, 20);
         if (appendUser) {
             m_sessions->appendMessage(area, QStringLiteral("user"), text);
             m_ws->broadcastEvent(
@@ -1222,73 +1285,25 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         system.replace(QStringLiteral("{{assets}}"),
                        assetLines.isEmpty() ? QStringLiteral("（空）") : assetLines);
 
-        QJsonArray messages{
-            QJsonObject{{"role", "system"}, {"content", system}}};
-        // recentMessages 只放行 user/assistant：草稿卡与计划卡行不能喂给 LLM
-        for (const QJsonValue& value : recentMessages(area, 20))
-            messages.append(value);
+        // 草稿行要靠这三个复原（资产、档位、原始需求）：与摘要草稿一致走 draft.meta
+        m_askAsset.insert(area, asset);
+        m_askShape.insert(area, params.value(QStringLiteral("shape")).toString());
+        m_askSource.insert(area, text);
 
         const QString taskId = QStringLiteral("ask-%1").arg(++m_seq);
+        m_ask->setModelConfig(cfg);
+        // 任务不在这里收工：由 DiscussionAgent::finished / failed 的接线 finish
+        m_askWait.insert(area, taskId);
         m_tasks->enqueue(Task{
             taskId, area, QString(),
-            [this, area, cfg, messages, asset, text](const QString& tid, TaskManager* tm) {
-                // [[EXEC]] 之后整段都是草稿：流里一个字都不能发，等结束做卡片
-                auto buffer = std::make_shared<QString>();
-                auto filter = std::make_shared<AskStreamFilter>();
-                LlmGateway::StreamHandlers handlers;
-                handlers.onDelta = [this, area, buffer, filter](const QString& delta) {
-                    buffer->append(delta);
-                    const QString visible = filter->feed(delta);
-                    if (!visible.isEmpty())
-                        m_ws->broadcastEvent(QStringLiteral("chat.delta"),
-                                             QJsonObject{{"area", area}, {"text", visible}});
-                };
-                handlers.onDone = [this, area, tid, tm, buffer, filter, asset, text]() {
-                    if (tm->isCancelled(tid)) {
-                        m_sessions->upsertTask(tid, area, QStringLiteral("chat"),
-                                               QStringLiteral("cancelled"), {});
-                        tm->finish(tid);
-                        return;
-                    }
-                    const QString tail = filter->finish();
-                    if (!tail.isEmpty())
-                        m_ws->broadcastEvent(QStringLiteral("chat.delta"),
-                                             QJsonObject{{"area", area}, {"text", tail}});
-                    const AskReply reply = parseAskReply(*buffer);
-                    m_sessions->appendMessage(area, QStringLiteral("assistant"), reply.visible);
-                    m_ws->broadcastEvent(
-                        QStringLiteral("chat.message"),
-                        QJsonObject{{"area", area}, {"role", "assistant"},
-                                    {"content", reply.visible}});
-                    // 讨论产出的草稿也是一行 draft：刷新后靠它重建草稿卡
-                    if (!reply.executable.isEmpty()) {
-                        const qint64 draftId = m_sessions->appendMessage(
-                            area, QStringLiteral("draft"), reply.executable,
-                            QJsonObject{{"state", "pending"}, {"origin", "discussion"},
-                                        {"asset", asset}, {"source", text}});
-                        m_ws->broadcastEvent(
-                            QStringLiteral("draft.created"),
-                            QJsonObject{{"area", area}, {"id", draftId},
-                                        {"prompt", reply.executable},
-                                        {"origin", "discussion"}, {"asset", asset}});
-                    }
-                    m_sessions->upsertTask(tid, area, QStringLiteral("chat"),
-                                           QStringLiteral("done"), {},
-                                           QJsonObject{{"reply", reply.visible}});
-                    tm->finish(tid);
-                };
-                handlers.onError = [this, area, tid, tm](const QString& error) {
-                    if (tm->isCancelled(tid)) {
-                        m_sessions->upsertTask(tid, area, QStringLiteral("chat"),
-                                               QStringLiteral("cancelled"), {});
-                        tm->finish(tid);
-                        return;
-                    }
-                    m_ws->broadcastEvent(QStringLiteral("error.card"),
-                                         QJsonObject{{"area", area}, {"reason", error}});
-                    tm->finish(tid);
-                };
-                m_llm->chatStream(cfg, messages, {}, handlers, area);
+            [this, area, cfg, system, history, text](const QString&, TaskManager*) {
+                // 就绪与否、有没有载入场景、Blender 忙不忙，决定这轮能不能真的「看」场景；
+                // 任一不满足就退回纯文字讨论，不报错打断聊天
+                const bool withTools = m_blender->isReady()
+                    && !m_loadedScenes.value(area).isEmpty() && !m_blenderGate.isBusy();
+                m_ask->setModelConfig(cfg);
+                m_ask->setMcpTools(m_blenderTools); // McpRuntime::toolsChanged 缓存的原始 tools
+                m_ask->ask(area, system, history, text, withTools);
             }});
         return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
     }

@@ -27,6 +27,7 @@ class PreflightChecker;
 class SummarizerAgent;
 class Cloud3dService;
 class UiState;
+class DiscussionAgent;
 
 struct CoreOptions
 {
@@ -88,6 +89,7 @@ private:
     McpRuntime* m_blender = nullptr; // QObject child，析构由 parent 负责
     std::unique_ptr<PreflightChecker> m_preflight;
     SummarizerAgent* m_summarizer = nullptr; // QObject child，析构由 parent 负责
+    std::unique_ptr<DiscussionAgent> m_ask;  // 讨论模式：只读感知 Blender 的多轮问答
     std::unique_ptr<Cloud3dService> m_cloud;  // 云 3D 轮询与下载，独立于任务队列
     AgentOrchestrator* m_orch = nullptr;     // QObject child，析构由 parent 负责
     BlenderGate m_blenderGate; // Blender agent 任务与 unity 转换互斥
@@ -109,6 +111,11 @@ private:
     QHash<QString, QString> m_sceneLoadRequests;
     QHash<QString, QString> m_sceneLoadTargets;
     QHash<QString, QString> m_loadedScenes; // 区 -> 已载入的 .blend，Task 8 据此给只读工具
+    // 讨论在途：area -> 任务 id / 目标资产 / 档位 / 用户原始需求（草稿行据此复原）
+    QHash<QString, QString> m_askWait;
+    QHash<QString, QString> m_askAsset;
+    QHash<QString, QString> m_askShape;
+    QHash<QString, QString> m_askSource;
     QHash<QString, QString> m_status; // area -> off|reconnecting|ready
     QHash<QString, QString> m_hints;  // area -> 状态提示文案
     QSet<QString> m_everReady;        // 曾握手成功的区：之后的 off 才算桥接崩溃

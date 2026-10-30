@@ -1,6 +1,7 @@
 #include "core/agent/AgentOrchestrator.h"
 
 #include "core/llm/ToolBridge.h"
+#include "core/llm/ToolMessage.h"
 #include "core/mcp/BlenderGate.h"
 #include "core/mcp/McpClient.h"
 #include "core/tasks/TaskManager.h"
@@ -113,51 +114,6 @@ QString blenderSystemPrompt(OutputShape shape)
         "收到系统的导出指令后再执行，且只执行一次。");
     // 分档纪律接在最后：编号与通用条独立，避免改一处要重排全部编号
     return body + shapeDiscipline(shape);
-}
-
-// 截图为 image content 时压成 JPEG base64：同一份结果既回喂模型又给前端展示
-QByteArray compressImage(const QByteArray& png)
-{
-    QImage image;
-    if (!image.loadFromData(png))
-        return {};
-    if (image.width() > 1024 || image.height() > 1024)
-        image = image.scaled(1024, 1024, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-    QByteArray out;
-    QBuffer buffer(&out);
-    buffer.open(QIODevice::WriteOnly);
-    image.save(&buffer, "JPEG", 80);
-    return out;
-}
-
-QJsonObject toolResultMessage(const QString& callId, const QJsonValue& result,
-                              const QJsonObject& error, QStringList* images)
-{
-    QJsonArray content;
-    if (!error.isEmpty()) {
-        content.append(QJsonObject{
-            {"type", "text"},
-            {"text", "ERROR: " + QString::fromUtf8(QJsonDocument(error).toJson(QJsonDocument::Compact))}});
-    } else {
-        for (const QJsonValue& item : result.toObject().value(QStringLiteral("content")).toArray()) {
-            const QJsonObject obj = item.toObject();
-            if (obj.value(QStringLiteral("type")).toString() == QLatin1String("image")) {
-                const QByteArray jpeg = compressImage(
-                    QByteArray::fromBase64(obj.value(QStringLiteral("data")).toString().toUtf8()));
-                if (jpeg.isEmpty())
-                    continue;
-                const QString dataUrl =
-                    QStringLiteral("data:image/jpeg;base64,") + QString::fromLatin1(jpeg.toBase64());
-                content.append(QJsonObject{{"type", "image_url"},
-                                           {"image_url", QJsonObject{{"url", dataUrl}}}});
-                if (images)
-                    images->append(dataUrl);
-            } else {
-                content.append(obj);
-            }
-        }
-    }
-    return QJsonObject{{"role", "tool"}, {"tool_call_id", callId}, {"content", content}};
 }
 
 } // namespace
