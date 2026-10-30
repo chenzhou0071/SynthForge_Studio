@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { WsClient } from "../ws/WsClient";
+import { contextMenuTop } from "../ui/menuPosition";
 
 type Area = "blender" | "unity";
 type Op = "mkdir" | "rename" | "delete" | "reveal" | "refresh";
@@ -37,6 +38,14 @@ const emit = defineEmits<{ select: [path: string]; modify: [path: string] }>();
 const menu = ref<{ x: number; y: number; path: string; isEntry: boolean; isDir: boolean } | null>(
   null,
 );
+// 菜单实际顶边：弹出后按实测高度算，靠近视口底部就向上翻，避免被截断点不到
+const menuEl = ref<HTMLUListElement | null>(null);
+const menuTop = ref(0);
+watch(menu, async (m) => {
+  if (!m) return;
+  await nextTick(); // 等 <ul> 挂上再量高度
+  menuTop.value = contextMenuTop(m.y, menuEl.value?.offsetHeight ?? 0, window.innerHeight);
+});
 const message = ref<{ text: string; kind: "notice" | "error" } | null>(null);
 const tree = ref<DirNode>({ name: "", path: "", dirs: [], files: [] });
 // 默认全展开，只记收起的目录；树刷新后已有目录的展开状态不会被重置
@@ -306,8 +315,9 @@ async function runOp(op: Op) {
 
     <ul
       v-if="menu"
+      ref="menuEl"
       class="ctx-menu"
-      :style="{ left: menu.x + 'px', top: menu.y + 'px' }"
+      :style="{ left: menu.x + 'px', top: menuTop + 'px' }"
       @mousedown.stop
       @click.stop
     >

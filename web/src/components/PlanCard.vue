@@ -25,6 +25,12 @@ const props = defineProps<{
 }>();
 const shapeNames = { prop: "道具", diorama: "盒式舞台", open: "开放场景" } as const;
 const shapeLabel = computed(() => shapeNames[props.plan.shape ?? "diorama"]);
+// 模型有时把「1. 」写进组标题，卡片又补一个序号 → 「1. 1. 地面」。
+// 先剥掉标题自带的行首编号，再统一用组序号，保证只出现一个编号。
+function groupLabel(index: number, title: string): string {
+  const stripped = title.replace(/^\s*\d+[.、)]\s*/, "");
+  return `${index + 1}. ${stripped}`;
+}
 const decided = ref<"pending" | "started" | "cancelled">(props.state ?? "pending");
 const error = ref("");
 watch(
@@ -96,7 +102,7 @@ async function cancel() {
     </div>
     <ol>
       <li v-for="(g, i) in plan.groups" :key="i">
-        <div class="group-title">{{ i + 1 }}. {{ g.title }}</div>
+        <div class="group-title">{{ groupLabel(i, g.title) }}</div>
         <div v-if="g.items.length" class="group-items">{{ g.items.join(" / ") }}</div>
         <ul v-if="g.placements?.length" class="group-placements">
           <li v-for="(p, j) in g.placements" :key="j">{{ p.name }}：{{ p.where }}</li>

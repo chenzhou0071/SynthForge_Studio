@@ -1173,6 +1173,21 @@ describe("ChatPanel", () => {
     expect(buttons[2]!.classes()).not.toContain("active");
   });
 
+  // 从云API 区点低模资产的「修改此资产」：修改本就是低模链路，必须自动切回低模
+  it("switches back to lowpoly when a modify target is set from cloud api", async () => {
+    const { wrapper } = mountPanel(
+      "blender",
+      (fake) => fake.results.set("uiState.get", { blenderMode: "cloud3d" }),
+      { selectedAsset: "Props/desk/desk.blend" },
+    );
+    await flushPromises();
+
+    const low = wrapper
+      .findAll(".chat-tools .mode-switch button")
+      .find((button) => button.text() === "低模")!;
+    expect(low.classes()).toContain("active");
+  });
+
   // 讨论一个已选中的资产前，必须先无超时确认载入 .blend，本轮不发消息
   it("requests a scene load before discussing a selected asset, and defers the send", async () => {
     const { client, wrapper } = mountPanel("blender", undefined, {

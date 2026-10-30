@@ -49,7 +49,17 @@ const effectiveShape = computed<Shape>(() => props.selectedAssetShape ?? shape.v
 // 云API 只走“执行”：没有讨论链路，切过去时立刻退回执行态
 watch(mode, (value) => {
   if (value === "cloud3d" && chatMode.value === "ask") chatMode.value = "exec";
+  // 有修改目标时不允许停在云API（含 loadUiPrefs 恢复出 cloud3d 的情况）：切回低模
+  if (value === "cloud3d" && props.selectedAsset) mode.value = "lowpoly";
 });
+// 选中资产（修改/讨论目标）就是低模链路：云 API 没有 .blend 可改，
+// 从云API 区点低模资产的「修改此资产」必须自动切回低模，否则停在云API 上语义全错
+watch(
+  () => props.selectedAsset,
+  (asset) => {
+    if (asset && mode.value === "cloud3d") mode.value = "lowpoly";
+  },
+);
 // 两个开关存后端 ui.ini（uiState.get/set）：Qt WebEngine 的 localStorage 在 app:// 下重启就丢
 const prefsReady = ref(false);
 async function loadUiPrefs() {
@@ -106,7 +116,11 @@ const busyLabel = computed(() => {
 // 讨论按钮在云API下置灰，提示文案要跟着解释原因
 const chatHint = computed(() => {
   if (mode.value === "cloud3d") return "云API 只走执行";
-  return chatMode.value === "ask" ? "只聊方案，不触碰 Blender" : "先出草稿卡，确认后才动手";
+  if (chatMode.value === "exec") return "先出提示词草稿，确认后才动手";
+  // 讨论态：让用户一眼看出这轮能不能真的「看见」Blender 场景（只读，不改）
+  if (loadedScene.value) return `讨论中 · 已读取 Blender：${loadedScene.value}（只读，不会改动场景）`;
+  if (props.selectedAsset) return "讨论中 · 将先确认载入资产，只读查看，不改动场景";
+  return "讨论中 · 不改模型；连上 Blender 后可只读查看场景与参数";
 });
 const scroller = ref<HTMLElement | null>(null);
 // 只有贴底时才跟随新输出；用户往上翻后不再抢视图
@@ -940,6 +954,7 @@ function onKeydown(event: KeyboardEvent) {
 .chat-tools {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 0 12px 8px;
 }
@@ -1021,6 +1036,7 @@ function onKeydown(event: KeyboardEvent) {
 .badge {
   font-size: 12px;
   color: var(--muted);
+  white-space: nowrap;
 }
 
 .badge.ok {
