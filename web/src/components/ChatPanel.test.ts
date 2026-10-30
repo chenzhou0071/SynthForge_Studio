@@ -1278,4 +1278,37 @@ describe("ChatPanel", () => {
     expect(card.text()).toContain("主轴：轨道沿 +Y 至 120 米");
     expect(card.text()).toContain("列车由南向北进出站");
   });
+
+  // 点「开始生成」进入选目录、又 × 掉弹窗：计划卡必须退回 pending（按钮回来），不能卡在「已确认…」
+  it("reverts the plan card to pending when the folder picker is cancelled", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.results.set("plan.confirm", { ok: true });
+    client.emit("plan.created", {
+      area: "blender",
+      id: 7,
+      taskId: "t-pick",
+      rules: [],
+      groups: [{ title: "底座", items: [], placements: [], acceptance: "宽度 22" }],
+      totalSteps: 4,
+    });
+    await flushPromises();
+
+    await wrapper.findAll("button").find((b) => b.text() === "开始生成")!.trigger("click");
+    await flushPromises();
+    // 后端下发选目录弹窗 → 卡片进入 started，「开始生成」消失
+    client.emit("folderPick.open", {
+      area: "blender",
+      requestId: "pick-1",
+      rootName: "ModelLibrary",
+      tree: { name: "ModelLibrary", path: "", children: [] },
+    });
+    await flushPromises();
+    expect(wrapper.findAll("button").some((b) => b.text() === "开始生成")).toBe(false);
+
+    // Esc 关掉选目录弹窗（= 取消，没开工）→ 卡片应退回 pending，按钮回来
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await flushPromises();
+    expect(wrapper.findAll("button").some((b) => b.text() === "开始生成")).toBe(true);
+  });
 });

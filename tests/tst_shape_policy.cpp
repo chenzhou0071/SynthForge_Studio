@@ -199,6 +199,9 @@ private slots:
         QVERIFY(!planSystemPromptFor(OutputShape::Prop).contains(QStringLiteral("底座")));
         QVERIFY(!planSystemPromptFor(OutputShape::OpenScene).contains(QStringLiteral("底座")));
         QVERIFY(planSystemPromptFor(OutputShape::OpenScene).contains(QStringLiteral("主轴")));
+        // 开放场景必须被要求输出真实 zones（否则分区永远走代码兜底的 0~20/20~60 套话）
+        QVERIFY(planSystemPromptFor(OutputShape::OpenScene).contains(QStringLiteral("zones")));
+        QVERIFY(planSystemPromptFor(OutputShape::OpenScene).contains(QStringLiteral("禁止套用")));
     }
 
     // 基线：盒式舞台的规划器提示词锁死这份「主题驱动」文本（批次2 起取代旧的

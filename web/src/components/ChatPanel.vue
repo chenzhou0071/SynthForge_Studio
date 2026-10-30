@@ -476,6 +476,8 @@ onMounted(() => {
         rootName: payload.rootName ?? "ModelLibrary",
         tree: payload.tree,
       };
+      // 进入选目录阶段：把这张计划卡标成 started，取消弹窗时再退回 pending（见 onPickClosed）
+      setPlanCardState("pending", "started");
     }),
     props.client.on("sceneLoad.confirm", (data) => {
       const payload = data as {
@@ -658,6 +660,20 @@ function onPickClosed(started?: boolean) {
   if (started) {
     cancelRequested = false;
     busy.value = true;
+    return;
+  }
+  // × 掉选目录 = 没开工：计划卡从 started 退回 pending，「开始生成」按钮回来，可重选位置
+  setPlanCardState("started", "pending");
+}
+
+// 把最近一张处于 from 状态的计划卡改成 to（PlanCard 监听 props.state 会跟着变）
+function setPlanCardState(from: "pending" | "started", to: "pending" | "started") {
+  for (let i = messages.value.length - 1; i >= 0; --i) {
+    const item = messages.value[i];
+    if (item.role === "plan" && item.state === from) {
+      item.state = to;
+      return;
+    }
   }
 }
 

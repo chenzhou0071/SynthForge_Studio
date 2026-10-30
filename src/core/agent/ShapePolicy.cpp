@@ -107,11 +107,20 @@ QString planSystemPromptFor(OutputShape shape)
         return planJsonSpec(policy.minGroups, policy.maxGroups,
                             QStringLiteral("主体 → 附属小件，超过 2 组就是拆得太碎"));
     case OutputShape::OpenScene:
+        // 共享 JSON 规范只定义了 rules/groups，从没要求 zones，导致开放场景分区永远走代码兜底
+        // （0~20/20~60 那种套话）。这里为开放场景追加硬性要求：必须输出真实 zones + 每组具体物体。
         return planJsonSpec(policy.minGroups, policy.maxGroups,
                             QStringLiteral(
                                 "地面与主轴 → 近景分区 → 中景分区 → 远景分区，"
                                 "同一分区的物体放在同一组；每组必须在 items 里列出该区的具体物体、"
-                                "并在 placements 给出各自相对位置，不能只写分组名与验收"));
+                                "并在 placements 给出各自相对位置，不能只写分组名与验收"))
+            + QStringLiteral(
+                  "另外：JSON 对象里必须再输出一个 \"zones\" 字符串数组——第一条写主轴（含真实走向与总长度，"
+                  "如「主轴：主干道沿 +Y 由南向北，总长约 600 米」），其后至少 3 条写各分区，"
+                  "范围与内容必须取自上文提示词里的真实数字（如「近景：0~150 米 双向六车道与底层商铺」），"
+                  "禁止套用 0~20/20~60 这类与本场景无关的默认值。"
+                  "且主轴的坐标轴、总长度与各分区范围必须与上文提示词一致，不得自行改数值或换坐标轴。"
+                  "楼群高度要参差错落、高楼可出现在任意深度，禁止「越往后越高」的单调递增台阶。");
     case OutputShape::Diorama:
         break;
     }

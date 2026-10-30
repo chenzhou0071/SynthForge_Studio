@@ -646,7 +646,8 @@ bool CoreApp::start()
                                       return QJsonValue(QJsonObject{
                                           {"ok", false}, {"error", "blender-busy"}});
                                   }
-                                  m_pendingPlans.remove(area);
+                                  // 不在此处 remove(m_pendingPlans)：留到 folderPick.submit 真正开工才消费。
+                                  // 这样用户 × 掉选目录弹窗后还能重新点「开始生成」（见 folderPick.cancel）
                                   // 只有真正开始选目录才置 started；blender-busy 保持 pending
                                   const QJsonObject row = m_sessions->messageById(requestedId);
                                   if (requestedId > 0
@@ -751,6 +752,7 @@ bool CoreApp::start()
                                   }
                                   m_pickRequests.remove(requestId);
                                   m_pendingPicks.remove(area);
+                                  m_pendingPlans.remove(area); // 真正开工才消费计划：之后不能重复确认
                                   const QString targetFolder = m_library->absoluteFor(relative);
                                   m_assetPrompts.insert(area, pick.prompt);
                                   const QString taskId = QStringLiteral("build-%1").arg(++m_seq);
@@ -775,6 +777,23 @@ bool CoreApp::start()
                                   if (area.isEmpty()) // 旧弹窗（requestId 已被取代）不报错卡
                                       return QJsonValue(QJsonObject{{"ok", true}});
                                   m_pendingPicks.remove(area);
+                                  // × 掉选目录 = 没开工：把计划卡从 started 退回 pending，
+                                  // 让「开始生成」按钮回来、可重新选位置（m_pendingPlans 仍在，能再确认）
+                                  const qint64 planId = m_pendingPlans.value(area)
+                                                            .value(QStringLiteral("id"))
+                                                            .toInteger();
+                                  if (planId > 0) {
+                                      const QJsonObject row = m_sessions->messageById(planId);
+                                      QJsonObject meta = row.value(QStringLiteral("meta")).toObject();
+                                      if (row.value(QStringLiteral("role")).toString()
+                                              == QLatin1String("plan")
+                                          && meta.value(QStringLiteral("state")).toString()
+                                                 == QLatin1String("started")) {
+                                          meta.insert(QStringLiteral("state"),
+                                                      QStringLiteral("pending"));
+                                          m_sessions->updateMessageMeta(planId, meta);
+                                      }
+                                  }
                                   m_ws->broadcastEvent(
                                       QStringLiteral("error.card"),
                                       QJsonObject{{"area", area}, {"reason", "user-cancelled"}});
