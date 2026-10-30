@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import type { WsClient } from "../ws/WsClient";
 
 const props = defineProps<{
@@ -10,7 +10,10 @@ const props = defineProps<{
   state?: "pending" | "started" | "cancelled";
   plan: {
     taskId: string;
+    shape?: "prop" | "diorama" | "open";
     rules: string[];
+    zones?: string[];
+    motions?: string[];
     groups: {
       title: string;
       items: string[];
@@ -20,6 +23,8 @@ const props = defineProps<{
     totalSteps: number;
   };
 }>();
+const shapeNames = { prop: "道具", diorama: "盒式舞台", open: "开放场景" } as const;
+const shapeLabel = computed(() => shapeNames[props.plan.shape ?? "diorama"]);
 const decided = ref<"pending" | "started" | "cancelled">(props.state ?? "pending");
 const error = ref("");
 watch(
@@ -66,8 +71,23 @@ async function cancel() {
 
 <template>
   <div class="plan-card">
-    <div class="plan-hint">建造计划 · 预估 {{ plan.totalSteps }} 步</div>
+    <div class="plan-hint">
+      <span class="shape-tag">{{ shapeLabel }}</span>
+      建造计划 · 预估 {{ plan.totalSteps }} 步
+    </div>
     <div class="plan-warn">开始后会先清空 Blender 当前场景（未保存的手工修改会丢失）</div>
+    <div v-if="plan.zones?.length" class="plan-rules">
+      <div class="rules-title">空间结构</div>
+      <ul>
+        <li v-for="(z, i) in plan.zones" :key="`z${i}`">{{ z }}</li>
+      </ul>
+    </div>
+    <div v-if="plan.motions?.length" class="plan-rules">
+      <div class="rules-title">时序与运动</div>
+      <ul>
+        <li v-for="(m, i) in plan.motions" :key="`m${i}`">{{ m }}</li>
+      </ul>
+    </div>
     <div v-if="plan.rules?.length" class="plan-rules">
       <div class="rules-title">布局约束</div>
       <ul>
@@ -107,6 +127,16 @@ async function cancel() {
 .plan-hint {
   color: var(--muted);
   font-size: 12px;
+}
+
+.shape-tag {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 11px;
+  color: var(--text);
 }
 
 .plan-warn {

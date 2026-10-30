@@ -22,7 +22,10 @@ export interface PlanGroup {
 
 export interface PlanData {
   taskId: string;
+  shape?: "prop" | "diorama" | "open";
   rules: string[];
+  zones?: string[];
+  motions?: string[];
   groups: PlanGroup[];
   totalSteps: number;
 }
@@ -36,6 +39,8 @@ export interface AssetFile {
 export interface AssetData {
   name: string;
   source: "lowpoly" | "cloud3d";
+  // 资产产出形态：决定讨论用哪档模板、载入哪个 blend
+  shape?: "prop" | "diorama" | "open";
   provider?: string;
   model?: string;
   prompt?: string;
@@ -57,6 +62,8 @@ export interface ChatItem {
   state?: "pending" | "started" | "cancelled";
   // 草稿来源：讨论产出还是摘要模板产出，决定卡片提示与重生成模板
   origin?: "discussion" | "generated";
+  // 草稿/资产所属产出形态：旧行没有就是 undefined，由后端回落盒式舞台
+  shape?: "prop" | "diorama" | "open";
   // 分组分隔条：每组建模开始前插一条，截图与文字就不会堆成一团
   groupIndex?: number;
   groupCount?: number;
@@ -117,6 +124,10 @@ export function toChatItems(page: unknown): ChatItem[] {
         id: message.id,
         content,
         origin: meta.origin === "discussion" ? "discussion" : "generated",
+        shape:
+          meta.shape === "prop" || meta.shape === "open" || meta.shape === "diorama"
+            ? meta.shape
+            : undefined,
         state: meta.state === "cancelled" ? "cancelled" : "pending",
       });
       continue;

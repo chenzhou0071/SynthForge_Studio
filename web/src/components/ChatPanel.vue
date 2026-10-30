@@ -32,6 +32,15 @@ const draft = ref("");
 const mode = ref<ChatMode>("lowpoly");
 // 讨论只聊方案、不碰 Blender；执行先出草稿卡，确认后才动手
 const chatMode = ref<"ask" | "exec">("exec");
+// 产出形态三档：道具/盒式舞台/开放场景。默认盒式舞台——等价于改造前的方形微缩行为
+type Shape = "prop" | "diorama" | "open";
+const shape = ref<Shape>("diorama");
+const shapeLabels: Record<Shape, string> = { prop: "道具", diorama: "盒式舞台", open: "开放场景" };
+const shapeHint: Record<Shape, string> = {
+  prop: "独立单体资产（书桌、招牌、路灯），无底座无场景布局，可直接进引擎复用",
+  diorama: "方形底盘的微缩舞台场景，构图不出框，适合展示与收藏",
+  open: "无方形边界的大空间（街区、公园、车站），支持长轨道、跨区域与可选动画",
+};
 // 云API 只走“执行”：没有讨论链路，切过去时立刻退回执行态
 watch(mode, (value) => {
   if (value === "cloud3d" && chatMode.value === "ask") chatMode.value = "exec";
@@ -40,13 +49,18 @@ watch(mode, (value) => {
 const prefsReady = ref(false);
 async function loadUiPrefs() {
   try {
-    const prefs = await props.client.request<{ blenderMode?: string; chatMode?: string }>(
-      "uiState.get",
-    );
+    const prefs = await props.client.request<{
+      blenderMode?: string;
+      chatMode?: string;
+      shape?: string;
+    }>("uiState.get");
     if (prefs?.blenderMode === "cloud3d" || prefs?.blenderMode === "lowpoly") {
       mode.value = prefs.blenderMode;
     }
     if (prefs?.chatMode === "ask" || prefs?.chatMode === "exec") chatMode.value = prefs.chatMode;
+    if (prefs?.shape === "prop" || prefs?.shape === "diorama" || prefs?.shape === "open") {
+      shape.value = prefs.shape;
+    }
     // 旧版本可能存过 cloud3d + ask 的组合：恢复时纠正，别停在不可用的讨论态
     if (mode.value === "cloud3d" && chatMode.value === "ask") chatMode.value = "exec";
   } catch {
@@ -57,10 +71,14 @@ async function loadUiPrefs() {
   }
 }
 // 用户改一下记一下；执行链路自动切到「执行」也算最近一次选择
-watch([mode, chatMode], () => {
+watch([mode, chatMode, shape], () => {
   if (!prefsReady.value) return;
   void props.client
-    .request("uiState.set", { blenderMode: mode.value, chatMode: chatMode.value })
+    .request("uiState.set", {
+      blenderMode: mode.value,
+      chatMode: chatMode.value,
+      shape: shape.value,
+    })
     .catch(() => {
       // 记忆失败不影响切换
     });
@@ -334,7 +352,13 @@ onMounted(() => {
       }
     }),
     props.client.on("draft.created", (data) => {
-      const d = data as { area?: string; id?: number; prompt?: string; origin?: string };
+      const d = data as {
+        area?: string;
+        id?: number;
+        prompt?: string;
+        origin?: string;
+        shape?: "prop" | "diorama" | "open";
+      };
       if (d.area !== props.area) return;
       // 后端已停止生成，等用户编辑确认；执行后才进入规划/修改
       busy.value = false;
@@ -343,6 +367,7 @@ onMounted(() => {
         id: d.id,
         content: d.prompt ?? "",
         origin: d.origin === "discussion" ? "discussion" : "generated",
+        shape: d.shape,
         state: "pending",
       });
       scrollToBottom();
@@ -380,7 +405,10 @@ onMounted(() => {
         area?: string;
         id?: number;
         taskId?: string;
+        shape?: "prop" | "diorama" | "open";
         rules?: string[];
+        zones?: string[];
+        motions?: string[];
         groups?: PlanGroup[];
         totalSteps?: number;
       };
@@ -393,7 +421,10 @@ onMounted(() => {
         state: "pending",
         plan: {
           taskId: payload.taskId ?? "",
+          shape: payload.shape,
           rules: payload.rules ?? [],
+          zones: payload.zones ?? [],
+          motions: payload.motions ?? [],
           groups: payload.groups ?? [],
           totalSteps: payload.totalSteps ?? 0,
         },
@@ -476,12 +507,14 @@ async function send() {
     if (props.area === "blender" && chatMode.value === "ask") {
       // 讨论不检查 Blender；带上当前资产只让模型知道在聊哪个文件
       params.mode = "ask";
+      params.shape = shape.value; // 讨论也要知道在聊哪一档
       if (props.selectedAsset) params.asset = props.selectedAsset;
     } else if (modify) {
       params.mode = "modify";
       params.asset = props.selectedAsset;
     } else if (props.area === "blender") {
       params.mode = mode.value;
+      params.shape = shape.value;
     }
     const result = await props.client.request<{ accepted?: boolean; error?: string }>(
       "chat.send",
@@ -623,6 +656,17 @@ function onKeydown(event: KeyboardEvent) {
       <div class="mode-switch">
         <button :class="{ active: mode === 'lowpoly' }" @click="mode = 'lowpoly'">低模</button>
         <button :class="{ active: mode === 'cloud3d' }" @click="mode = 'cloud3d'">云API</button>
+      </div>
+      <div v-if="mode === 'lowpoly'" class="shape-switch">
+        <button
+          v-for="(label, key) in shapeLabels"
+          :key="key"
+          :class="{ active: shape === key }"
+          :title="shapeHint[key]"
+          @click="shape = key as Shape"
+        >
+          {{ label }}
+        </button>
       </div>
       <span class="badge" :class="cloudConfigured ? 'ok' : 'warn'">
         {{ cloudConfigured ? "云API 已配置" : "云API 未配置" }}
@@ -878,6 +922,30 @@ function onKeydown(event: KeyboardEvent) {
   opacity: 0.35;
   background: transparent;
   cursor: not-allowed;
+}
+
+/* 三档产出形态开关：观感与模式开关一致，只是多一档 */
+.shape-switch {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.shape-switch button {
+  border: 0;
+  border-radius: 0;
+  padding: 3px 10px;
+  font-size: 12px;
+  white-space: nowrap;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.shape-switch button.active {
+  background: var(--accent);
+  color: #fff;
 }
 
 .badge {

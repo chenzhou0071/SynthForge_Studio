@@ -269,7 +269,10 @@ bool CoreApp::start()
                 // 计划卡也是一行：刷新后靠 content + meta.state 重建
                 const QJsonObject payload{
                     {QStringLiteral("taskId"), taskId},
+                    {QStringLiteral("shape"), plan.value(QStringLiteral("shape"))},
                     {QStringLiteral("rules"), plan.value(QStringLiteral("rules"))},
+                    {QStringLiteral("zones"), plan.value(QStringLiteral("zones"))},
+                    {QStringLiteral("motions"), plan.value(QStringLiteral("motions"))},
                     {QStringLiteral("groups"), plan.value(QStringLiteral("groups"))},
                     {QStringLiteral("totalSteps"), plan.value(QStringLiteral("totalSteps"))}};
                 const qint64 planId = m_sessions->appendMessage(
@@ -286,7 +289,10 @@ bool CoreApp::start()
                     QJsonObject{{QStringLiteral("area"), area},
                                 {QStringLiteral("id"), planId},
                                 {QStringLiteral("taskId"), taskId},
+                                {QStringLiteral("shape"), plan.value(QStringLiteral("shape"))},
                                 {QStringLiteral("rules"), plan.value(QStringLiteral("rules"))},
+                                {QStringLiteral("zones"), plan.value(QStringLiteral("zones"))},
+                                {QStringLiteral("motions"), plan.value(QStringLiteral("motions"))},
                                 {QStringLiteral("groups"), plan.value(QStringLiteral("groups"))},
                                 {QStringLiteral("totalSteps"), plan.value(QStringLiteral("totalSteps"))}});
             });
@@ -481,7 +487,9 @@ bool CoreApp::start()
         m_orch->setModelConfig(primaryAgentConfig());
         // 本次指令已由草稿行转正落库，plan() 会把它拼在末尾：历史里去掉同一条避免重复
         m_orch->setConversationHistory(historyForPrompt(area, prompt, 20));
-        m_orch->plan(QStringLiteral("plan-%1").arg(++m_seq), nullptr, prompt, area);
+        // 档位取草稿自己那份（chat.send 时按界面开关存的）：不传规划器就恒按盒式舞台出组
+        m_orch->plan(QStringLiteral("plan-%1").arg(++m_seq), nullptr, prompt, area,
+                     shapeFromString(meta.value(QStringLiteral("shape")).toString()));
         return QJsonValue(QJsonObject{{"accepted", true}});
                               });
     m_router->registerHandler(QStringLiteral("draft.cancel"),

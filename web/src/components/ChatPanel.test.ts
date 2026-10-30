@@ -1116,4 +1116,66 @@ describe("ChatPanel", () => {
       false,
     );
   });
+
+  // 三档产出形态：默认盒式舞台不破旧行为，选了要写回 ui.ini，云API 下整块隐藏
+  it("persists the output shape switch to ui.ini and hides it for cloud api", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+
+    const shapeButtons = wrapper.findAll(".shape-switch button");
+    expect(shapeButtons.map((button) => button.text())).toEqual(["道具", "盒式舞台", "开放场景"]);
+    expect(shapeButtons[1]!.classes()).toContain("active"); // 默认盒式舞台
+
+    await shapeButtons[0]!.trigger("click"); // 道具
+    await flushPromises();
+    const saved = client.callsOf("uiState.set").at(-1)!.params as Record<string, unknown>;
+    expect(saved.shape).toBe("prop");
+
+    const cloud = wrapper
+      .findAll(".chat-tools .mode-switch button")
+      .find((button) => button.text() === "云API")!;
+    await cloud.trigger("click");
+    await flushPromises();
+    // 云端只产单体，三档开关这条链路不存在
+    expect(wrapper.find(".shape-switch").exists()).toBe(false);
+  });
+
+  it("sends the current shape with the lowpoly request", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.results.set("chat.send", { accepted: true });
+
+    await wrapper.find("textarea").setValue("一张书桌，上面有电脑和杯子");
+    await wrapper.find("button.primary").trigger("click");
+    await flushPromises();
+
+    const sent = client.callsOf("chat.send").at(-1)!.params as Record<string, unknown>;
+    // 后端 ui.ini 是唯一真相，但请求自带档位可躲开读写竞态
+    expect(sent.shape).toBe("diorama");
+  });
+
+  // 计划卡要把后端 plan.created 带来的档位、分区、动线显示出来
+  it("shows the output shape, zones and motions on the plan card", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+
+    client.emit("plan.created", {
+      area: "blender",
+      id: 5,
+      taskId: "t-open",
+      shape: "open",
+      rules: ["留出通道"],
+      zones: ["主轴：轨道沿 +Y 至 120 米"],
+      motions: ["列车由南向北进出站"],
+      groups: [{ title: "路基", items: [], placements: [], acceptance: "达到 120 米" }],
+      totalSteps: 8,
+    });
+    await flushPromises();
+
+    const card = wrapper.find(".plan-card");
+    expect(card.exists()).toBe(true);
+    expect(card.find(".shape-tag").text()).toBe("开放场景");
+    expect(card.text()).toContain("主轴：轨道沿 +Y 至 120 米");
+    expect(card.text()).toContain("列车由南向北进出站");
+  });
 });

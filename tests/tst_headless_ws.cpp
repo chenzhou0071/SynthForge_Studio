@@ -1073,6 +1073,58 @@ private slots:
         QVERIFY(!raw.contains("\"ts\":")); // 只发 role/content，不带 id/ts
     }
 
+    // 界面选的档位必须一路走到规划器：chat.send 记住 open → draft.send 按 open 规划 →
+    // plan.created 带 shape/zones/motions，前端计划卡才显示得出档位（Task 6 的后端半边）
+    void draftSendDrivesPlannerAndPlanCardCarriesShape()
+    {
+        MockLlmServer server({
+            textTurn(QStringLiteral("主题：轨道站台")),
+            textTurn(QStringLiteral(
+                R"({"rules":[],"zones":["主轴：轨道沿 +Y 至 120 米","近景：0~20 米 站台"],)"
+                R"("motions":["列车进出站"],"groups":[{"title":"路基"},{"title":"接触网"}]})")),
+        });
+        QVERIFY(server.listen());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        CoreApp app({dir.path(), true, dir.filePath(QStringLiteral("library")),
+                     mockBlenderBridge()});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+        QTRY_VERIFY_WITH_TIMEOUT(client.lastEvent(QStringLiteral("conn.status"))
+                                     .value(QStringLiteral("blender")).toString()
+                                 == QStringLiteral("ready"),
+                                 10000);
+        QVERIFY(configureLlm(client, server.baseUrl()).contains(QStringLiteral("result")));
+        QVERIFY(client.request(QStringLiteral("uiState.set"), {{"shape", "open"}})
+                    .contains(QStringLiteral("result")));
+
+        QVERIFY(sendLowpoly(client, QStringLiteral("一段地铁轨道站台"))
+                    .value(QStringLiteral("result")).toObject()
+                    .value(QStringLiteral("accepted")).toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(!client.lastEvent(QStringLiteral("draft.created")).isEmpty(),
+                                 10000);
+        const qint64 draftId = client.lastEvent(QStringLiteral("draft.created"))
+                                   .value(QStringLiteral("id")).toInteger();
+        QVERIFY(draftId > 0);
+
+        QVERIFY(client.request(QStringLiteral("draft.send"),
+                               QJsonObject{{QStringLiteral("id"), draftId},
+                                           {QStringLiteral("prompt"),
+                                            QStringLiteral("一段地铁轨道站台")}})
+                    .value(QStringLiteral("result")).toObject()
+                    .value(QStringLiteral("accepted")).toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(!client.lastEvent(QStringLiteral("plan.created")).isEmpty(),
+                                 10000);
+        const QJsonObject created = client.lastEvent(QStringLiteral("plan.created"));
+        // 草稿记住的 open 档要落到 plan.created，且开放场景的 zones/motions 得带出来
+        QCOMPARE(created.value(QStringLiteral("shape")).toString(), QStringLiteral("open"));
+        QVERIFY2(created.value(QStringLiteral("zones")).toArray().size() >= 1,
+                 "plan.created 没带 zones，前端计划卡显示不了空间结构");
+        QVERIFY2(created.value(QStringLiteral("motions")).toArray().size() >= 1,
+                 "plan.created 没带 motions，前端计划卡显示不了时序动线");
+    }
+
     // 计划卡落库：draft.send 走真实握手 → plan.created 带 id → 刷新能按 id 恢复 → 确认后置 started
     void planCardPersistsAndUpdatesState()
     {
