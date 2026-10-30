@@ -10,6 +10,7 @@ import DraftCard from "./DraftCard.vue";
 import FolderPicker from "./FolderPicker.vue";
 import type { FolderNode } from "./FolderPicker.vue";
 import PlanCard from "./PlanCard.vue";
+import SceneLoadDialog from "./SceneLoadDialog.vue";
 
 type Area = "blender" | "unity";
 type ChatMode = "lowpoly" | "cloud3d";
@@ -19,6 +20,7 @@ const props = defineProps<{
   client: WsClient;
   settingsVersion?: number;
   selectedAsset?: string;
+  selectedAssetShape?: "prop" | "diorama" | "open";
 }>();
 // [修改此资产] / 右键菜单设定的目标；提交一条修改指令后清空
 const emit = defineEmits<{
@@ -41,6 +43,9 @@ const shapeHint: Record<Shape, string> = {
   diorama: "方形底盘的微缩舞台场景，构图不出框，适合展示与收藏",
   open: "无方形边界的大空间（街区、公园、车站），支持长轨道、跨区域与可选动画",
 };
+// 选中带档位的资产时锁定：有效档位以资产为准，用户不能改成别的模式去破坏它
+const shapeLocked = computed(() => !!props.selectedAssetShape);
+const effectiveShape = computed<Shape>(() => props.selectedAssetShape ?? shape.value);
 // 云API 只走“执行”：没有讨论链路，切过去时立刻退回执行态
 watch(mode, (value) => {
   if (value === "cloud3d" && chatMode.value === "ask") chatMode.value = "exec";
@@ -116,6 +121,14 @@ const loadingOlder = ref(false); // 翻页请求在飞，防止连续触顶叠�
 const showPending = computed(() => busy.value && !messages.value.some((item) => item.streaming));
 // 计划已确认、等选存放位置：folderPick.open 下发根目录树
 const pick = ref<{ requestId: string; rootName: string; tree: FolderNode } | null>(null);
+// 讨论前载入资产：后端下发 confirm，弹窗无超时，用户决定后才有「看得见场景」的讨论
+const pendingLoad = ref<{
+  area: string;
+  requestId: string;
+  file: string;
+  path: string;
+} | null>(null);
+const loadedScene = ref("");
 const unsubscribers: Array<() => void> = [];
 let streaming: ChatItem | null = null; // 指向 messages 里的流式气泡；必须是 reactive 代理，否则收口不触发重渲染
 // 用户已点停止：abort 前发出的帧可能晚到，不能让它们把 busy/气泡重新拉起来
@@ -446,6 +459,35 @@ onMounted(() => {
         tree: payload.tree,
       };
     }),
+    props.client.on("sceneLoad.confirm", (data) => {
+      const payload = data as {
+        area?: string;
+        requestId?: string;
+        file?: string;
+        path?: string;
+      };
+      if (payload?.area !== props.area || !payload.requestId) return;
+      pendingLoad.value = {
+        area: props.area,
+        requestId: payload.requestId,
+        file: payload.file ?? "",
+        path: payload.path ?? "",
+      };
+    }),
+    props.client.on("sceneLoad.loaded", (data) => {
+      const payload = data as { area?: string; file?: string };
+      if (payload?.area === props.area) loadedScene.value = payload.file ?? "";
+    }),
+    props.client.on("sceneLoad.notice", (data) => {
+      const payload = data as { area?: string; reason?: string };
+      if (payload?.area !== props.area) return;
+      // 没连上 / 载入失败：这一轮发不出去，得给个人看得见的理由（无源文件的情况前端入口已封死）
+      window.alert(
+        payload.reason === "blender-offline"
+          ? "未连接 Blender，本轮只能凭文字讨论。"
+          : "载入该资产的 .blend 失败，本轮只能凭文字讨论。",
+      );
+    }),
     props.client.on("error.card", (data) => {
       const card = data as {
         area?: string;
@@ -507,14 +549,26 @@ async function send() {
     if (props.area === "blender" && chatMode.value === "ask") {
       // 讨论不检查 Blender；带上当前资产只让模型知道在聊哪个文件
       params.mode = "ask";
-      params.shape = shape.value; // 讨论也要知道在聊哪一档
-      if (props.selectedAsset) params.asset = props.selectedAsset;
+      params.shape = effectiveShape.value; // 讨论也要知道在聊哪一档
+      if (props.selectedAsset) {
+        params.asset = props.selectedAsset;
+        if (!loadedScene.value && !pendingLoad.value) {
+          // 先把「会清空 Blender」问清楚，再让模型开口；否则一句话就把人场景换了
+          void props.client.request("sceneLoad.request", {
+            area: props.area,
+            asset: props.selectedAsset,
+          });
+          draft.value = text; // 载入确认弹窗不该吞掉用户刚写的这轮问题
+          busy.value = false;
+          return;
+        }
+      }
     } else if (modify) {
       params.mode = "modify";
       params.asset = props.selectedAsset;
     } else if (props.area === "blender") {
       params.mode = mode.value;
-      params.shape = shape.value;
+      params.shape = effectiveShape.value;
     }
     const result = await props.client.request<{ accepted?: boolean; error?: string }>(
       "chat.send",
@@ -657,12 +711,13 @@ function onKeydown(event: KeyboardEvent) {
         <button :class="{ active: mode === 'lowpoly' }" @click="mode = 'lowpoly'">低模</button>
         <button :class="{ active: mode === 'cloud3d' }" @click="mode = 'cloud3d'">云API</button>
       </div>
-      <div v-if="mode === 'lowpoly'" class="shape-switch">
+      <div v-if="mode === 'lowpoly'" class="shape-switch" :class="{ locked: shapeLocked }">
         <button
           v-for="(label, key) in shapeLabels"
           :key="key"
-          :class="{ active: shape === key }"
-          :title="shapeHint[key]"
+          :class="{ active: effectiveShape === key }"
+          :disabled="shapeLocked"
+          :title="shapeLocked ? '已锁定为该资产的模式，改档需先取消选中' : shapeHint[key]"
           @click="shape = key as Shape"
         >
           {{ label }}
@@ -812,6 +867,13 @@ function onKeydown(event: KeyboardEvent) {
       :tree="pick.tree"
       @close="onPickClosed"
     />
+
+    <SceneLoadDialog
+      v-if="pendingLoad"
+      :client="client"
+      :load="pendingLoad"
+      @decided="pendingLoad = null"
+    />
   </section>
 </template>
 
@@ -946,6 +1008,14 @@ function onKeydown(event: KeyboardEvent) {
 .shape-switch button.active {
   background: var(--accent);
   color: #fff;
+}
+
+.shape-switch.locked button {
+  cursor: not-allowed;
+}
+
+.shape-switch.locked button:not(.active) {
+  opacity: 0.4;
 }
 
 .badge {

@@ -1125,6 +1125,230 @@ private slots:
                  "plan.created 没带 motions，前端计划卡显示不了时序动线");
     }
 
+    // file.read 要能回该资产的产出形态：前端据此把三档开关锁到资产原本的档
+    void fileReadSurfacesAssetShapeForLocking()
+    {
+        QTemporaryDir dir;
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library + QStringLiteral("/Props")));
+        for (const QString& name : {QStringLiteral("desk.glb"), QStringLiteral("desk.blend")}) {
+            QFile f(library + QStringLiteral("/Props/") + name);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("x");
+            f.close();
+        }
+        // 资产卡落库到独立的 assets 表：磁盘 .blend 不带模式，档位只存这里
+        {
+            SessionStore seed(dir.path() + QStringLiteral("/sessions.db"));
+            QVERIFY(seed.open());
+            const QJsonObject card{
+                {QStringLiteral("name"), QStringLiteral("desk_01")},
+                {QStringLiteral("source"), QStringLiteral("lowpoly")},
+                {QStringLiteral("shape"), QStringLiteral("prop")},
+                {QStringLiteral("files"),
+                 QJsonArray{QJsonObject{{QStringLiteral("suffix"), QStringLiteral("glb")},
+                                        {QStringLiteral("path"), QStringLiteral("Props/desk.glb")}},
+                            QJsonObject{{QStringLiteral("suffix"), QStringLiteral("blend")},
+                                       {QStringLiteral("path"), QStringLiteral("Props/desk.blend")}}}}};
+            seed.upsertAsset(QStringLiteral("Props/desk.blend"), QStringLiteral("blender"),
+                             QStringLiteral("Props/desk.blend"), card);
+        }
+
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        const QJsonObject read = client.request(
+                                     QStringLiteral("file.read"),
+                                     {{QStringLiteral("area"), QStringLiteral("blender")},
+                                      {QStringLiteral("path"), QStringLiteral("Props/desk.glb")}})
+                                     .value(QStringLiteral("result"))
+                                     .toObject();
+        QVERIFY2(read.value(QStringLiteral("ok")).toBool(), qPrintable(QJsonDocument(read).toJson()));
+        QCOMPARE(read.value(QStringLiteral("blendPath")).toString(),
+                 QStringLiteral("Props/desk.blend"));
+        QCOMPARE(read.value(QStringLiteral("shape")).toString(), QStringLiteral("prop"));
+    }
+
+    // 档位存在 assets 表而非对话消息表：清空本区对话后，仍能回查该资产的模式
+    void assetShapeSurvivesChatClear()
+    {
+        QTemporaryDir dir;
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library + QStringLiteral("/Props")));
+        for (const QString& name : {QStringLiteral("desk.glb"), QStringLiteral("desk.blend")}) {
+            QFile f(library + QStringLiteral("/Props/") + name);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("x");
+            f.close();
+        }
+        {
+            SessionStore seed(dir.path() + QStringLiteral("/sessions.db"));
+            QVERIFY(seed.open());
+            // 既当历史卡（会被清空删掉），也登记进 assets 表（清空对话不动它）
+            const QJsonObject card{
+                {QStringLiteral("name"), QStringLiteral("desk_01")},
+                {QStringLiteral("source"), QStringLiteral("lowpoly")},
+                {QStringLiteral("shape"), QStringLiteral("open")},
+                {QStringLiteral("files"), QJsonArray{QJsonObject{
+                    {QStringLiteral("suffix"), QStringLiteral("blend")},
+                    {QStringLiteral("path"), QStringLiteral("Props/desk.blend")}}}}};
+            seed.appendMessage(QStringLiteral("blender"), QStringLiteral("asset"),
+                               QString::fromUtf8(
+                                   QJsonDocument(card).toJson(QJsonDocument::Compact)),
+                               QJsonObject{{QStringLiteral("state"), QStringLiteral("done")}});
+            seed.upsertAsset(QStringLiteral("Props/desk.blend"), QStringLiteral("blender"),
+                             QStringLiteral("Props/desk.blend"), card);
+        }
+
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        // 清空本区对话：messages 被删，但 assets 表保留
+        QVERIFY(client.request(QStringLiteral("chat.clear"),
+                               {{QStringLiteral("area"), QStringLiteral("blender")}})
+                    .contains(QStringLiteral("result")));
+
+        const QJsonObject read = client.request(
+                                     QStringLiteral("file.read"),
+                                     {{QStringLiteral("area"), QStringLiteral("blender")},
+                                      {QStringLiteral("path"), QStringLiteral("Props/desk.blend")}})
+                                     .value(QStringLiteral("result"))
+                                     .toObject();
+        QVERIFY2(read.value(QStringLiteral("ok")).toBool(), qPrintable(QJsonDocument(read).toJson()));
+        QCOMPARE(read.value(QStringLiteral("shape")).toString(), QStringLiteral("open"));
+    }
+
+    // 讨论载入资产：无 .blend 的资产（云 glb）只能回错误码，绝不弹「会清空场景」确认
+    void sceneLoadRejectsAssetWithoutBlendSource()
+    {
+        QTemporaryDir dir;
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library + QStringLiteral("/Props")));
+        QFile glb(library + QStringLiteral("/Props/cloud_crate.glb"));
+        QVERIFY(glb.open(QIODevice::WriteOnly));
+        glb.write("glTF");
+        glb.close();
+
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        const int mark = client.mark();
+        const QJsonObject result = client.request(
+                                       QStringLiteral("sceneLoad.request"),
+                                       {{QStringLiteral("area"), QStringLiteral("blender")},
+                                        {QStringLiteral("asset"), QStringLiteral("Props/cloud_crate.glb")}})
+                                       .value(QStringLiteral("result"))
+                                       .toObject();
+        QCOMPARE(result.value(QStringLiteral("error")).toString(),
+                 QStringLiteral("no-blend-source"));
+        QVERIFY2(!client.eventsSince(mark).contains(QStringLiteral("sceneLoad.confirm")),
+                 "没有源文件绝不能弹「会清空场景」的确认窗");
+        QVERIFY2(!client.eventsSince(mark).contains(QStringLiteral("sceneLoad.notice")),
+                 "这个入口前端已封死，后端不该再为它做一套提示 UI");
+    }
+
+    // 有 .blend：先弹无超时确认；取消后同一 requestId 不能再生效（否则旧弹窗会载入两次）
+    void sceneLoadConfirmThenDeclineClearsPendingRequest()
+    {
+        QTemporaryDir dir;
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library + QStringLiteral("/Props")));
+        for (const QString& name : {QStringLiteral("desk.glb"), QStringLiteral("desk.blend")}) {
+            QFile f(library + QStringLiteral("/Props/") + name);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("x");
+            f.close();
+        }
+
+        CoreApp app({dir.path(), true, library, mockBlenderBridge()});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+        // request 处理器先查 m_mcp->isReady()：桥接没握手成功只会广播 notice，弹不出 confirm
+        QTRY_VERIFY_WITH_TIMEOUT(client.lastEvent(QStringLiteral("conn.status"))
+                                     .value(QStringLiteral("blender")).toString()
+                                 == QStringLiteral("ready"),
+                                 10000);
+
+        const int mark = client.mark();
+        client.request(QStringLiteral("sceneLoad.request"),
+                       {{QStringLiteral("area"), QStringLiteral("blender")},
+                        {QStringLiteral("asset"), QStringLiteral("Props/desk.glb")}});
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !client.lastEvent(QStringLiteral("sceneLoad.confirm"), mark).isEmpty(), 5000);
+        const QJsonObject confirm = client.lastEvent(QStringLiteral("sceneLoad.confirm"), mark);
+        const QString requestId = confirm.value(QStringLiteral("requestId")).toString();
+        // file 是基名（弹窗自己拼 .blend 显示），path 才带完整源文件路径
+        QCOMPARE(confirm.value(QStringLiteral("file")).toString(), QStringLiteral("desk"));
+        QVERIFY(confirm.value(QStringLiteral("path")).toString().endsWith(QStringLiteral("desk.blend")));
+
+        // 取消：弹窗关掉、不载入，讨论仍可正常纯文字进行
+        const QJsonObject declined = client.request(
+            QStringLiteral("sceneLoad.decline"), {{QStringLiteral("requestId"), requestId}})
+            .value(QStringLiteral("result")).toObject();
+        QVERIFY(declined.value(QStringLiteral("cancelled")).toBool());
+        // 同一个 requestId 不能再被确认：否则旧弹窗点确定会载入两次
+        // （handler 自己返回的错误都在 result 里面，外层 error 只由 WsServer::sendError 产生）
+        QCOMPARE(client.request(QStringLiteral("sceneLoad.accept"),
+                                {{QStringLiteral("requestId"), requestId}})
+                     .value(QStringLiteral("result"))
+                     .toObject()
+                     .value(QStringLiteral("error"))
+                     .toString(),
+                 QStringLiteral("request-not-found"));
+    }
+
+    // 确认载入：走 execute_blender_code 真替换场景 → sceneLoad.loaded + 记档 m_loadedScenes
+    void sceneLoadAcceptLoadsAndBroadcastsLoaded()
+    {
+        QTemporaryDir dir;
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library + QStringLiteral("/Props")));
+        for (const QString& name : {QStringLiteral("desk.glb"), QStringLiteral("desk.blend")}) {
+            QFile f(library + QStringLiteral("/Props/") + name);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("x");
+            f.close();
+        }
+
+        CoreApp app({dir.path(), true, library, mockBlenderBridge()});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+        QTRY_VERIFY_WITH_TIMEOUT(client.lastEvent(QStringLiteral("conn.status"))
+                                     .value(QStringLiteral("blender")).toString()
+                                 == QStringLiteral("ready"),
+                                 10000);
+
+        const int mark = client.mark();
+        client.request(QStringLiteral("sceneLoad.request"),
+                       {{QStringLiteral("area"), QStringLiteral("blender")},
+                        {QStringLiteral("asset"), QStringLiteral("Props/desk.glb")}});
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !client.lastEvent(QStringLiteral("sceneLoad.confirm"), mark).isEmpty(), 5000);
+        const QString requestId =
+            client.lastEvent(QStringLiteral("sceneLoad.confirm"), mark)
+                .value(QStringLiteral("requestId")).toString();
+
+        const QJsonObject accepted = client.request(
+            QStringLiteral("sceneLoad.accept"), {{QStringLiteral("requestId"), requestId}})
+            .value(QStringLiteral("result")).toObject();
+        QVERIFY2(accepted.value(QStringLiteral("ok")).toBool(),
+                 qPrintable(QJsonDocument(accepted).toJson()));
+        // 假桥接对 execute_blender_code 回成功：载入完成后广播 loaded 并带基名
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !client.lastEvent(QStringLiteral("sceneLoad.loaded"), mark).isEmpty(), 5000);
+        QCOMPARE(client.lastEvent(QStringLiteral("sceneLoad.loaded"), mark)
+                     .value(QStringLiteral("file")).toString(),
+                 QStringLiteral("desk"));
+    }
+
     // 计划卡落库：draft.send 走真实握手 → plan.created 带 id → 刷新能按 id 恢复 → 确认后置 started
     void planCardPersistsAndUpdatesState()
     {

@@ -66,6 +66,8 @@ private:
     QJsonValue handleChatSend(const QJsonObject& params, bool appendUser = true);
     // 修改已有资产：单组计划直接执行，调用前草稿已转正为 user 行
     QJsonValue startModify(const QString& area, const QString& asset, const QString& text);
+    // 按 .blend 相对路径回查该资产的产出形态（prop/diorama/open），查不到返回空
+    QString assetShapeForPath(const QString& area, const QString& blendRelative) const;
     void broadcastConnStatus(const QString& area, const QString& status, const QString& hint);
     // 新客户端连上时补发当前状态：桥接先就绪、页面后加载也不会永远灰灯
     void broadcastStatusSnapshot() const;
@@ -103,6 +105,10 @@ private:
     QSet<QString> m_planCancelled;              // area -> 规划取消标记
     QHash<QString, PendingPick> m_pendingPicks; // area -> 等待选目录的执行任务
     QHash<QString, QString> m_pickRequests;     // requestId -> area
+    // 讨论载入资产：requestId -> 区；区 -> 待载入的 .blend 绝对路径
+    QHash<QString, QString> m_sceneLoadRequests;
+    QHash<QString, QString> m_sceneLoadTargets;
+    QHash<QString, QString> m_loadedScenes; // 区 -> 已载入的 .blend，Task 8 据此给只读工具
     QHash<QString, QString> m_status; // area -> off|reconnecting|ready
     QHash<QString, QString> m_hints;  // area -> 状态提示文案
     QSet<QString> m_everReady;        // 曾握手成功的区：之后的 off 才算桥接崩溃

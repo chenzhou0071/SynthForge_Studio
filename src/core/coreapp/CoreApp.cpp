@@ -3,6 +3,7 @@
 #include "core/agent/AgentOrchestrator.h"
 #include "core/agent/AskReply.h"
 #include "core/agent/ShapePolicy.h"
+#include "core/agent/SceneLoader.h"
 #include "core/agent/SummarizerAgent.h"
 #include "core/assets/AssetLibrary.h"
 #include "core/cloud3d/Cloud3dService.h"
@@ -10,6 +11,7 @@
 #include "core/llm/LlmGateway.h"
 #include "core/llm/ToolBridge.h"
 #include "core/mcp/BridgeCommands.h"
+#include "core/mcp/McpClient.h"
 #include "core/mcp/McpRuntime.h"
 #include "core/mcp/StdioTransport.h"
 #include "core/preflight/PreflightChecker.h"
@@ -169,6 +171,9 @@ bool CoreApp::start()
                 input.createdAt =
                     QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm"));
                 const QJsonObject card = makeAssetCard(input);
+                // 云资产同样登记进 assets 表（glb 相对路径为键）；它没有 .blend，
+                // 不会被载入/修改的档位回查命中，这里只为让资产登记表完整、跨清空不丢
+                m_sessions->upsertAsset(relative, area, relative, card);
                 const qint64 cardId = m_sessions->appendMessage(
                     area, QStringLiteral("asset"),
                     QString::fromUtf8(QJsonDocument(card).toJson(QJsonDocument::Compact)),
@@ -338,6 +343,11 @@ bool CoreApp::start()
                     input.dir = dir == QLatin1String(".") ? QString() : dir;
                     input.createdAt = createdAt;
                     const QJsonObject card = makeAssetCard(input);
+                    // 除对话里那张卡外，再登记进独立的 assets 表：以 .blend 相对路径为幂等键，
+                    // 一个资产改很多次也只覆盖同一行，且「清空本区对话」不会抹掉它的档位
+                    const QString blendRel = paths.value(QStringLiteral("blend")).toString();
+                    m_sessions->upsertAsset(blendRel.isEmpty() ? relative : blendRel, area,
+                                            blendRel.isEmpty() ? relative : blendRel, card);
                     const qint64 cardId = m_sessions->appendMessage(
                         area, QStringLiteral("asset"),
                         QString::fromUtf8(QJsonDocument(card).toJson(QJsonDocument::Compact)),
@@ -710,6 +720,97 @@ bool CoreApp::start()
                                       QJsonObject{{"area", area}, {"reason", "user-cancelled"}});
                                   return QJsonValue(QJsonObject{{"ok", true}});
                               });
+    // 讨论载入资产 .blend：载入是全量替换当前场景，必须由人确认（无超时），系统再备份兜底
+    m_router->registerHandler(QStringLiteral("sceneLoad.request"),
+                              [this](const QJsonObject& params) {
+                                  const QString area = params.value(QStringLiteral("area")).toString();
+                                  const QString asset = params.value(QStringLiteral("asset")).toString();
+                                  const QString blend = resolveBlendSource(*m_library, asset);
+                                  if (blend.isEmpty()) {
+                                      // 正常走不到这里：只有 .blend 资产才拿得到 selectedAsset（App.vue 的修改按钮已拦下云资产）。
+                                      // 只回一个错误码，不广播、不弹窗——不给「不存在的入口」做第二套 UI
+                                      return QJsonValue(QJsonObject{{"accepted", false},
+                                                                    {"error", "no-blend-source"}});
+                                  }
+                                  if (!m_blender->isReady()) {
+                                      m_ws->broadcastEvent(
+                                          QStringLiteral("sceneLoad.notice"),
+                                          QJsonObject{{"area", area}, {"reason", "blender-offline"}});
+                                      return QJsonValue(QJsonObject{{"accepted", false},
+                                                                    {"reason", "blender-offline"}});
+                                  }
+                                  // 每次都弹：哪怕 Blender 是空的也弹——「会清空当前场景」这件事必须由人确认，
+                                  // 不能由程序判断「应该没东西」就替人做决定
+                                  for (auto it = m_sceneLoadRequests.begin();
+                                       it != m_sceneLoadRequests.end();) {
+                                      if (it.value() == area)
+                                          it = m_sceneLoadRequests.erase(it);
+                                      else
+                                          ++it;
+                                  }
+                                  m_sceneLoadTargets.insert(area, blend);
+                                  const QString requestId =
+                                      QStringLiteral("load-%1").arg(++m_seq);
+                                  m_sceneLoadRequests.insert(requestId, area);
+                                  m_ws->broadcastEvent(
+                                      QStringLiteral("sceneLoad.confirm"),
+                                      QJsonObject{{"area", area},
+                                                  {"requestId", requestId},
+                                                  {"file", QFileInfo(blend).completeBaseName()},
+                                                  {"path", blend}});
+                                  return QJsonValue(QJsonObject{{"accepted", true},
+                                                                {"requestId", requestId}});
+                              });
+    m_router->registerHandler(QStringLiteral("sceneLoad.decline"),
+                              [this](const QJsonObject& params) {
+                                  const QString area = m_sceneLoadRequests.take(
+                                      params.value("requestId").toString());
+                                  if (!area.isEmpty())
+                                      m_sceneLoadTargets.remove(area);
+                                  return QJsonValue(QJsonObject{{"ok", true}, {"cancelled", true}});
+                              });
+    m_router->registerHandler(QStringLiteral("sceneLoad.accept"),
+                              [this](const QJsonObject& params) {
+                                  const QString requestId =
+                                      params.value(QStringLiteral("requestId")).toString();
+                                  const QString area = m_sceneLoadRequests.take(requestId);
+                                  if (area.isEmpty()) // 旧弹窗或已取消：绝不重复载入
+                                      return QJsonValue(QJsonObject{{"ok", false},
+                                                                    {"error", "request-not-found"}});
+                                  const QString blend = m_sceneLoadTargets.take(area);
+                                  if (m_blenderGate.isBusy()) {
+                                      // 忙：把 requestId 还回去，弹窗不关，空闲后可再点确定（与 folderPick 同语义）
+                                      m_sceneLoadRequests.insert(requestId, area);
+                                      m_sceneLoadTargets.insert(area, blend);
+                                      m_ws->broadcastEvent(
+                                          QStringLiteral("error.card"),
+                                          QJsonObject{{"area", area}, {"reason", "blender-busy"}});
+                                      return QJsonValue(QJsonObject{{"ok", false},
+                                                                    {"error", "blender-busy"}});
+                                  }
+                                  if (!m_blenderGate.tryAcquire(QStringLiteral("discussion-read")))
+                                      return QJsonValue(QJsonObject{{"ok", false},
+                                                                    {"error", "blender-busy"}});
+                                  const QString script = sceneLoadScript(blend);
+                                  m_blender->client()->callTool(
+                                      QStringLiteral("execute_blender_code"),
+                                      QJsonObject{{"code", script}},
+                                      [this, area, blend](const QJsonValue&, const QJsonObject& error) {
+                                          m_blenderGate.release(QStringLiteral("discussion-read"));
+                                          if (!error.isEmpty()) {
+                                              m_ws->broadcastEvent(
+                                                  QStringLiteral("sceneLoad.notice"),
+                                                  QJsonObject{{"area", area}, {"reason", "load-failed"}});
+                                              return;
+                                          }
+                                          m_loadedScenes.insert(area, blend);
+                                          m_ws->broadcastEvent(
+                                              QStringLiteral("sceneLoad.loaded"),
+                                              QJsonObject{{"area", area},
+                                                          {"file", QFileInfo(blend).completeBaseName()}});
+                                      });
+                                  return QJsonValue(QJsonObject{{"ok", true}});
+                              });
     m_router->registerHandler(QStringLiteral("folderPick.mkdir"),
                               [this](const QJsonObject& params) {
                                   const QString parent = params.value("path").toString();
@@ -790,6 +891,8 @@ bool CoreApp::start()
                 // 模型三种格式都回 blendPath：修改入口据此判断有没有可编辑源文件
                 const QFileInfo blend(info.dir().filePath(info.completeBaseName()
                                                           + QStringLiteral(".blend")));
+                const QString blendRel =
+                    blend.exists() ? m_library->relativeFor(blend.absoluteFilePath()) : QString();
                 return QJsonValue(QJsonObject{
                     {"ok", true},
                     {"kind", "model"},
@@ -797,9 +900,9 @@ bool CoreApp::start()
                     // 前端加载前轮询这两个字段，确认导出已经写完再交给 three.js
                     {"size", static_cast<double>(info.size())},
                     {"modified", info.lastModified().toString(Qt::ISODate)},
-                    {"blendPath", blend.exists()
-                                      ? m_library->relativeFor(blend.absoluteFilePath())
-                                      : QString()}});
+                    {"blendPath", blendRel},
+                    // 档位供前端把三档开关锁到该资产产出时的模式（未知则为空，不锁）
+                    {"shape", assetShapeForPath(area, blendRel)}});
             }
             // fbx / blend 不读内容（可能几十 MB），只回文件信息卡
             if (suffix == QLatin1String("fbx") || suffix == QLatin1String("blend")) {
@@ -808,14 +911,15 @@ bool CoreApp::start()
                         ? info
                         : QFileInfo(info.dir().filePath(info.completeBaseName()
                                                         + QStringLiteral(".blend")));
+                const QString blendRel =
+                    blend.exists() ? m_library->relativeFor(blend.absoluteFilePath()) : QString();
                 return QJsonValue(QJsonObject{
                     {"ok", true},
                     {"kind", "info"},
                     {"size", static_cast<double>(info.size())},
                     {"modified", info.lastModified().toString(Qt::ISODate)},
-                    {"blendPath", blend.exists()
-                                      ? m_library->relativeFor(blend.absoluteFilePath())
-                                      : QString()}});
+                    {"blendPath", blendRel},
+                    {"shape", assetShapeForPath(area, blendRel)}});
             }
             QFile file(abs);
             if (!file.open(QIODevice::ReadOnly))
@@ -1330,6 +1434,29 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
 
     return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
 }
+QString CoreApp::assetShapeForPath(const QString& area, const QString& blendRelative) const
+{
+    if (blendRelative.isEmpty())
+        return {};
+    // 磁盘上的 .blend 不带模式，档位只记在 assets 表（独立于对话历史，清空对话也不丢）：
+    // assets() 按 updated 倒序返回，第一次命中即最新一张卡；一个资产改很多次也只一行
+    const QJsonArray rows = m_sessions->assets(area);
+    for (const QJsonValue& value : rows) {
+        const QJsonObject card = value.toObject().value(QStringLiteral("card")).toObject();
+        for (const QJsonValue& file : card.value(QStringLiteral("files")).toArray()) {
+            const QJsonObject fo = file.toObject();
+            if (fo.value(QStringLiteral("suffix")).toString() != QLatin1String("blend"))
+                continue;
+            if (fo.value(QStringLiteral("path")).toString().compare(
+                    blendRelative, Qt::CaseInsensitive) == 0) {
+                const QString shape = card.value(QStringLiteral("shape")).toString();
+                if (!shape.isEmpty())
+                    return shape;
+            }
+        }
+    }
+    return {};
+}
 
 QJsonValue CoreApp::startModify(const QString& area, const QString& asset, const QString& text)
 {
@@ -1354,6 +1481,9 @@ QJsonValue CoreApp::startModify(const QString& area, const QString& asset, const
     plan.groups.append(group);
     plan.maxSteps = 50;
     plan.targetBase = info.completeBaseName(); // 导出回合据此覆盖同名文件
+    // 修改沿用该资产产出时的档位：查不到（外部导入的老资产）才回落盒式舞台。
+    // 不让一个道具椅子被盒式舞台的「正方形底座」纪律改坏，也不给开放场景丢 FX。
+    plan.shape = shapeFromString(assetShapeForPath(area, blendRelative));
     const QString prompt = QStringLiteral("打开 .blend 源文件 %1。要求：%2。"
                                           "保留场景里已有的可导出动效（物体关键帧），不要删除或覆盖。"
                                           "过程中不要自行导出或保存；完成后由系统统一覆盖导出同名 "
@@ -1362,7 +1492,7 @@ QJsonValue CoreApp::startModify(const QString& area, const QString& asset, const
     const QString taskId = QStringLiteral("chat-%1").arg(++m_seq);
     const QString targetFolder = info.absolutePath();
     // 修改任务不走 plan.confirm，档位在这里记：不写就会留着上一次任务的档，
-    // 资产卡会挂着错的 shape 让讨论模式选错模板。今天修改恒为盒式舞台。
+    // 资产卡会挂着错的 shape 让讨论模式选错模板。取该资产产出时的档位。
     m_shapeByArea.insert(area, plan.shape);
     // 草稿已转正成最后一条 user，prompt 还会拼在末尾：历史里去掉同一条避免重复
     const QJsonArray history = historyForPrompt(area, text, 20);

@@ -28,6 +28,8 @@ const showExporting = computed(() => active.value === "blender" && exporting.val
 let previewSeq = 0; // 连续点文件时只让最后一次等待生效
 // 已归一化到 .blend 的修改目标；Task 6 会把它作为 chip 传给 ChatPanel
 const modifyTarget = ref<string | null>(null);
+// 选中资产的产出形态：ChatPanel 据此把三档开关锁到该档（未知则不锁）
+const modifyTargetShape = ref<"prop" | "diorama" | "open" | undefined>(undefined);
 // 设置保存后递增，让常驻的 ChatPanel 重新拉取云API 徽标状态
 const settingsVersion = ref(0);
 const lamp = ref<{ blender: LampState; unity: LampState }>({ blender: "off", unity: "off" });
@@ -68,7 +70,8 @@ function previewAsset(path: string) {
 async function readFile(path: string, area: Area = active.value) {
   return (await client.request("file.read", { area, path })) as {
     ok?: boolean; kind?: PreviewFile["kind"]; content?: string; dataUrl?: string;
-    language?: string; size?: number; modified?: string; blendPath?: string; error?: string;
+    language?: string; size?: number; modified?: string; blendPath?: string; shape?: string;
+    error?: string;
   };
 }
 
@@ -138,12 +141,23 @@ async function requestModify(path: string) {
     return;
   }
   modifyTarget.value = res.blendPath; // 输入框上方出现 chip，随下一条消息发给 chat.send
+  modifyTargetShape.value =
+    res.shape === "prop" || res.shape === "diorama" || res.shape === "open"
+      ? res.shape
+      : undefined;
+}
+
+// 取消修改目标（ChatPanel 的 chip 关闭 / 提交后）：连带清掉锁定的档位
+function clearModify() {
+  modifyTarget.value = null;
+  modifyTargetShape.value = undefined;
 }
 
 // 切区后旧区预览不再适用，清掉避免 Unity 区显示 Blender 资产
 watch(active, () => {
   previewFile.value = null;
   modifyTarget.value = null;
+  modifyTargetShape.value = undefined;
   previewSeq++; // 旧区的等待结果作废
 });
 
@@ -220,7 +234,8 @@ onBeforeUnmount(() => {
           :client="client"
           :settings-version="settingsVersion"
           :selected-asset="modifyTarget ?? undefined"
-          @clear-asset="modifyTarget = null"
+          :selected-asset-shape="modifyTargetShape"
+          @clear-asset="clearModify"
           @preview="previewAsset"
           @open-settings="openSettings"
         />

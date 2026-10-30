@@ -28,6 +28,7 @@ add_library(synthforge_core STATIC
     src/core/agent/SummarizerAgent.cpp
     src/core/agent/AskReply.cpp
     src/core/agent/ShapePolicy.cpp
+    src/core/agent/SceneLoader.cpp
     src/core/agent/AgentOrchestrator.cpp
     src/core/assets/AssetLibrary.cpp
     src/core/cloud3d/Cloud3dProvider.cpp
@@ -247,6 +248,12 @@ add_executable(tst_shape_policy tests/tst_shape_policy.cpp)
 target_link_libraries(tst_shape_policy PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_shape_policy COMMAND tst_shape_policy)
 set_tests_properties(tst_shape_policy PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_scene_loader tests/tst_scene_loader.cpp)
+target_link_libraries(tst_scene_loader PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_scene_loader COMMAND tst_scene_loader)
+set_tests_properties(tst_scene_loader PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
 add_executable(tst_ui_state tests/tst_ui_state.cpp)

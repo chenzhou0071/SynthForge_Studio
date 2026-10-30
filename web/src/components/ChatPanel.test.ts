@@ -1154,6 +1154,64 @@ describe("ChatPanel", () => {
     expect(sent.shape).toBe("diorama");
   });
 
+  // 选中一个带档位的资产后，三档开关自动跳到该档并锁死：不能用开放场景提示词改一把道具椅子
+  it("locks the shape switch to the selected asset's own mode", async () => {
+    const { wrapper } = mountPanel("blender", undefined, {
+      selectedAsset: "Props/desk/desk.blend",
+      selectedAssetShape: "prop",
+    });
+    await flushPromises();
+
+    const buttons = wrapper.findAll(".shape-switch button");
+    expect(buttons).toHaveLength(3);
+    expect(buttons[0]!.classes()).toContain("active"); // 自动落到道具
+    // 锁死：三个按钮全禁用，点开放场景也不生效
+    expect(buttons.every((b) => (b.element as HTMLButtonElement).disabled)).toBe(true);
+    await buttons[2]!.trigger("click");
+    await flushPromises();
+    expect(buttons[0]!.classes()).toContain("active");
+    expect(buttons[2]!.classes()).not.toContain("active");
+  });
+
+  // 讨论一个已选中的资产前，必须先无超时确认载入 .blend，本轮不发消息
+  it("requests a scene load before discussing a selected asset, and defers the send", async () => {
+    const { client, wrapper } = mountPanel("blender", undefined, {
+      selectedAsset: "Props/desk/desk.blend",
+    });
+    await flushPromises();
+    client.results.set("chat.send", { accepted: true });
+
+    await wrapper.findAll(".chat-mode button")[0]!.trigger("click"); // 讨论
+    await wrapper.find("textarea").setValue("这个桌面材质怎么调更旧");
+    await wrapper.find("button.primary").trigger("click");
+    await flushPromises();
+
+    // 先发起载入确认，且这一轮没有把讨论消息发出去
+    const req = client.callsOf("sceneLoad.request").at(-1)?.params as Record<string, unknown>;
+    expect(req.asset).toBe("Props/desk/desk.blend");
+    expect(client.callsOf("chat.send")).toHaveLength(0);
+    // 用户刚写的这轮问题不能被吞掉
+    expect((wrapper.find("textarea").element as HTMLTextAreaElement).value).toBe(
+      "这个桌面材质怎么调更旧",
+    );
+  });
+
+  it("shows the load confirmation dialog when the backend broadcasts sceneLoad.confirm", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+
+    client.emit("sceneLoad.confirm", {
+      area: "blender",
+      requestId: "load-9",
+      file: "desk",
+      path: "d:/lib/Props/desk.blend",
+    });
+    await flushPromises();
+
+    expect(wrapper.find(".dialog").exists()).toBe(true);
+    expect(wrapper.text()).toContain("会替换 Blender 当前场景");
+  });
+
   // 计划卡要把后端 plan.created 带来的档位、分区、动线显示出来
   it("shows the output shape, zones and motions on the plan card", async () => {
     const { client, wrapper } = mountPanel("blender");
