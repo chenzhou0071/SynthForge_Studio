@@ -28,12 +28,12 @@ private slots:
 
         for (const QString& name : {"manage_gameobject", "create_script", "read_console",
                                     "find_gameobjects", "import_model_file", "refresh_unity",
-                                    "validate_script", "batch_execute", "apply_text_edits",
+                                    "validate_script", "apply_text_edits",
                                     "script_apply_edits", "delete_script", "run_tests",
                                     "execute_code", "get_test_job"})
             QVERIFY2(kept.contains(name), qPrintable(name + " 应被放行"));
         for (const QString& name : {"generate_image", "generate_model", "get_sha",
-                                    "execute_menu_item", "set_active_instance"})
+                                    "execute_menu_item", "set_active_instance", "batch_execute"})
             QVERIFY2(!kept.contains(name), qPrintable(name + " 应被挡掉"));
     }
 

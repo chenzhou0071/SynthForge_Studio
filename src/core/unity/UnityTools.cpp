@@ -6,13 +6,14 @@
 
 QJsonArray filterUnityTools(const QJsonArray& all)
 {
-    // 前缀白名单：除“实机游玩”外的编辑器/脚本/测试类操作都放行
+    // 前缀白名单：除“实机游玩”外的编辑器/脚本/测试类操作都放行。
+    // 不含 batch_：batch_execute 一次跑多条、破坏面大且易乱改，故意排除。
     static const QStringList prefixes{QStringLiteral("manage_"), QStringLiteral("create_"),
                                       QStringLiteral("read_"), QStringLiteral("find_"),
                                       QStringLiteral("import_"), QStringLiteral("refresh_"),
-                                      QStringLiteral("validate_"), QStringLiteral("batch_"),
-                                      QStringLiteral("apply_"), QStringLiteral("script_"),
-                                      QStringLiteral("delete_"), QStringLiteral("run_")};
+                                      QStringLiteral("validate_"), QStringLiteral("apply_"),
+                                      QStringLiteral("script_"), QStringLiteral("delete_"),
+                                      QStringLiteral("run_")};
     // 按名精确放行：execute_ / get_ 前缀太宽，只开这两个，避免误放 execute_menu_item / get_sha
     static const QSet<QString> extras{QStringLiteral("execute_code"),
                                       QStringLiteral("get_test_job")};
