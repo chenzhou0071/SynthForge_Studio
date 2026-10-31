@@ -5,6 +5,7 @@ import { toChatItems } from "../chat/history";
 import type { AssetData, ChatItem, PlanGroup } from "../chat/history";
 import type { WsClient } from "../ws/WsClient";
 import ChatMessage from "./ChatMessage.vue";
+import AssetPicker from "./AssetPicker.vue";
 import FolderPicker from "./FolderPicker.vue";
 import type { FolderNode } from "./FolderPicker.vue";
 import SceneLoadDialog from "./SceneLoadDialog.vue";
@@ -28,6 +29,9 @@ const emit = defineEmits<{
 
 const messages = ref<ChatItem[]>([]);
 const draft = ref("");
+// unity 区「添加资产」：待发送的附件（相对模型库路径）+ 选择器开关
+const attachments = ref<string[]>([]);
+const pickerOpen = ref(false);
 const mode = ref<ChatMode>("lowpoly");
 // 讨论只聊方案、不碰 Blender；执行先出草稿卡，确认后才动手
 const chatMode = ref<"ask" | "exec">("exec");
@@ -554,18 +558,31 @@ onBeforeUnmount(() => {
   unsubscribers.forEach((off) => off());
 });
 
+function onAssetsPicked(paths: string[]) {
+  for (const path of paths) if (!attachments.value.includes(path)) attachments.value.push(path);
+  pickerOpen.value = false;
+}
+
+function removeAttachment(path: string) {
+  attachments.value = attachments.value.filter((item) => item !== path);
+}
+
 async function send() {
+  if (busy.value) return;
   const text = draft.value.trim();
-  if (!text || busy.value) return;
+  const sendAttachments = props.area === "unity" ? [...attachments.value] : [];
+  if (!text && !sendAttachments.length) return;
   cancelRequested = false;
   cloudPercent.value = null; // 新一轮任务从零开始，不沿用上一轮的百分比
   cloudState.value = "";
   draft.value = "";
+  attachments.value = []; // 附件随本条消息发出后清空
   busy.value = true;
   // modifyTarget 只由 [修改此资产] / 右键菜单设定，点文件不会触发修改
   const modify = props.area === "blender" && !!props.selectedAsset;
   try {
     const params: Record<string, unknown> = { area: props.area, text };
+    if (sendAttachments.length) params.attachments = sendAttachments;
     if (props.area === "blender" && chatMode.value === "ask") {
       // 讨论不检查 Blender；带上当前资产只让模型知道在聊哪个文件
       params.mode = "ask";
@@ -835,6 +852,12 @@ function onKeydown(event: KeyboardEvent) {
         <span>目标资产：{{ assetName }}</span>
         <button type="button" title="取消修改目标" @click="emit('clearAsset')">✕</button>
       </div>
+      <div v-if="area === 'unity' && attachments.length" class="attach-chips">
+        <span v-for="path in attachments" :key="path" class="chip">
+          {{ path.split("/").pop() }}
+          <button type="button" title="移除附件" @click="removeAttachment(path)">✕</button>
+        </span>
+      </div>
       <textarea
         v-model="draft"
         rows="3"
@@ -849,8 +872,20 @@ function onKeydown(event: KeyboardEvent) {
         <div class="fill" :style="{ width: `${cloudPercent}%` }"></div>
       </div>
       <div class="chat-actions">
+        <button
+          v-if="area === 'unity'"
+          class="add-asset"
+          :disabled="busy"
+          @click="pickerOpen = true"
+        >
+          添加资产
+        </button>
         <button v-if="busy" class="stop" @click="cancelTask">停止</button>
-        <button class="primary" :disabled="busy || !draft.trim()" @click="send">
+        <button
+          class="primary"
+          :disabled="busy || (!draft.trim() && !(area === 'unity' && attachments.length))"
+          @click="send"
+        >
           {{ busy ? busyLabel : "发送" }}
         </button>
       </div>
@@ -875,6 +910,13 @@ function onKeydown(event: KeyboardEvent) {
         pendingLoad = null;
         flushPendingAsk();
       "
+    />
+
+    <AssetPicker
+      v-if="pickerOpen"
+      :client="client"
+      @close="pickerOpen = false"
+      @confirm="onAssetsPicked"
     />
   </section>
 </template>
@@ -1085,6 +1127,56 @@ function onKeydown(event: KeyboardEvent) {
 .asset-chip button:hover {
   color: var(--text);
   border-color: var(--muted);
+}
+
+/* 附件 chip：unity 区待发送的模型库资产 */
+.attach-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0;
+}
+
+.attach-chips .chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.attach-chips .chip button {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.add-asset {
+  margin-right: auto;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--muted);
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.add-asset:hover {
+  color: var(--text);
+  border-color: var(--muted);
+}
+
+.add-asset:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .pending {

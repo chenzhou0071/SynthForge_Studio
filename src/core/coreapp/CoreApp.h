@@ -31,6 +31,7 @@ class UiState;
 class DiscussionAgent;
 class ProjectService;
 class DirectoryWatcher;
+class AssetImporter;
 
 struct CoreOptions
 {
@@ -105,6 +106,7 @@ private:
     std::unique_ptr<DiscussionAgent> m_ask;  // 讨论模式：只读感知 Blender 的多轮问答
     ProjectService* m_projects = nullptr;    // QObject child：Unity 区唯一激活工程状态机
     DirectoryWatcher* m_watcher = nullptr;   // QObject child：<project>/Assets 目录监控
+    AssetImporter* m_importer = nullptr;     // QObject child：添加资产 glb→fbx 转换 + Unity 导入
     FolderPicker m_folderPicker;             // GUI 注入的文件夹选择回调（headless 为空）
     bool m_pickingFolder = false;            // 选择框打开中：并发请求一律 busy
     std::unique_ptr<Cloud3dService> m_cloud;  // 云 3D 轮询与下载，独立于任务队列

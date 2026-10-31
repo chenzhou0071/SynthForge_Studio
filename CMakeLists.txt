@@ -23,6 +23,7 @@ add_library(synthforge_core STATIC
     src/core/unity/ProjectService.cpp
     src/core/unity/DirectoryWatcher.cpp
     src/core/unity/UnityTools.cpp
+    src/core/unity/AssetImporter.cpp
     src/core/ws/ProtocolRouter.cpp
     src/core/ws/WsServer.cpp
     src/core/llm/SseParser.cpp
@@ -135,6 +136,12 @@ add_executable(tst_unity_tools tests/tst_unity_tools.cpp)
 target_link_libraries(tst_unity_tools PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_unity_tools COMMAND tst_unity_tools)
 set_tests_properties(tst_unity_tools PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_asset_importer tests/tst_asset_importer.cpp)
+target_link_libraries(tst_asset_importer PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_asset_importer COMMAND tst_asset_importer)
+set_tests_properties(tst_asset_importer PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
 add_executable(synthforge_cli src/cli/main.cpp)

@@ -23,6 +23,7 @@
 #include "core/unity/ProjectService.h"
 #include "core/unity/DirectoryWatcher.h"
 #include "core/unity/UnityTools.h"
+#include "core/unity/AssetImporter.h"
 #include "core/ws/ProtocolRouter.h"
 #include "core/ws/WsServer.h"
 
@@ -130,6 +131,18 @@ QString operateUnderRoot(const QString& root, const QString& op, const QString& 
     if (op == QLatin1String("refresh"))
         return QString();
     return QStringLiteral("unknown-op");
+}
+
+// 把附件的 FBX 绝对路径拼到用户原文后，交给 Unity agent 用 import_model_file 导入
+QString withAttachmentBlock(const QString& text, const QStringList& fbxPaths)
+{
+    if (fbxPaths.isEmpty())
+        return text;
+    QString block = QStringLiteral("\n\n本次消息附带以下资产（已准备好 FBX 绝对路径）：\n");
+    for (const QString& path : fbxPaths)
+        block += QStringLiteral("- %1\n").arg(path);
+    block += QStringLiteral("请使用 import_model_file 导入，并按用户要求实例化（命名/坐标/挂载）。");
+    return text + block;
 }
 
 } // namespace
@@ -1378,6 +1391,10 @@ bool CoreApp::start()
             m_watcher->endSuppress();
     });
 
+    // 添加资产：glb→fbx 转换与 Blender 任务共用同一把门禁（owner=unity-convert）
+    m_importer = new AssetImporter(m_library.get(), m_blender, m_unity, this);
+    m_importer->setBlenderGate(&m_blenderGate);
+
     // 切换工程 = 断旧桥 + 取消旧任务 + 起新桥；就绪与否由 m_unity 真实握手决定（Task 3）
     m_projects->setBridgeHooks(
         [this] {
@@ -1504,6 +1521,42 @@ bool CoreApp::start()
                               : QJsonObject{{"ok", true}, {"tree", node}});
     });
 
+    // asset.import：直接导入一个模型库资产到 Unity（不经 agent）；结果走 chat.message + fileTree.changed
+    m_router->registerHandler(QStringLiteral("asset.import"), [this](const QJsonObject& params) {
+        if (m_projects->activePath().isEmpty())
+            return QJsonValue(QJsonObject{{"accepted", false}, {"reason", "project-not-active"}});
+        if (!m_unity || !m_unity->isReady())
+            return QJsonValue(QJsonObject{{"accepted", false}, {"reason", "unity-not-ready"}});
+        const QString relative = params.value(QStringLiteral("glbRelativePath")).toString();
+        m_importer->prepare(
+            QJsonArray{relative},
+            [this, params, relative](bool ok, const QStringList& fbx, const QString& error) {
+                if (!ok || fbx.isEmpty()) {
+                    m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                         QJsonObject{{"area", "unity"},
+                                                    {"reason", ok ? QStringLiteral("invalid-attachment") : error}});
+                    return;
+                }
+                m_importer->importToUnity(
+                    fbx.first(), params,
+                    [this, relative](bool imported, const QString& importError) {
+                        if (!imported) {
+                            m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                                 QJsonObject{{"area", "unity"}, {"reason", importError}});
+                            return;
+                        }
+                        m_ws->broadcastEvent(QStringLiteral("chat.message"),
+                                             QJsonObject{{"area", "unity"}, {"role", "assistant"},
+                                                        {"content", QStringLiteral("已导入资产：%1")
+                                                             .arg(QFileInfo(relative).fileName())}});
+                        m_ws->broadcastEvent(QStringLiteral("fileTree.changed"),
+                                             QJsonObject{{"area", "unity"}, {"reason", "incremental"},
+                                                        {"paths", QJsonArray{QFileInfo(relative).path()}}});
+                    });
+            });
+        return QJsonValue(QJsonObject{{"accepted", true}});
+    });
+
     // 启动恢复上次工程（规格 6.1/7.3）：目录仍合法就直接 select，走等待 Unity 流程、不弹确认
     const QString lastProject = m_settings->data().value(QStringLiteral("unity")).toObject()
                                     .value(QStringLiteral("lastProject")).toString();
@@ -1628,6 +1681,7 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         const QString taskId = QStringLiteral("unity-%1").arg(++m_seq);
         const QString project = m_projects->activePath();
         const QString assetsRoot = m_projects->assetsPath();
+        const QJsonArray attachments = params.value(QStringLiteral("attachments")).toArray();
         BuildPlan plan;
         plan.groups = {BuildGroup{QStringLiteral("Unity 任务"), {}, {},
                                   QStringLiteral("read_console 无编译错误；有测试则 run_tests 通过；"
@@ -1635,11 +1689,29 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         plan.maxSteps = 50;
         m_tasks->enqueue(Task{taskId, area, project,
                               [=](const QString& tid, TaskManager* tm) {
-                                  m_unityOrch->setModelConfig(primaryAgentConfig());
-                                  m_unityOrch->setConversationHistory(recentMessages(area, 20));
-                                  m_unityOrch->execute(tid, tm,
-                                                       ToolBridge::mcpToolsToOpenAi(m_unityTools),
-                                                       plan, text, assetsRoot, area);
+                                  // 先准备附件（无配对 glb 会经 Blender 转 fbx，占门禁），再执行
+                                  m_importer->prepare(
+                                      attachments,
+                                      [=](bool ok, const QStringList& fbxPaths, const QString& error) {
+                                          if (tm->isCancelled(tid)) {
+                                              tm->finish(tid);
+                                              return;
+                                          }
+                                          if (!ok) {
+                                              m_ws->broadcastEvent(
+                                                  QStringLiteral("error.card"),
+                                                  QJsonObject{{"area", "unity"}, {"reason", error}});
+                                              tm->finish(tid);
+                                              return;
+                                          }
+                                          m_unityOrch->setModelConfig(primaryAgentConfig());
+                                          m_unityOrch->setConversationHistory(
+                                              recentMessages(area, 20));
+                                          m_unityOrch->execute(
+                                              tid, tm, ToolBridge::mcpToolsToOpenAi(m_unityTools),
+                                              plan, withAttachmentBlock(text, fbxPaths),
+                                              assetsRoot, area);
+                                      });
                               }});
         return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
     }
