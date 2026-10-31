@@ -35,7 +35,8 @@ public:
                    ReplyCallback onErr = nullptr);
     void callTool(const QString& name, const QJsonObject& arguments,
                   ReplyCallback onDone,
-                  const QJsonValue& progressToken = QJsonValue());
+                  const QJsonValue& progressToken = QJsonValue(),
+                  int timeoutMs = -1); // -1 走全局默认；耗时工具（Blender 转换）可单独放宽
 
 signals:
     void ready(const QJsonObject& serverInfo);

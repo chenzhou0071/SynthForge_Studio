@@ -32,6 +32,14 @@ public:
         if (method == QLatin1String("tools/call")) {
             const QJsonObject params = request.value(QStringLiteral("params")).toObject();
             calls.append(params.value(QStringLiteral("name")).toString());
+            if (transientFailures > 0) { // 模拟 domain reload 期间的编辑器掉线
+                --transientFailures;
+                reply(id, QJsonObject{{"isError", true},
+                                      {"content", QJsonArray{QJsonObject{
+                                           {"type", "text"},
+                                           {"text", "未找到 Unity 编辑器实例"}}}}});
+                return;
+            }
             reply(id, QJsonObject{{"content", QJsonArray{QJsonObject{
                                                {"type", "text"}, {"text", "ok"}}}}});
             return;
@@ -42,7 +50,8 @@ public:
     void stop() override { emit stopped(0); }
 
     McpClient& client() { return m_client; }
-    QStringList calls; // 收到的工具名，按调用顺序
+    QStringList calls;        // 收到的工具名，按调用顺序
+    int transientFailures = 0; // 前 N 次 tools/call 回「未找到 Unity 编辑器实例」
 
 private:
     void reply(int id, const QJsonObject& result)

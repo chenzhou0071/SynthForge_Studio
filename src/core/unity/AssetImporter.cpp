@@ -5,10 +5,23 @@
 #include "core/mcp/McpClient.h"
 #include "core/mcp/McpRuntime.h"
 
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
+#include <QTimer>
 
 #include <utility>
+
+namespace {
+// 转换请求自身的超时：Blender 单线程、上一条命令没跑完时新请求只能排队，
+// 照 30s 默认超时会在排队阶段就被误判死（命令其实随后照常执行）。
+constexpr int kConvertTimeoutMs = 120000;
+// 回执正常但文件还没出现：导出是同步写盘，只给落盘/杀毒扫描留一点余量
+constexpr int kQuietGraceMs = 3000;
+// 回执失败（超时/桥抖动）：命令可能还在 Blender 队列里，宽限窗口要长一些
+constexpr int kLateGraceMs = 20000;
+constexpr int kPollIntervalMs = 250;
+} // namespace
 
 AssetImporter::AssetImporter(AssetLibrary* library, McpRuntime* blender, McpRuntime* unity,
                              QObject* parent)
@@ -25,6 +38,53 @@ QString AssetImporter::fbxPathFor(const QString& glbPath) const
 {
     const QFileInfo info(glbPath);
     return info.dir().filePath(info.completeBaseName() + QStringLiteral(".fbx"));
+}
+
+QString AssetImporter::glbToFBXScript(const QString& glb, const QString& fbx)
+{
+    // 定向清空（不用 read_factory_settings：它会重置偏好、关掉 BlenderMCP 插件→断连）；
+    // 导出带 embed_textures，避免进 Unity 变白模。
+    return QStringLiteral("import bpy\n"
+                          "if bpy.context.object and bpy.context.object.mode != 'OBJECT':\n"
+                          "    bpy.ops.object.mode_set(mode='OBJECT')\n"
+                          "bpy.ops.object.select_all(action='SELECT')\n"
+                          "bpy.ops.object.delete(use_global=False)\n"
+                          "for coll in (bpy.data.meshes, bpy.data.materials, bpy.data.images,\n"
+                          "             bpy.data.armatures, bpy.data.actions, bpy.data.cameras,"
+                          " bpy.data.lights):\n"
+                          "    for item in list(coll):\n"
+                          "        if item.users == 0:\n"
+                          "            coll.remove(item)\n"
+                          "bpy.ops.import_scene.gltf(filepath=r'%1')\n"
+                          "bpy.ops.export_scene.fbx(filepath=r'%2', use_selection=False,\n"
+                          "                        apply_scale_options='FBX_SCALE_ALL',\n"
+                          "                        path_mode='COPY', embed_textures=True)\n")
+        .arg(glb, fbx);
+}
+
+void AssetImporter::waitForFile(const QString& path, int graceMs,
+                                std::function<void(bool)> done)
+{
+    waitForFileStep(path, graceMs, 0, std::move(done));
+}
+
+void AssetImporter::waitForFileStep(const QString& path, int graceMs, int waited,
+                                    std::function<void(bool)> done)
+{
+    if (QFileInfo::exists(path)) {
+        done(true);
+        return;
+    }
+    if (waited >= graceMs) {
+        done(false);
+        return;
+    }
+    QTimer::singleShot(kPollIntervalMs, QCoreApplication::instance(),
+                       [path, graceMs, waited, done = std::move(done)]() mutable {
+                           AssetImporter::waitForFileStep(path, graceMs,
+                                                          waited + kPollIntervalMs,
+                                                          std::move(done));
+                       });
 }
 
 void AssetImporter::prepare(const QJsonArray& attachments, PrepareCallback done)
@@ -104,22 +164,25 @@ void AssetImporter::ensureFbx(
         return;
     }
     const QString fbx = fbxPathFor(glb);
-    const QString script =
-        QStringLiteral("import bpy\n"
-                       "bpy.ops.wm.read_factory_settings(use_empty=True)\n"
-                       "bpy.ops.import_scene.gltf(filepath=r'%1')\n"
-                       "bpy.ops.export_scene.fbx(filepath=r'%2', use_selection=False, "
-                       "apply_scale_options='FBX_SCALE_ALL', path_mode='COPY')\n")
-            .arg(glb, fbx);
+    const QString script = glbToFBXScript(glb, fbx);
     m_blender->client()->callTool(
         QStringLiteral("execute_blender_code"), QJsonObject{{"code", script}},
         [done = std::move(done), fbx](const QJsonValue&, const QJsonObject& error) {
-            if (!error.isEmpty() || !QFileInfo::exists(fbx)) {
-                done(false, {}, QStringLiteral("blender-convert-failed"));
+            // 回执不可信：超时只删本地 pending，Blender 端脚本往往仍在排队/执行，
+            // fbx 会迟到落地；以文件为唯一事实，宽限窗口内出现即算成功。
+            if (QFileInfo::exists(fbx)) {
+                done(true, fbx, QString());
                 return;
             }
-            done(true, fbx, QString());
-        });
+            const int graceMs = error.isEmpty() ? kQuietGraceMs : kLateGraceMs;
+            waitForFile(fbx, graceMs, [done = std::move(done), fbx](bool appeared) {
+                if (appeared)
+                    done(true, fbx, QString());
+                else
+                    done(false, {}, QStringLiteral("blender-convert-timeout"));
+            });
+        },
+        QJsonValue(), kConvertTimeoutMs); // 转换要等 Blender 空闲，不能照 30s 默认超时
 }
 
 void AssetImporter::importToUnity(const QString& fbx, const QJsonObject& options,

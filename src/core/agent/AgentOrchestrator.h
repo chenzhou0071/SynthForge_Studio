@@ -102,6 +102,11 @@ private:
     void onTurnFinished();
     void finishTurnText();
     void executeToolCalls(const QJsonArray& calls);
+    // Unity 编辑器 domain reload 会把桥打成「未找到实例」：等 reload 结束后重发，
+    // 仍失败才把错误交给模型。attempt 从 0 起。
+    void callToolWithRetry(const QString& name, const QJsonObject& args,
+                           std::function<void(const QJsonValue&, const QJsonObject&)> finishCall,
+                           int attempt);
     void finishOk(const QString& text);
     void finishCancelled();
     void fail(const QString& reason);
@@ -128,6 +133,9 @@ private:
     int m_pendingToolCalls = 0;
     bool m_awaitingTools = false;
     bool m_exporting = false; // 最后一组的导出回合已发起
+    // 本组是否调用过工具：零调用的「建造完成」不算数，先催开工；连续空转则判失败
+    bool m_groupHadTools = false;
+    int m_emptyBuildTurns = 0;
     bool m_resumable = false; // 上次失败是步数耗尽：可续跑，保留 m_messages/m_plan
     GroupPhase m_phase = GroupPhase::Build;
     QSet<QString> m_planning; // 规划进行中的区（chat.cancel 可丢弃迟到结果）

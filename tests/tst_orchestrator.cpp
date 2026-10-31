@@ -5,6 +5,7 @@
 
 #include "core/agent/AgentOrchestrator.h"
 #include "core/llm/LlmGateway.h"
+#include "core/llm/ToolMessage.h"
 #include "core/mcp/BlenderGate.h"
 #include "core/tasks/TaskManager.h"
 #include "mock/MockLlmServer.h"
@@ -80,8 +81,56 @@ private slots:
         // 收尾必须汇报完成情况 + 把实机验证交回用户
         QVERIFY(server.requestAt(0).contains(QStringLiteral("收尾汇报")));
         QVERIFY(server.requestAt(0).contains(QStringLiteral("实机")));
+        // 改动纪律：一次一步、warning 不算错、未找到实例就停
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("一次只做一个小改动")));
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("未找到 Unity 编辑器实例")));
         // 不能对 Unity 桥下 Blender 专属命令（清场 / 导出都靠 execute_blender_code）
         QVERIFY(!mcp.calls.contains(QStringLiteral("execute_blender_code")));
+    }
+
+    // 瞬时错误识别：只有「编辑器未连接/桥掉了」才重试，真错误照常交给模型
+    void transientBridgeErrorDetection()
+    {
+        const QJsonObject editorDown{
+            {"isError", true},
+            {"content", QJsonArray{QJsonObject{{"type", "text"},
+                                                {"text", "未找到 Unity 编辑器实例，请确保 Unity 已打开"}}}}};
+        QVERIFY(isRetryableBridgeError(editorDown, {}));
+        QVERIFY(isRetryableBridgeError({}, QJsonObject{{"message", "Connection refused"}}));
+        QVERIFY(!isRetryableBridgeError(
+            QJsonObject{{"content", QJsonArray{QJsonObject{{"type", "text"}, {"text", "ok"}}}}}, {}));
+        QVERIFY(!isRetryableBridgeError({}, QJsonObject{{"message", "invalid arguments"}}));
+    }
+
+    // Unity 编辑器 domain reload 会把桥打成「未找到实例」：属瞬时故障，
+    // 应当自动等一会儿重发，而不是把错误甩给模型、让任务半路终止。
+    void unityRetriesTransientEditorDisconnect()
+    {
+        MockLlmServer server({toolTurn(QStringLiteral("manage_scene")),
+                              textTurn(QStringLiteral("建好了")),
+                              textTurn(QStringLiteral("自检通过"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        mcp.transientFailures = 2; // 前两次像 domain reload 一样报未找到实例
+        AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+        orch.setModelConfig(server.config());
+        BuildPlan plan;
+        BuildGroup group;
+        group.title = QStringLiteral("Unity 任务");
+        group.acceptance = QStringLiteral("read_console 无编译错误");
+        plan.groups = {group};
+        plan.maxSteps = 10;
+        QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
+
+        orch.execute(QStringLiteral("t1"), nullptr, QJsonArray{}, plan,
+                     QStringLiteral("导入模型"), QStringLiteral("Assets"),
+                     QStringLiteral("unity"));
+        QTRY_COMPARE_WITH_TIMEOUT(finalSpy.count(), 1, 20000);
+
+        QCOMPARE(mcp.calls.count(QStringLiteral("manage_scene")), 3); // 两次抖动 + 一次成功
+        QVERIFY2(!server.requestAt(1).contains(QStringLiteral("ERROR:")),
+                 "瞬时错误不该回喂给模型，重试成功后才给结果"); // 系统提示词里本就有「未找到实例」字样
     }
 
     void plannerParsesGroupsAndLayout()
@@ -250,6 +299,9 @@ private slots:
         QVERIFY(server.requestAt(3).contains(QStringLiteral("不要复述本条要求或脚本内容"))); // 别复述导出指令
         QVERIFY(server.requestAt(3).contains(QStringLiteral("最终回复保持简短"))); // 收尾别写小作文
         QVERIFY(server.requestAt(3).contains(QStringLiteral("最多 5 条清单")));   // 清单保留
+        // fbx 必须内嵌贴图，否则“配对 fbx”直接导进 Unity 会是白模（glb 自带贴图所以有色）
+        QVERIFY(server.requestAt(3).contains(QStringLiteral("embed_textures=True")));
+        QVERIFY(server.requestAt(3).contains(QStringLiteral("path_mode='COPY'")));
     }
 
     // 建造/自检阶段自行 export/save 会被拦下，只有系统最后的导出回合能落盘
@@ -332,6 +384,61 @@ private slots:
         QVERIFY(!exportRequest.contains(QStringLiteral("while os.path.exists"))); // 不再加序号
         QVERIFY(exportRequest.contains(QStringLiteral("最终回复保持简短"))); // 收尾别写小作文
         QVERIFY(exportRequest.contains(QStringLiteral("最多 5 条清单")));   // 清单保留
+    }
+
+    // 模型在建造轮只回「自检通过」、一次工具都没调：不能当本组建完，要先催它开工；
+    // 否则组与组之间会空转出满屏「自检通过」，最后什么都没建。
+    void buildTurnWithoutToolsIsNudgedToBuild()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("自检通过")),
+                              toolTurn(QStringLiteral("execute_blender_code")),
+                              textTurn(QStringLiteral("建好了")),
+                              textTurn(QStringLiteral("自检通过")),
+                              textTurn(QStringLiteral("已导出"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+        orch.setModelConfig(server.config());
+        BuildPlan plan;
+        plan.groups = {{QStringLiteral("底座"), {}, {}, QStringLiteral("底座完整")}};
+        plan.maxSteps = 20;
+        QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
+
+        orch.execute(QStringLiteral("t1"), nullptr, openAiTools(), plan,
+                     QStringLiteral("p"), QStringLiteral("/tmp/out"),
+                     QStringLiteral("blender"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(finalSpy.count(), 1, 8000);
+        QCOMPARE(server.requestCount(), 5); // 空转 → 催建 → 建造 → 自检 → 导出
+        QVERIFY(server.requestAt(1).contains(QStringLiteral("还没有任何建造动作")));
+        QCOMPARE(mcp.calls.size(), 2); // 清场 + 一次真建造
+    }
+
+    // 连续空转不能无限循环：提醒两次仍不动手就交代失败，让用户看见
+    void groupStallsWhenBuildNeverCallsTools()
+    {
+        MockLlmServer server({textTurn(QStringLiteral("自检通过")),
+                              textTurn(QStringLiteral("自检通过")),
+                              textTurn(QStringLiteral("自检通过"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+        orch.setModelConfig(server.config());
+        BuildPlan plan;
+        plan.groups = {{QStringLiteral("底座"), {}, {}, QStringLiteral("底座完整")}};
+        plan.maxSteps = 20;
+        QSignalSpy failedSpy(&orch, &AgentOrchestrator::failed);
+        QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
+
+        orch.execute(QStringLiteral("t1"), nullptr, openAiTools(), plan,
+                     QStringLiteral("p"), QStringLiteral("/tmp/out"),
+                     QStringLiteral("blender"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(failedSpy.count(), 1, 8000);
+        QCOMPARE(failedSpy.first().at(1).toString(), QStringLiteral("group-stalled"));
+        QCOMPARE(finalSpy.count(), 0);
     }
 
     void executorAdvancesGroups()
@@ -704,7 +811,8 @@ private slots:
     // 时序动画只截一张静图，模型永远发现不了火车穿模或原地不动
     void openSelfCheckAsksForFrameSetShots()
     {
-        MockLlmServer server({textTurn(QStringLiteral("本组建好了")),
+        MockLlmServer server({toolTurn(QStringLiteral("execute_blender_code")),
+                              textTurn(QStringLiteral("本组建好了")),
                               textTurn(QStringLiteral("自检通过")),
                               textTurn(QStringLiteral("导出完成"))});
         QVERIFY(server.listen());
@@ -722,9 +830,9 @@ private slots:
                      QStringLiteral("火车站"), QStringLiteral("Scenes"),
                      QStringLiteral("blender"));
 
-        // 建造轮 = 请求 0，自检轮 = 请求 1
-        QTRY_VERIFY_WITH_TIMEOUT(server.requestCount() >= 2, 5000);
-        const QString selfCheck = server.requestAt(1);
+        // 建造轮 = 0（含工具），收尾文字 = 1，自检轮 = 2
+        QTRY_VERIFY_WITH_TIMEOUT(server.requestCount() >= 3, 5000);
+        const QString selfCheck = server.requestAt(2);
         QVERIFY2(selfCheck.contains(QStringLiteral("frame_set")), "自检没要求按帧截图");
         QVERIFY2(selfCheck.contains(QStringLiteral("起始帧")), "自检没给出取哪几帧");
         // 档位没读错：盒式舞台那句自检不能套到动画档
@@ -734,7 +842,8 @@ private slots:
     // 氛围层要在 Blender 里看得见、在 Unity 里不碍事：靠集合级过滤，不靠模型自觉
     void exportScriptExcludesFxCollectionFromGlbAndFbx()
     {
-        MockLlmServer server({textTurn(QStringLiteral("建好了")),
+        MockLlmServer server({toolTurn(QStringLiteral("execute_blender_code")),
+                              textTurn(QStringLiteral("建好了")),
                               textTurn(QStringLiteral("自检通过")),
                               textTurn(QStringLiteral("导出完成"))});
         QVERIFY(server.listen());
@@ -751,9 +860,9 @@ private slots:
                      QStringLiteral("便利店"), QStringLiteral("Shop"),
                      QStringLiteral("blender"));
 
-        // 建造轮 0 → 自检轮 1 → 导出轮 2（脚本轮都只出文字、不调工具）
-        QTRY_VERIFY_WITH_TIMEOUT(server.requestCount() >= 3, 5000);
-        const QString exportTurn = server.requestAt(2);
+        // 建造工具轮 0 → 收尾文字 1 → 自检 2 → 导出 3（脚本轮都只出文字、不调工具）
+        QTRY_VERIFY_WITH_TIMEOUT(server.requestCount() >= 4, 5000);
+        const QString exportTurn = server.requestAt(3);
         QVERIFY2(exportTurn.contains(QStringLiteral("coll.name == 'FX'")),
                  "导出脚本没识别 FX 集合");
         QVERIFY2(exportTurn.contains(QStringLiteral("use_selection=True")),
@@ -772,7 +881,8 @@ private slots:
     // 道具进 Unity 要能整体拖、也能拆开单用：根空对象必须留在导出选择集里
     void propExportKeepsRootEmptyAndNoBaseplate()
     {
-        MockLlmServer server({textTurn(QStringLiteral("建好了")),
+        MockLlmServer server({toolTurn(QStringLiteral("execute_blender_code")),
+                              textTurn(QStringLiteral("建好了")),
                               textTurn(QStringLiteral("自检通过")),
                               textTurn(QStringLiteral("导出完成"))});
         QVERIFY(server.listen());
@@ -789,8 +899,8 @@ private slots:
                      QStringLiteral("书桌"), QStringLiteral("Props"),
                      QStringLiteral("blender"));
 
-        QTRY_VERIFY_WITH_TIMEOUT(server.requestCount() >= 3, 5000);
-        const QString exportTurn = server.requestAt(2);
+        QTRY_VERIFY_WITH_TIMEOUT(server.requestCount() >= 4, 5000);
+        const QString exportTurn = server.requestAt(3);
         QVERIFY2(exportTurn.contains(QStringLiteral("根空对象保持选中")),
                  "道具档没保住根空对象（层级会散）");
         QVERIFY2(exportTurn.contains(QStringLiteral("先删掉再导出")),

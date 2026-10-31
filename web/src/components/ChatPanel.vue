@@ -168,6 +168,14 @@ function reasonText(reason: string, steps?: number, maxSteps?: number) {
     return `步数预算用完了${usage}。前面的成果还在 Blender 场景里，点「继续工作」接着干，不会重新清场。`;
   }
   if (reason === "blender-busy") return "Blender 正忙，等当前任务结束后再试一次。";
+  // 回执超时不等于转换失败：命令常已发出，fbx 会迟到落地；重试会直接复用产物
+  if (reason === "blender-convert-timeout") {
+    return "转换没等到结果：Blender 可能还在执行上一条命令。等它空闲后再点一次导入即可，已生成的 fbx 会直接复用。";
+  }
+  // 建造轮连续空转被叫停：不是建坏了，是模型一直在复述自检、根本没动手
+  if (reason === "group-stalled") {
+    return "这一组连续几次都没有任何建造动作，已停止，避免空转。请把这一组拆分成更小的几组后重发，或直接说明这一步具体要建什么。";
+  }
   if (reason === "nothing-to-resume") {
     return "这份任务的现场已经不在了（可能已有新任务开始），请重新发指令。";
   }

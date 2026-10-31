@@ -54,3 +54,43 @@ QJsonObject toolResultMessage(const QString& callId, const QJsonValue& result,
     }
     return QJsonObject{{"role", "tool"}, {"tool_call_id", callId}, {"content", content}};
 }
+
+namespace {
+
+bool mentionsDisconnect(const QString& text)
+{
+    static const QStringList needles{
+        QStringLiteral("未找到 unity 编辑器实例"),
+        QStringLiteral("unity 编辑器实例"),
+        QStringLiteral("editor instance"),
+        QStringLiteral("connection refused"),
+        QStringLiteral("connection reset"),
+        QStringLiteral("not connected"),
+        QStringLiteral("disconnected"),
+        QStringLiteral("桥接未连"),
+        QStringLiteral("无法连接编辑器"),
+        QStringLiteral("拒绝连接"),
+    };
+    for (const QString& needle : needles) {
+        if (text.contains(needle, Qt::CaseInsensitive))
+            return true;
+    }
+    return false;
+}
+
+} // namespace
+
+bool isRetryableBridgeError(const QJsonValue& result, const QJsonObject& error)
+{
+    if (!error.isEmpty()) {
+        // JSON-RPC 层错误：message 里带连接类描述时重试；invalid arguments 之类不算
+        return mentionsDisconnect(error.value(QStringLiteral("message")).toString())
+               || mentionsDisconnect(QString::fromUtf8(
+                   QJsonDocument(error).toJson(QJsonDocument::Compact)));
+    }
+    const QJsonObject obj = result.toObject();
+    QString text;
+    for (const QJsonValue& item : obj.value(QStringLiteral("content")).toArray())
+        text += item.toObject().value(QStringLiteral("text")).toString() + QLatin1Char('\n');
+    return mentionsDisconnect(text);
+}

@@ -528,6 +528,33 @@ describe("ChatPanel", () => {
     expect(wrapper.find(".error-card").text()).toContain("未配置");
   });
 
+  // 转换超时不是真失败：Blender 可能还在跑上一条命令，fbx 稍后会落地并可直接复用
+  it("tells the user to retry the import after a conversion timeout", async () => {
+    const { client, wrapper } = mountPanel("unity");
+    await flushPromises();
+
+    client.emit("error.card", { area: "unity", reason: "blender-convert-timeout" });
+    await flushPromises();
+
+    const card = wrapper.find(".error-card").text();
+    expect(card).toContain("再点一次");
+    expect(card).not.toContain("blender-convert-timeout"); // 不把内部错误码直接掴给用户
+  });
+
+  // 建造轮连续空转被叫停：要讲明白是「没动手」而不是「建失败了」，并给出下一步
+  it("explains a stalled build group instead of showing the raw reason", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+
+    client.emit("error.card", { area: "blender", reason: "group-stalled" });
+    await flushPromises();
+
+    const card = wrapper.find(".error-card").text();
+    expect(card).toContain("建造动作");
+    expect(card).toContain("拆分");
+    expect(card).not.toContain("group-stalled");
+  });
+
   it("shows an asset card when generation finishes and opens it for preview", async () => {
     const { client, wrapper } = mountPanel("blender");
     await flushPromises();

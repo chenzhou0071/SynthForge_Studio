@@ -89,14 +89,14 @@ void McpClient::listTools(std::function<void(const QJsonArray&)> onOk, ReplyCall
 }
 
 void McpClient::callTool(const QString& name, const QJsonObject& arguments,
-                         ReplyCallback onDone, const QJsonValue& progressToken)
+                         ReplyCallback onDone, const QJsonValue& progressToken, int timeoutMs)
 {
     QJsonObject params{{"name", name}, {"arguments", arguments}};
     if (!progressToken.isUndefined() && !progressToken.isNull()) {
         params.insert(QStringLiteral("_meta"),
                       QJsonObject{{QStringLiteral("progressToken"), progressToken}});
     }
-    sendRequest(QStringLiteral("tools/call"), params, std::move(onDone));
+    sendRequest(QStringLiteral("tools/call"), params, std::move(onDone), timeoutMs);
 }
 
 qint64 McpClient::sendRequest(const QString& method, const QJsonObject& params,

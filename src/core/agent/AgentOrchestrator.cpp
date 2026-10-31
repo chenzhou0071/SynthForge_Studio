@@ -111,7 +111,9 @@ QString blenderSystemPrompt(OutputShape shape)
         "增强氛围，但必须有真实光源支撑；不要默认生成飞虫、湿地面、积水等元素，用户明确要求时"
         "才做，且不得用几何体冒充。\n"
         "9. 建造与自检阶段禁止调用 export_scene / save_as_mainfile；"
-        "收到系统的导出指令后再执行，且只执行一次。");
+        "收到系统的导出指令后再执行，且只执行一次。\n"
+        "10. 组号以系统指令为准：只有系统说“开始第 N 组”时你才在该组干活；"
+        "不要自己数第几组，也不要在收到系统导出指令前宣布“全部完成”。");
     // 分档纪律接在最后：编号与通用条独立，避免改一处要重排全部编号
     return body + shapeDiscipline(shape);
 }
@@ -131,6 +133,11 @@ QString unitySystemPrompt()
         "2. 需要看效果时用 manage_editor 的截图动作回传 Game 视图，不要凭空断言结果。\n"
         "3. 不要自行导出或保存工程文件，除非用户明确要求。\n"
         "4. 先查后改：用工具读当前场景/资源，不要假设已有什么。\n"
+        "5. 一次只做一个小改动：改前用一句话说清要改哪个对象/文件，不要一口气批量改一堆无关东西。\n"
+        "6. read_console 只把 Error 当失败；warning 级（如并行/批量执行提示）不算错误，不要因此反复重试。\n"
+        "7. 工具返回“未找到 Unity 编辑器实例”或连接类错误时，系统会自动等几秒重试；"
+        "重试仍失败才停止，并如实汇报“Unity 编辑器未连接，请到 MCP for Unity 窗口点重连”，"
+        "不要改用 execute_code 绕道，也不要乱改其它物体。\n"
         "收尾汇报（任务结束时的最后一轮，必须遵守）：\n"
         "1. 不再调用任何工具，用简体中文给出汇报：① 这次做了什么；② 实现/改动了哪些脚本、"
         "物体、场景或资源；③ 编译与测试结论（read_console 是否无错、run_tests 是否通过）。\n"
@@ -140,6 +147,10 @@ QString unitySystemPrompt()
 }
 
 } // namespace
+
+// Unity domain reload 常见 2~8 秒：两段等待盖住它，仍失败才交给模型
+constexpr int kBridgeRetryDelaysMs[] = {2500, 5000};
+constexpr int kBridgeRetryCount = 2;
 
 // 规划器输出与 planReady 下发用同一套字段名；plan.confirm 靠它还原成可执行计划
 BuildPlan buildPlanFromJson(const QJsonObject& json)
@@ -410,6 +421,8 @@ void AgentOrchestrator::fail(const QString& reason)
 void AgentOrchestrator::startGroup()
 {
     const BuildGroup& group = m_plan.groups[m_groupIndex];
+    m_groupHadTools = false;
+    m_emptyBuildTurns = 0;
     emit groupProgress(m_area, m_groupIndex + 1, m_plan.groups.size(), group.title);
     QString content =
         QStringLiteral("开始第 %1/%2 组「%3」。本组对象：%4。")
@@ -455,6 +468,27 @@ void AgentOrchestrator::finishTurnText()
 void AgentOrchestrator::onTurnFinished() // 一轮 LLM 无工具调用时进入
 {
     if (m_phase == GroupPhase::Build) {
+        // 建造轮一次工具都没调：模型只是在复述「自检通过」，不是建完了。
+        // 不催就会空转：每轮白白推一组，满屏自检通过，实际什么都没建。
+        if (m_area != QLatin1String("unity") && !m_groupHadTools) {
+            finishTurnText();
+            if (++m_emptyBuildTurns > 2) {
+                fail(QStringLiteral("group-stalled"));
+                return;
+            }
+            const BuildGroup& stalled = m_plan.groups[m_groupIndex];
+            m_messages.append(QJsonObject{
+                {"role", "user"},
+                {"content", QStringLiteral("本组还没有任何建造动作（0 次工具调用）。"
+                                           "不要重复回复自检通过；现在立即用 "
+                                           "execute_blender_code 开始建造第 %1 组「%2」，"
+                                           "建完再结束本轮，之后才轮到自检。")
+                                .arg(m_groupIndex + 1)
+                                .arg(stalled.title)}});
+            m_stream.clear();
+            tick();
+            return;
+        }
         finishTurnText();
         m_phase = GroupPhase::SelfCheck;
         const BuildGroup& group = m_plan.groups[m_groupIndex];
@@ -533,7 +567,7 @@ void AgentOrchestrator::onTurnFinished() // 一轮 LLM 无工具调用时进入
             "                          export_animation_mode='ACTIONS', export_frame_range=True,\n"
             "                          use_selection=True)\n"
             "bpy.ops.export_scene.fbx(filepath=os.path.join(folder, base + \".fbx\"),\n"
-            "                         use_selection=True)\n"
+            "                         use_selection=True, path_mode='COPY', embed_textures=True)\n"
             "bpy.ops.file.pack_all()\n"
             "prefs = bpy.context.preferences.filepaths\n"
             "old_save_version = prefs.save_version\n"
@@ -602,6 +636,7 @@ void AgentOrchestrator::tick()
 
 void AgentOrchestrator::executeToolCalls(const QJsonArray& calls)
 {
+    m_groupHadTools = true; // 本组确实动过手，后面的「建造完成」才可信
     m_awaitingTools = true;
     m_pendingToolCalls = calls.size();
     // 先说话再干活：工具调用前的交代单独收口，截图回来后的下一段另起气泡
@@ -651,8 +686,35 @@ void AgentOrchestrator::executeToolCalls(const QJsonArray& calls)
             continue;
         }
 
-        m_mcp->callTool(name, args, finishCall);
+        callToolWithRetry(name, args, finishCall, 0);
     }
+}
+
+void AgentOrchestrator::callToolWithRetry(
+    const QString& name, const QJsonObject& args,
+    std::function<void(const QJsonValue&, const QJsonObject&)> finishCall, int attempt)
+{
+    m_mcp->callTool(name, args,
+                    [this, name, args, finishCall, attempt](const QJsonValue& result,
+                                                            const QJsonObject& error) {
+                        // 只有 Unity 区的「编辑器未连」才自动重试：domain reload 会瞬断几秒，
+                        // 重发就好；把这种抖动回喂给模型，它只会停手或绕道
+                        if (m_area == QLatin1String("unity") && attempt < kBridgeRetryCount
+                            && isRetryableBridgeError(result, error)) {
+                            if (m_tm && m_tm->isCancelled(m_taskId)) {
+                                finishCall(result, error);
+                                return;
+                            }
+                            emit toolStep(m_area, name, "running"); // 前端能看到还在等
+                            QTimer::singleShot(kBridgeRetryDelaysMs[attempt], this,
+                                               [this, name, args, finishCall, attempt]() {
+                                                   callToolWithRetry(name, args, finishCall,
+                                                                     attempt + 1);
+                                               });
+                            return;
+                        }
+                        finishCall(result, error);
+                    });
 }
 
 void AgentOrchestrator::finishOk(const QString& text)
