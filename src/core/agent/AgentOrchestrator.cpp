@@ -116,6 +116,23 @@ QString blenderSystemPrompt(OutputShape shape)
     return body + shapeDiscipline(shape);
 }
 
+// Unity 区系统提示词：复用同一执行循环，但说话方式与收尾都换成 Unity（不涉 Blender）。
+QString unitySystemPrompt()
+{
+    return QStringLiteral(
+        "你是 SynthForge Studio 的 Unity 编辑器 agent。使用提供的 MCP 工具"
+        "（manage_* / create_* / read_console 等）在当前激活的 Unity 工程里干活："
+        "创建或修改 GameObject、组件、材质、预制体、场景，编写与修改 C# 脚本。\n"
+        "沟通方式（必须遵守）：全程用简体中文（对象名、代码、文件路径除外）；"
+        "每一轮先用 1 句中文说明这一步要做什么、依据是什么，再调用工具；"
+        "工具返回后只看关键问题，用中文说明是否达标、下一步怎么改，不要复述细节。\n"
+        "硬性约束：\n"
+        "1. 每次新建或修改 C# 脚本后，必须调用 read_console 回读编译错误；有错误就修正后再次确认，直到无编译错误。\n"
+        "2. 需要看效果时用 manage_editor 的截图动作回传 Game 视图，不要凭空断言结果。\n"
+        "3. 不要自行导出或保存工程文件，除非用户明确要求。\n"
+        "4. 先查后改：用工具读当前场景/资源，不要假设已有什么。");
+}
+
 } // namespace
 
 // 规划器输出与 planReady 下发用同一套字段名；plan.confirm 靠它还原成可执行计划
@@ -271,7 +288,7 @@ void AgentOrchestrator::execute(const QString& taskId, TaskManager* tm, const QJ
         m_gateHeld = true;
     }
     m_messages = initialMessages(
-        blenderSystemPrompt(m_shape),
+        m_area == QLatin1String("unity") ? unitySystemPrompt() : blenderSystemPrompt(m_shape),
         QStringLiteral("已确认的专业提示词：\n%1\n目标存放目录：%2。").arg(prompt, targetFolder));
 
     // 清场：活会话里还留着上一次任务的模型，不清就会被 save_as_mainfile 一起存进新 blend
@@ -289,7 +306,7 @@ for coll in (bpy.data.meshes, bpy.data.materials, bpy.data.images,
         if item.users == 0:
             coll.remove(item)
 )python");
-    if (!m_mcp) { // 单测/降级路径：没有 MCP 就没有会话可清
+    if (!m_mcp || m_area == QLatin1String("unity")) { // 单测/无 MCP，或 Unity 区：不清 Blender 场景
         startGroup();
         return;
     }
@@ -459,6 +476,11 @@ void AgentOrchestrator::onTurnFinished() // 一轮 LLM 无工具调用时进入
         ++m_groupIndex;
         m_phase = GroupPhase::Build;
         startGroup();
+        return;
+    }
+    if (m_area == QLatin1String("unity")) {
+        // Unity 区不导出 glb/fbx/blend（那是 Blender 出资产的收尾）：任务到此结束
+        finishOk(m_stream);
         return;
     }
     if (!m_exporting) {

@@ -49,6 +49,38 @@ class OrchestratorTest : public QObject
     Q_OBJECT
 
 private slots:
+    // 方案 A：unity 复用同一执行器时，必须用 Unity 说明书、跳过 Blender 专属的清场/导出
+    void unityExecuteUsesUnityPromptAndSkipsBlenderSteps()
+    {
+        // unity 单组：build 轮（无工具）→ 自检轮（无工具）→ 直接收尾，不导出
+        MockLlmServer server({textTurn(QStringLiteral("建了个立方体")),
+                              textTurn(QStringLiteral("自检通过"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+        orch.setModelConfig(server.config());
+        BuildPlan plan;
+        BuildGroup group;
+        group.title = QStringLiteral("Unity 任务");
+        group.acceptance = QStringLiteral("read_console 无编译错误");
+        plan.groups = {group};
+        plan.maxSteps = 10;
+        QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
+
+        orch.execute(QStringLiteral("t1"), nullptr, QJsonArray{}, plan,
+                     QStringLiteral("创建一个红色立方体"), QStringLiteral("Assets"),
+                     QStringLiteral("unity"));
+        QTRY_COMPARE_WITH_TIMEOUT(finalSpy.count(), 1, 5000);
+
+        // 系统提示词是 Unity 的，不能是 Blender 建模说明书
+        QVERIFY2(!server.requestAt(0).contains(QStringLiteral("Blender 建模 agent")),
+                 qPrintable(server.requestAt(0)));
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("Unity")));
+        // 不能对 Unity 桥下 Blender 专属命令（清场 / 导出都靠 execute_blender_code）
+        QVERIFY(!mcp.calls.contains(QStringLiteral("execute_blender_code")));
+    }
+
     void plannerParsesGroupsAndLayout()
     {
         MockLlmServer server({textTurn(QStringLiteral(
