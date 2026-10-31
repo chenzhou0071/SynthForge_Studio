@@ -19,7 +19,16 @@ const active = ref<Area>("blender");
 const settingsOpen = ref(false);
 // 「去设置」根据错误类型直达 Agent / 3D 模型页
 const settingsTab = ref<"agent" | "cloud3d">("agent");
-const importing = ref(false);
+const picking = ref(false);
+const importError = ref("");
+// project.state 事件：{path,name,state,waiting?,attempt?}，用于导入横幅与等待提示
+const projectState = ref<{
+  path?: string;
+  name?: string;
+  state?: string;
+  waiting?: boolean;
+  attempt?: number;
+} | null>(null);
 // 预览内容由 file.read 填充；asset.created 到达时自动打开新资产
 const previewFile = ref<PreviewFile | null>(null);
 // 导出回合：glb 还在写，预览先挂“导出中”，等 asset.created 再自动加载
@@ -38,6 +47,7 @@ let offAssetCreated: (() => void) | null = null;
 let offExportStarted: (() => void) | null = null;
 let offExportFinished: (() => void) | null = null;
 let offErrorCard: (() => void) | null = null;
+let offProjectState: (() => void) | null = null;
 
 const lampHints = computed(() => ({
   blender: `Blender：${stateLabel(lamp.value.blender)}`,
@@ -54,8 +64,69 @@ function selectArea(area: Area) {
   active.value = area;
 }
 
-function requestImport() {
-  // Unity 工程导入在 P6 接入；P3 只保留入口与按钮状态。
+function newRequestId() {
+  return typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `r-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+// 先订阅再发请求：requestId 由前端生成，事件即使早于响应到达也不会丢
+function waitDialogResult(requestId: string) {
+  let off = () => {};
+  let timer: ReturnType<typeof setTimeout>;
+  const promise = new Promise<string | null>((resolve, reject) => {
+    timer = setTimeout(() => { off(); reject(new Error("dialog-timeout")); }, 10 * 60 * 1000);
+    off = client.on("dialog.result", (d) => {
+      const evt = d as { requestId?: string; cancelled?: boolean; path?: string };
+      if (evt.requestId !== requestId) return;
+      clearTimeout(timer);
+      off();
+      resolve(evt.cancelled ? null : evt.path ?? null);
+    });
+  });
+  return { promise, cancel: () => { clearTimeout(timer); off(); } };
+}
+
+async function importProject() {
+  if (picking.value) return;
+  picking.value = true;
+  importError.value = "";
+  const requestId = newRequestId();
+  const waiter = waitDialogResult(requestId);
+  try {
+    const res = (await client.request("dialog.pickFolder", { purpose: "unityProject", requestId })) as
+      { accepted?: boolean; reason?: string };
+    if (!res.accepted) {
+      waiter.cancel();
+      if (res.reason !== "busy")
+        importError.value = res.reason === "dialog-unavailable"
+          ? "无法打开文件夹选择框" : String(res.reason);
+      return;
+    }
+    const path = await waiter.promise;
+    if (path) await selectProject(path);              // 取消：静默
+  } catch (e) {
+    waiter.cancel();
+    const msg = e instanceof Error ? e.message : String(e);
+    importError.value = msg === "dialog-timeout" ? "文件夹选择超时，请重试" : (msg || "导入失败");
+  } finally {
+    picking.value = false;
+  }
+}
+
+async function selectProject(path: string) {
+  const res = (await client.request("project.select", { path })) as {
+    accepted?: boolean; reason?: string; runningTasks?: number; newPath?: string;
+  };
+  if (res.accepted) return;
+  if (res.reason === "switch-confirm") {
+    if (!window.confirm(`当前工程有 ${res.runningTasks ?? 0} 个任务运行中，切换将终止这些任务`)) return;
+    await client.request("project.switchConfirm", { path: res.newPath });
+    return;
+  }
+  importError.value = res.reason === "invalid-project"
+    ? "不是有效 Unity 工程（需含 Assets 与 ProjectSettings）"
+    : String(res.reason ?? "导入失败");
 }
 
 function openSettings(target: "agent" | "cloud") {
@@ -177,6 +248,11 @@ onMounted(async () => {
       unity: next.unity ?? lamp.value.unity,
     };
   });
+  offProjectState = client.on("project.state", (data) => {
+    projectState.value = data as {
+      path?: string; name?: string; state?: string; waiting?: boolean; attempt?: number;
+    };
+  });
   offExportStarted = client.on("export.started", (data) => {
     const evt = data as { area?: string };
     if (evt.area === "blender") exporting.value = true;
@@ -204,6 +280,7 @@ onBeforeUnmount(() => {
   offExportStarted?.();
   offExportFinished?.();
   offErrorCard?.();
+  offProjectState?.();
 });
 </script>
 
@@ -216,9 +293,22 @@ onBeforeUnmount(() => {
         :blender="lamp.blender"
         :unity="lamp.unity"
         :hints="lampHints"
-        :importing="importing"
-        @import-project="requestImport"
+        :importing="picking"
+        @import-project="importProject"
       />
+      <p v-if="importError" class="import-error">{{ importError }}</p>
+      <div
+        v-if="active === 'unity' && projectState?.state === 'activating'"
+        class="project-banner"
+      >
+        等待 Unity 启动（第 {{ projectState.attempt ?? 1 }} 次尝试）…
+      </div>
+      <div
+        v-else-if="active === 'unity' && projectState?.state === 'active'"
+        class="project-banner"
+      >
+        当前工程：{{ projectState.name }}
+      </div>
       <div class="content">
         <FileTree :area="active" :client="client" @select="openPreview" @modify="requestModify" />
         <PreviewPane

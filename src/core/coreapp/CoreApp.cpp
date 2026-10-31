@@ -20,6 +20,7 @@
 #include "core/settings/UiState.h"
 #include "core/store/SessionStore.h"
 #include "core/tasks/TaskManager.h"
+#include "core/unity/ProjectService.h"
 #include "core/ws/ProtocolRouter.h"
 #include "core/ws/WsServer.h"
 
@@ -1130,6 +1131,101 @@ bool CoreApp::start()
                                           {"ok", false}, {"error", "bridge-not-registered"}});
                                   return QJsonValue(QJsonObject{{"ok", fn()}});
                               });
+
+    // Unity 区：唯一激活工程状态机（Task 1 用占位桥接钩子，Task 3 换成真实 m_unity 的 stop/start/isReady）
+    m_projects = new ProjectService(this);
+    m_projects->setBridgeHooks(
+        [] {}, [] {},                                       // stopBridge / startBridge → Task 3
+        [this](const QString&) { m_tasks->cancelArea(QStringLiteral("unity")); });
+    m_projects->setBridgeReadyQuery([] { return true; });   // isReady → Task 3: m_unity->isReady()
+    m_projects->setRunningTaskQuery(
+        [this] { return m_tasks->runningCount(QStringLiteral("unity")); });
+
+    connect(m_projects, &ProjectService::stateChanged, this, [this](const ProjectInfo& info) {
+        if (info.state == QLatin1String("active")) {        // 记住上次工程（规格 6.1）
+            QJsonObject root = m_settings->data();
+            QJsonObject unity = root.value(QStringLiteral("unity")).toObject();
+            unity.insert(QStringLiteral("lastProject"), info.path);
+            root.insert(QStringLiteral("unity"), unity);
+            m_settings->setData(root);
+            m_settings->save();
+        }
+        m_ws->broadcastEvent(QStringLiteral("project.state"),
+                             QJsonObject{{"path", info.path}, {"name", info.name},
+                                         {"state", info.state}});
+    });
+    connect(m_projects, &ProjectService::waitingUnity, this,
+            [this](const QString& path, int attempt) {
+                m_ws->broadcastEvent(QStringLiteral("project.state"),
+                                     QJsonObject{{"path", path}, {"state", "activating"},
+                                                 {"waiting", true}, {"attempt", attempt}});
+            });
+    connect(m_projects, &ProjectService::errorOccurred, this, [this](const QString& reason) {
+        m_ws->broadcastEvent(QStringLiteral("error.card"),
+                             QJsonObject{{"area", "unity"}, {"reason", reason}});
+    });
+
+    m_router->registerHandler(QStringLiteral("project.select"), [this](const QJsonObject& params) {
+        const QString path = params.value(QStringLiteral("path")).toString();
+        int running = 0;
+        const auto result = m_projects->requestSwitch(path, &running);
+        if (result == ProjectService::SwitchResult::Invalid)
+            return QJsonValue(QJsonObject{{"accepted", false}, {"reason", "invalid-project"}});
+        if (result == ProjectService::SwitchResult::NeedsConfirm)
+            return QJsonValue(QJsonObject{{"accepted", false}, {"reason", "switch-confirm"},
+                                          {"currentPath", m_projects->activePath()},
+                                          {"newPath", path},
+                                          {"runningTasks", running}});
+        return QJsonValue(QJsonObject{{"accepted", true}});
+    });
+    m_router->registerHandler(QStringLiteral("project.switchConfirm"),
+                              [this](const QJsonObject& params) {
+                                  m_projects->confirmSwitch(
+                                      params.value(QStringLiteral("path")).toString());
+                                  return QJsonValue(QJsonObject{{"accepted", true}});
+                              });
+
+    // 原生目录选择：C++ 只唤起对话框并回传路径，校验/切换仍全部走 project.select（规格 8.3）
+    m_router->registerHandler(QStringLiteral("dialog.pickFolder"), [this](const QJsonObject& params) {
+        if (!m_folderPicker)
+            return QJsonValue(QJsonObject{{"accepted", false}, {"reason", "dialog-unavailable"}});
+        if (m_pickingFolder)
+            return QJsonValue(QJsonObject{{"accepted", false}, {"reason", "busy"}});
+        if (params.value(QStringLiteral("purpose")).toString() != QLatin1String("unityProject"))
+            return QJsonValue(QJsonObject{{"accepted", false}, {"reason", "unsupported-purpose"}});
+        const QString requestId = params.value(QStringLiteral("requestId")).toString();
+        if (requestId.isEmpty())
+            return QJsonValue(QJsonObject{{"accepted", false}, {"reason", "bad-request"}});
+
+        const QJsonObject unity = m_settings->data().value(QStringLiteral("unity")).toObject();
+        QString startDir = unity.value(QStringLiteral("lastBrowseDir")).toString();
+        if (startDir.isEmpty()) {
+            const QString lastProject = unity.value(QStringLiteral("lastProject")).toString();
+            if (!lastProject.isEmpty())
+                startDir = QFileInfo(lastProject).absolutePath();
+        }
+        if (startDir.isEmpty())
+            startDir = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+
+        m_pickingFolder = true;
+        m_folderPicker(startDir, [this, requestId](const QString& path) {
+            m_pickingFolder = false;
+            const QString clean = path.isEmpty() ? QString() : QDir::cleanPath(path);
+            if (!clean.isEmpty()) {                          // 记住上次浏览目录
+                QJsonObject root = m_settings->data();
+                QJsonObject unityObj = root.value(QStringLiteral("unity")).toObject();
+                unityObj.insert(QStringLiteral("lastBrowseDir"), clean);
+                root.insert(QStringLiteral("unity"), unityObj);
+                m_settings->setData(root);
+                m_settings->save();
+            }
+            m_ws->broadcastEvent(QStringLiteral("dialog.result"),
+                                 QJsonObject{{"requestId", requestId},
+                                             {"path", clean},
+                                             {"cancelled", clean.isEmpty()}});
+        });
+        return QJsonValue(QJsonObject{{"accepted", true}});
+    });
 
     if (!m_ws->listen())
         return false;

@@ -20,6 +20,7 @@ add_library(synthforge_core STATIC
     src/core/settings/UiState.cpp
     src/core/store/SessionStore.cpp
     src/core/tasks/TaskManager.cpp
+    src/core/unity/ProjectService.cpp
     src/core/ws/ProtocolRouter.cpp
     src/core/ws/WsServer.cpp
     src/core/llm/SseParser.cpp
@@ -108,6 +109,18 @@ add_executable(tst_bridge_commands tests/tst_bridge_commands.cpp)
 target_link_libraries(tst_bridge_commands PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_bridge_commands COMMAND tst_bridge_commands)
 set_tests_properties(tst_bridge_commands PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_project_service tests/tst_project_service.cpp)
+target_link_libraries(tst_project_service PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_project_service COMMAND tst_project_service)
+set_tests_properties(tst_project_service PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_folder_pick tests/tst_folder_pick.cpp)
+target_link_libraries(tst_folder_pick PRIVATE synthforge_core Qt6::Test Qt6::WebSockets)
+add_test(NAME tst_folder_pick COMMAND tst_folder_pick)
+set_tests_properties(tst_folder_pick PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
 add_executable(synthforge_cli src/cli/main.cpp)

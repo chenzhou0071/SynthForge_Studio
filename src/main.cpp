@@ -1,12 +1,15 @@
 #include <QApplication>
 #include <QByteArray>
 #include <QCoreApplication>
+#include <QFileDialog>
 #include <QIcon>
 #include <QStringList>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QWebEngineProfile>
 #include <QWebEngineUrlScheme>
+
+#include <functional>
 
 #include "app/AppSchemeHandler.h"
 #include "app/MainWindow.h"
@@ -63,6 +66,22 @@ int main(int argc, char* argv[])
                           uiState.setWindowGeometry(geometry);
                       },
                       softwareRender); // core 先声明：退出时窗口先销毁
+
+    // 注入原生目录选择：core 不依赖 QtWidgets，对话框在此用 QFileDialog，选完/取消都回传路径
+    core.setFolderPicker([&window](const QString& startDir,
+                                   std::function<void(const QString&)> done) {
+        auto* dialog = new QFileDialog(&window, QStringLiteral("选择 Unity 工程文件夹"), startDir);
+        dialog->setFileMode(QFileDialog::Directory);
+        dialog->setOption(QFileDialog::ShowDirsOnly, true);
+        dialog->setWindowModality(Qt::ApplicationModal);  // 非 exec()，但保持应用级模态
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        QObject::connect(dialog, &QDialog::accepted, dialog, [dialog, done] {
+            done(dialog->selectedFiles().value(0));
+        });
+        QObject::connect(dialog, &QDialog::rejected, dialog, [done] { done(QString()); });
+        dialog->open();                                   // 不阻塞事件循环
+    });
+
     window.show();
     return app.exec();
 }

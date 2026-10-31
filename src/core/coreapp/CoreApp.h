@@ -10,6 +10,7 @@
 
 #include <functional>
 #include <memory>
+#include <utility>
 
 #include "core/agent/AgentOrchestrator.h"
 #include "core/assets/AssetLibrary.h"
@@ -28,6 +29,7 @@ class SummarizerAgent;
 class Cloud3dService;
 class UiState;
 class DiscussionAgent;
+class ProjectService;
 
 struct CoreOptions
 {
@@ -63,6 +65,12 @@ public:
     // 由 P4（blender）/ P6（unity）注入桥接重启回调
     void registerBridge(const QString& area, RestartFn fn);
 
+    // 原生目录选择：core 不依赖 QtWidgets，由 GUI 入口（main.cpp）注入 QFileDialog 回调。
+    // 未注入（headless/单测）时 dialog.pickFolder 返回 dialog-unavailable。
+    using FolderPicker =
+        std::function<void(const QString& startDir, std::function<void(const QString&)> done)>;
+    void setFolderPicker(FolderPicker picker) { m_folderPicker = std::move(picker); }
+
 private:
     QJsonValue handleChatSend(const QJsonObject& params, bool appendUser = true);
     // 修改已有资产：单组计划直接执行，调用前草稿已转正为 user 行
@@ -90,6 +98,9 @@ private:
     std::unique_ptr<PreflightChecker> m_preflight;
     SummarizerAgent* m_summarizer = nullptr; // QObject child，析构由 parent 负责
     std::unique_ptr<DiscussionAgent> m_ask;  // 讨论模式：只读感知 Blender 的多轮问答
+    ProjectService* m_projects = nullptr;    // QObject child：Unity 区唯一激活工程状态机
+    FolderPicker m_folderPicker;             // GUI 注入的文件夹选择回调（headless 为空）
+    bool m_pickingFolder = false;            // 选择框打开中：并发请求一律 busy
     std::unique_ptr<Cloud3dService> m_cloud;  // 云 3D 轮询与下载，独立于任务队列
     AgentOrchestrator* m_orch = nullptr;     // QObject child，析构由 parent 负责
     BlenderGate m_blenderGate; // Blender agent 任务与 unity 转换互斥
