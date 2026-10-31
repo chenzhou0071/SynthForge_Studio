@@ -77,6 +77,9 @@ private slots:
         QVERIFY2(!server.requestAt(0).contains(QStringLiteral("Blender 建模 agent")),
                  qPrintable(server.requestAt(0)));
         QVERIFY(server.requestAt(0).contains(QStringLiteral("Unity")));
+        // 收尾必须汇报完成情况 + 把实机验证交回用户
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("收尾汇报")));
+        QVERIFY(server.requestAt(0).contains(QStringLiteral("实机")));
         // 不能对 Unity 桥下 Blender 专属命令（清场 / 导出都靠 execute_blender_code）
         QVERIFY(!mcp.calls.contains(QStringLiteral("execute_blender_code")));
     }

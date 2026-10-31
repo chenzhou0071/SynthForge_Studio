@@ -1630,7 +1630,8 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         const QString assetsRoot = m_projects->assetsPath();
         BuildPlan plan;
         plan.groups = {BuildGroup{QStringLiteral("Unity 任务"), {}, {},
-                                  QStringLiteral("read_console 无编译错误且 Game 截图正常")}};
+                                  QStringLiteral("read_console 无编译错误；有测试则 run_tests 通过；"
+                                                 "收尾给出完成汇报并提示用户去 Unity 实机验证")}};
         plan.maxSteps = 50;
         m_tasks->enqueue(Task{taskId, area, project,
                               [=](const QString& tid, TaskManager* tm) {
