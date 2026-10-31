@@ -38,6 +38,7 @@ struct CoreOptions
     bool headless = false;
     QString libraryRoot;         // 空 = Documents/SynthForgeStudio/ModelLibrary；测试注入用
     BridgeCommand blenderBridge; // program 为空 = 默认 uvx mcp-for-blender；测试注入 mock_mcp_server
+    BridgeCommand unityBridge;   // program 为空 = 默认 uvx mcp-for-unity；测试注入 mock/假程序
 };
 
 // 已确认、等用户选完存放目录就执行的任务
@@ -79,6 +80,8 @@ private:
     // 按 .blend 相对路径回查该资产的产出形态（prop/diorama/open），查不到返回空
     QString assetShapeForPath(const QString& area, const QString& blendRelative) const;
     void broadcastConnStatus(const QString& area, const QString& status, const QString& hint);
+    // Unity 编排器的信号接线：复用与 blender 同构的通用广播（不含 blender 专属的 plan/导出卡）
+    void wireUnityOrchestrator(AgentOrchestrator* orch);
     // 新客户端连上时补发当前状态：桥接先就绪、页面后加载也不会永远灰灯
     void broadcastStatusSnapshot() const;
     LlmConfig primaryAgentConfig() const;
@@ -96,6 +99,7 @@ private:
     std::unique_ptr<WsServer> m_ws;
     std::unique_ptr<LlmGateway> m_llm;
     McpRuntime* m_blender = nullptr; // QObject child，析构由 parent 负责
+    McpRuntime* m_unity = nullptr;   // QObject child：Unity 区 MCP 桥接运行时
     std::unique_ptr<PreflightChecker> m_preflight;
     SummarizerAgent* m_summarizer = nullptr; // QObject child，析构由 parent 负责
     std::unique_ptr<DiscussionAgent> m_ask;  // 讨论模式：只读感知 Blender 的多轮问答
@@ -105,8 +109,10 @@ private:
     bool m_pickingFolder = false;            // 选择框打开中：并发请求一律 busy
     std::unique_ptr<Cloud3dService> m_cloud;  // 云 3D 轮询与下载，独立于任务队列
     AgentOrchestrator* m_orch = nullptr;     // QObject child，析构由 parent 负责
+    AgentOrchestrator* m_unityOrch = nullptr; // Unity 区专用编排器：不能与 blender 共用，否则并行任务互相覆盖
     BlenderGate m_blenderGate; // Blender agent 任务与 unity 转换互斥
     QJsonArray m_blenderTools;
+    QJsonArray m_unityTools;    // filterUnityTools 后的 Unity 区工具（白名单）
     std::unique_ptr<AssetLibrary> m_library;    // 资产库根目录（ModelLibrary）
     QHash<QString, QJsonObject> m_pendingPlans; // area -> 计划卡 JSON
     QHash<QString, OutputShape> m_shapeByArea;  // area -> 本次执行任务的档位（资产卡据此落 shape）

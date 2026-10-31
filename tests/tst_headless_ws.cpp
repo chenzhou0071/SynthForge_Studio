@@ -962,6 +962,49 @@ private slots:
                  QStringLiteral("invalid-path"));
     }
 
+    // unity chat.send 前置：没激活工程 / Unity 桥未就绪都不消耗 LLM，直接出错误卡
+    void unityChatSendRequiresProjectAndReady()
+    {
+        QTemporaryDir dir;
+        const QString project = dir.filePath(QStringLiteral("MyGame"));
+        QVERIFY(QDir().mkpath(project + QStringLiteral("/Assets")));
+        QVERIFY(QDir().mkpath(project + QStringLiteral("/ProjectSettings")));
+        BridgeCommand dead; // 假程序：m_unity 永远起不来 → 未就绪
+        dead.program = QStringLiteral("definitely-not-a-real-bridge-program");
+        CoreApp app({dir.path(), true, dir.filePath(QStringLiteral("library")),
+                     mockBlenderBridge(), dead});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        // 没激活工程：project-not-active
+        const int mark1 = client.mark();
+        const QJsonObject noProject =
+            client.request(QStringLiteral("chat.send"), {{"area", "unity"}, {"text", "做个红立方"}})
+                .value(QStringLiteral("result")).toObject();
+        QCOMPARE(noProject.value(QStringLiteral("accepted")).toBool(), false);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !client.lastEvent(QStringLiteral("error.card"), mark1).isEmpty(), 3000);
+        QCOMPARE(client.lastEvent(QStringLiteral("error.card"), mark1)
+                     .value(QStringLiteral("reason")).toString(),
+                 QStringLiteral("project-not-active"));
+
+        // 激活工程但 Unity 桥未就绪：unity-not-ready
+        QVERIFY(client.request(QStringLiteral("project.select"), {{"path", project}})
+                    .value(QStringLiteral("result")).toObject()
+                    .value(QStringLiteral("accepted")).toBool());
+        const int mark2 = client.mark();
+        const QJsonObject notReady =
+            client.request(QStringLiteral("chat.send"), {{"area", "unity"}, {"text", "再试"}})
+                .value(QStringLiteral("result")).toObject();
+        QCOMPARE(notReady.value(QStringLiteral("accepted")).toBool(), false);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !client.lastEvent(QStringLiteral("error.card"), mark2).isEmpty(), 3000);
+        QCOMPARE(client.lastEvent(QStringLiteral("error.card"), mark2)
+                     .value(QStringLiteral("reason")).toString(),
+                 QStringLiteral("unity-not-ready"));
+    }
+
     void fileReadRejectsBadPaths()
     {
         QTemporaryDir dir;
@@ -1142,6 +1185,8 @@ private slots:
 
     void cancelEndsOnlyTargetArea()
     {
+        // 暂只覆盖 blender 自身取消。unity 现在走 agent 执行路径（Task 3），
+        // 其跨区取消隔离要等 AgentOrchestrator 按区参数化（方案 A）后才能安全验证。
         QTemporaryDir dir;
         CoreApp app({dir.path(), true});
         QVERIFY(app.start());
@@ -1154,27 +1199,13 @@ private slots:
 
         QVERIFY(client.request(QStringLiteral("chat.send"), {{"area", "blender"}, {"text", "a"}})
                     .value("result").toObject().value("accepted").toBool());
-        QTRY_COMPARE_WITH_TIMEOUT(server.acceptedCount(), 1, 3000);
-        QVERIFY(client.request(QStringLiteral("chat.send"), {{"area", "unity"}, {"text", "b"}})
-                    .value("result").toObject().value("accepted").toBool());
-        QTRY_COMPARE_WITH_TIMEOUT(server.acceptedCount(), 2, 3000);
-
-        // 只取消 blender：unity 的流必须还活着（abortTag 不是全局 abort）
+        QTRY_VERIFY_WITH_TIMEOUT(server.acceptedAt(0), 3000);
         QCOMPARE(client.request(QStringLiteral("chat.cancel"), {{"area", "blender"}})
                      .value("result").toObject().value("ok").toBool(),
                  true);
         QTRY_VERIFY_WITH_TIMEOUT(server.disconnectedAt(0), 2000);
-        QTest::qWait(300);
-        QVERIFY(!server.disconnectedAt(1));
-
-        QCOMPARE(client.request(QStringLiteral("chat.clear"), {{"area", "unity"}})
-                     .value("result").toObject().value("ok").toBool(),
-                 true);
-        QTRY_VERIFY_WITH_TIMEOUT(server.disconnectedAt(1), 2000);
-
-        QTest::qWait(700); // 跨过 400ms 的迟到回复
-        QCOMPARE(taskState(dir.path(), QStringLiteral("blender")), QStringLiteral("cancelled"));
-        QCOMPARE(taskState(dir.path(), QStringLiteral("unity")), QStringLiteral("cancelled"));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            taskState(dir.path(), QStringLiteral("blender")) == QStringLiteral("cancelled"), 2000);
     }
 
     void sendsOnlyRecentTwentyMessagesAsContext()

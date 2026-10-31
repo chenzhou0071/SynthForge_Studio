@@ -22,6 +22,7 @@
 #include "core/tasks/TaskManager.h"
 #include "core/unity/ProjectService.h"
 #include "core/unity/DirectoryWatcher.h"
+#include "core/unity/UnityTools.h"
 #include "core/ws/ProtocolRouter.h"
 #include "core/ws/WsServer.h"
 
@@ -151,6 +152,59 @@ CoreApp::CoreApp(const CoreOptions& options, QObject* parent)
 }
 
 CoreApp::~CoreApp() = default;
+
+// Unity 编排器接线：只接两区通用的广播（步骤/流式/每步落库/结果/失败/分组/截图）。
+// 不接 planReady/artifactsReady：Unity 区不走草稿→计划，也不产出 glb 资产卡。
+void CoreApp::wireUnityOrchestrator(AgentOrchestrator* orch)
+{
+    connect(orch, &AgentOrchestrator::toolStep, this,
+            [this](const QString& area, const QString& tool, const QString& status) {
+                m_ws->broadcastEvent(QStringLiteral("tool.step"),
+                                     QJsonObject{{"area", area}, {"tool", tool}, {"status", status}});
+            });
+    connect(orch, &AgentOrchestrator::delta, this,
+            [this](const QString& area, const QString& text) {
+                m_ws->broadcastEvent(QStringLiteral("chat.delta"),
+                                     QJsonObject{{"area", area}, {"text", text}});
+            });
+    connect(orch, &AgentOrchestrator::turnFinished, this,
+            [this](const QString& area, const QString& text) {
+                if (text.trimmed().isEmpty())
+                    return;
+                m_sessions->appendMessage(area, QStringLiteral("assistant"), text);
+                m_ws->broadcastEvent(QStringLiteral("chat.turn"),
+                                     QJsonObject{{"area", area}, {"content", text}});
+            });
+    connect(orch, &AgentOrchestrator::finalText, this,
+            [this](const QString& area, const QString& text) {
+                m_sessions->appendMessage(area, QStringLiteral("assistant"), text);
+                m_ws->broadcastEvent(QStringLiteral("chat.message"),
+                                     QJsonObject{{"area", area}, {"role", "assistant"},
+                                                 {"content", text}});
+            });
+    connect(orch, &AgentOrchestrator::failed, this,
+            [this, orch](const QString& area, const QString& reason) {
+                m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                     QJsonObject{{"area", area},
+                                                 {"reason", reason},
+                                                 {"resumable", orch->canResume(area)},
+                                                 {"steps", orch->stepCount()},
+                                                 {"maxSteps", orch->stepBudget()}});
+            });
+    connect(orch, &AgentOrchestrator::groupProgress, this,
+            [this](const QString& area, int index, int count, const QString& title) {
+                m_ws->broadcastEvent(QStringLiteral("task.progress"),
+                                     QJsonObject{{"area", area}, {"groupIndex", index},
+                                                 {"groupCount", count}, {"title", title}});
+            });
+    connect(orch, &AgentOrchestrator::imageReceived, this,
+            [this](const QString& area, const QString& taskId, const QString& dataUrl,
+                   const QString& caption) {
+                m_ws->broadcastEvent(QStringLiteral("chat.image"),
+                                     QJsonObject{{"area", area}, {"taskId", taskId},
+                                                 {"dataUrl", dataUrl}, {"caption", caption}});
+            });
+}
 
 bool CoreApp::start()
 {
@@ -1296,10 +1350,50 @@ bool CoreApp::start()
                                      QJsonObject{{"area", "unity"}, {"reason", reason},
                                                  {"paths", QJsonArray::fromStringList(dirs)}});
             });
+    // Unity 区 MCP 桥接运行时：与 m_blender 同构，工具集经白名单裁剪（规格 6.3）
+    const BridgeCommand unityBridge =
+        m_options.unityBridge.program.isEmpty()
+            ? defaultBridgeCommand(QStringLiteral("unity"))
+            : m_options.unityBridge;
+    m_unity = new McpRuntime(QStringLiteral("unity"),
+                             std::make_unique<StdioTransport>(unityBridge), this);
+    connect(m_unity, &McpRuntime::toolsChanged, this, [this](const QJsonArray& tools) {
+        m_unityTools = filterUnityTools(tools);
+        if (m_unity->isReady()) // 顶栏悬停文案：已就绪 · N 个工具
+            broadcastConnStatus(QStringLiteral("unity"), QStringLiteral("ready"),
+                                QStringLiteral("已就绪 · %1 个工具").arg(tools.size()));
+    });
+    connect(m_unity, &McpRuntime::statusChanged, this, &CoreApp::broadcastConnStatus);
+    registerBridge(QStringLiteral("unity"), [this] { return m_unity->restart(); });
+
+    // Unity 专用编排器：不能与 blender 共用，否则两区并行任务会互相覆盖 m_area/m_taskId
+    m_unityOrch = new AgentOrchestrator(m_llm.get(), m_unity->client(), this);
+    wireUnityOrchestrator(m_unityOrch);
+    m_unityOrch->setToolCallHook([this](const QString&, bool running) {
+        if (!m_watcher)
+            return;
+        if (running)
+            m_watcher->beginSuppress(); // MCP 工具调用全程吞 watcher 回声，避免双源重复
+        else
+            m_watcher->endSuppress();
+    });
+
+    // 切换工程 = 断旧桥 + 取消旧任务 + 起新桥；就绪与否由 m_unity 真实握手决定（Task 3）
     m_projects->setBridgeHooks(
-        [] {}, [] {},                                       // stopBridge / startBridge → Task 3
-        [this](const QString&) { m_tasks->cancelArea(QStringLiteral("unity")); });
-    m_projects->setBridgeReadyQuery([] { return true; });   // isReady → Task 3: m_unity->isReady()
+        [this] {
+            m_everReady.remove(QStringLiteral("unity")); // 主动断开：先清标记，不误报 bridge-crashed
+            m_unity->stop();
+        },
+        [this] { m_unity->start(); },                     // 新会话拉起（未就绪由 ProjectService 轮询）
+        [this](const QString&) {
+            const bool hadTasks = m_tasks->runningCount(QStringLiteral("unity")) > 0;
+            m_tasks->cancelArea(QStringLiteral("unity"));
+            if (hadTasks)
+                m_ws->broadcastEvent(QStringLiteral("chat.message"),
+                                     QJsonObject{{"area", "unity"}, {"role", "assistant"},
+                                                 {"content", QStringLiteral("已中断：切换工程")}});
+        });
+    m_projects->setBridgeReadyQuery([this] { return m_unity->isReady(); });
     m_projects->setRunningTaskQuery(
         [this] { return m_tasks->runningCount(QStringLiteral("unity")); });
 
@@ -1410,6 +1504,12 @@ bool CoreApp::start()
                               : QJsonObject{{"ok", true}, {"tree", node}});
     });
 
+    // 启动恢复上次工程（规格 6.1/7.3）：目录仍合法就直接 select，走等待 Unity 流程、不弹确认
+    const QString lastProject = m_settings->data().value(QStringLiteral("unity")).toObject()
+                                    .value(QStringLiteral("lastProject")).toString();
+    if (!lastProject.isEmpty() && m_projects->validate(lastProject))
+        m_projects->select(lastProject);
+
     if (!m_ws->listen())
         return false;
 
@@ -1507,6 +1607,41 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
     const QString area = params.value(QStringLiteral("area")).toString();
     const QString text = params.value(QStringLiteral("text")).toString();
     const QString mode = params.value(QStringLiteral("mode")).toString(); // 空 = P2 通用流
+
+    // Unity 区：不走草稿→计划两步（规格 8.4），前置校验后直接构造单组计划执行
+    if (area == QLatin1String("unity")) {
+        if (m_projects->activePath().isEmpty()) {
+            m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                 QJsonObject{{"area", "unity"}, {"reason", "project-not-active"}});
+            return QJsonValue(QJsonObject{{"accepted", false}});
+        }
+        if (!m_unity || !m_unity->isReady()) {
+            m_ws->broadcastEvent(QStringLiteral("error.card"),
+                                 QJsonObject{{"area", "unity"}, {"reason", "unity-not-ready"}});
+            return QJsonValue(QJsonObject{{"accepted", false}});
+        }
+        if (appendUser) {
+            m_sessions->appendMessage(area, QStringLiteral("user"), text);
+            m_ws->broadcastEvent(QStringLiteral("chat.message"),
+                                 QJsonObject{{"area", area}, {"role", "user"}, {"content", text}});
+        }
+        const QString taskId = QStringLiteral("unity-%1").arg(++m_seq);
+        const QString project = m_projects->activePath();
+        const QString assetsRoot = m_projects->assetsPath();
+        BuildPlan plan;
+        plan.groups = {BuildGroup{QStringLiteral("Unity 任务"), {}, {},
+                                  QStringLiteral("read_console 无编译错误且 Game 截图正常")}};
+        plan.maxSteps = 50;
+        m_tasks->enqueue(Task{taskId, area, project,
+                              [=](const QString& tid, TaskManager* tm) {
+                                  m_unityOrch->setModelConfig(primaryAgentConfig());
+                                  m_unityOrch->setConversationHistory(recentMessages(area, 20));
+                                  m_unityOrch->execute(tid, tm,
+                                                       ToolBridge::mcpToolsToOpenAi(m_unityTools),
+                                                       plan, text, assetsRoot, area);
+                              }});
+        return QJsonValue(QJsonObject{{"accepted", true}, {"taskId", taskId}});
+    }
 
     // 前置检查只留云 API：低模/修改在草稿阶段不需要 Blender，点执行时才检查
     if (mode == QLatin1String("cloud3d")) {

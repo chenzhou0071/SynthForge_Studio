@@ -22,6 +22,7 @@ add_library(synthforge_core STATIC
     src/core/tasks/TaskManager.cpp
     src/core/unity/ProjectService.cpp
     src/core/unity/DirectoryWatcher.cpp
+    src/core/unity/UnityTools.cpp
     src/core/ws/ProtocolRouter.cpp
     src/core/ws/WsServer.cpp
     src/core/llm/SseParser.cpp
@@ -128,6 +129,12 @@ add_executable(tst_watcher tests/tst_watcher.cpp)
 target_link_libraries(tst_watcher PRIVATE synthforge_core Qt6::Test)
 add_test(NAME tst_watcher COMMAND tst_watcher)
 set_tests_properties(tst_watcher PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_unity_tools tests/tst_unity_tools.cpp)
+target_link_libraries(tst_unity_tools PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_unity_tools COMMAND tst_unity_tools)
+set_tests_properties(tst_unity_tools PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
 add_executable(synthforge_cli src/cli/main.cpp)
