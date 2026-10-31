@@ -146,13 +146,49 @@ function buildTree(items: unknown): DirNode {
   return root;
 }
 
+// tree.refresh 返回的嵌套节点：{name,path,type,children?}
+interface TreeNode {
+  name: string;
+  path: string;
+  type: "dir" | "file";
+  children?: TreeNode[];
+}
+
+// 把 Unity 工程树（相对 <project>/Assets）转成与 blender 模型库同形的 DirNode，复用同一套渲染
+function unityToDirNode(node: TreeNode): DirNode {
+  const dir: DirNode = { name: node.name, path: node.path, dirs: [], files: [] };
+  for (const child of node.children ?? []) {
+    if (child.type === "dir") dir.dirs.push(unityToDirNode(child));
+    else
+      dir.files.push({
+        name: child.name,
+        path: child.path,
+        kind: (child.name.split(".").pop() ?? "").toLowerCase(),
+      });
+  }
+  dir.dirs.sort((a, b) => a.name.localeCompare(b.name));
+  dir.files.sort((a, b) => a.name.localeCompare(b.name));
+  return dir;
+}
+
 async function loadTree() {
-  if (!isBlender.value) return;
   const seq = ++fetchSeq;
   try {
-    const items = await props.client.request<unknown>("assets.list", {});
-    if (seq !== fetchSeq) return; // 连续事件只认最后一次结果
-    tree.value = buildTree(items);
+    if (isBlender.value) {
+      const items = await props.client.request<unknown>("assets.list", {});
+      if (seq !== fetchSeq) return; // 连续事件只认最后一次结果
+      tree.value = buildTree(items);
+      return;
+    }
+    // Unity 区：tree.refresh 是唯一树数据源，返回以 <project>/Assets 为根的嵌套节点
+    const res = await props.client.request<{ ok?: boolean; tree?: TreeNode }>("tree.refresh", {
+      area: "unity",
+    });
+    if (seq !== fetchSeq) return;
+    tree.value =
+      res && res.ok && res.tree
+        ? unityToDirNode(res.tree)
+        : { name: "", path: "", dirs: [], files: [] };
   } catch (cause) {
     if (seq !== fetchSeq) return;
     message.value = { kind: "error", text: cause instanceof Error ? cause.message : String(cause) };
@@ -179,7 +215,6 @@ function openModify() {
 }
 
 function openMenu(event: MouseEvent, path: string, isEntry: boolean, isDir = false) {
-  if (!isBlender.value) return;
   message.value = null;
   menu.value = { x: event.clientX, y: event.clientY, path, isEntry, isDir };
 }
@@ -231,8 +266,7 @@ watch(
     closeMenu();
     message.value = null;
     collapsed.value = new Set();
-    if (isBlender.value) void loadTree();
-    else tree.value = { name: "", path: "", dirs: [], files: [] };
+    void loadTree();
   },
 );
 
@@ -288,35 +322,31 @@ async function runOp(op: Op) {
     </header>
 
     <div class="tree-body" @contextmenu.prevent.stop="openRootMenu($event)">
-      <template v-if="isBlender">
-        <!-- 打开的就是模型库根目录，不再显示同名根节点 -->
-        <div
-          v-for="row in rows"
-          :key="row.key"
-          class="tree-row"
-          :class="row.kind === 'dir' ? 'tree-dir' : 'tree-file'"
-          :style="{ paddingLeft: 6 + row.depth * 14 + 'px' }"
-          :data-path="row.path"
-          @click="onRowClick(row)"
-          @contextmenu.prevent.stop="openRowMenu($event, row)"
+      <!-- 两区共用同一套 rows 渲染：blender 是模型库，unity 是工程 Assets 树 -->
+      <div
+        v-for="row in rows"
+        :key="row.key"
+        class="tree-row"
+        :class="row.kind === 'dir' ? 'tree-dir' : 'tree-file'"
+        :style="{ paddingLeft: 6 + row.depth * 14 + 'px' }"
+        :data-path="row.path"
+        @click="onRowClick(row)"
+        @contextmenu.prevent.stop="openRowMenu($event, row)"
+      >
+        <span class="tree-icon">{{ row.kind === "dir" ? (collapsed.has(row.path) ? "▸" : "▾") : "" }}</span>
+        <span class="tree-name">{{ row.label }}</span>
+        <span
+          v-if="row.fileKind && isBlender"
+          class="suffix"
+          :class="{ muted: row.fileKind !== 'glb', cloud: row.source === 'cloud' }"
+          :title="row.source === 'cloud' ? cloudTitle(row.provider) : undefined"
         >
-          <span class="tree-icon">{{ row.kind === "dir" ? (collapsed.has(row.path) ? "▸" : "▾") : "" }}</span>
-          <span class="tree-name">{{ row.label }}</span>
-          <span
-            v-if="row.fileKind"
-            class="suffix"
-            :class="{ muted: row.fileKind !== 'glb', cloud: row.source === 'cloud' }"
-            :title="row.source === 'cloud' ? cloudTitle(row.provider) : undefined"
-          >
-            {{ row.source === "cloud" ? `云 · ${row.fileKind}` : row.fileKind }}
-          </span>
-        </div>
-        <p v-if="rows.length === 0" class="tree-empty">暂无资产，右键可新建文件夹</p>
-      </template>
-      <template v-else>
-        <p class="tree-root">尚未导入工程</p>
-        <p class="tree-empty">导入 Unity 工程后在此浏览资源。</p>
-      </template>
+          {{ row.source === "cloud" ? `云 · ${row.fileKind}` : row.fileKind }}
+        </span>
+      </div>
+      <p v-if="rows.length === 0" class="tree-empty">
+        {{ isBlender ? "暂无资产，右键可新建文件夹" : "尚未导入工程，或 Assets 为空" }}
+      </p>
 
       <p
         v-if="message"
@@ -340,7 +370,7 @@ async function runOp(op: Op) {
       <li :class="{ disabled: !menu.isEntry }" @click="runOp('delete')">删除</li>
       <li @click="runOp('reveal')">在资源管理器中显示</li>
       <li @click="runOp('refresh')">刷新</li>
-      <li v-if="menu.isEntry && !menu.isDir" @click="openModify">修改此资产</li>
+      <li v-if="menu.isEntry && !menu.isDir && isBlender" @click="openModify">修改此资产</li>
     </ul>
   </aside>
 </template>

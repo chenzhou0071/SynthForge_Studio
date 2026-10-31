@@ -21,6 +21,7 @@ add_library(synthforge_core STATIC
     src/core/store/SessionStore.cpp
     src/core/tasks/TaskManager.cpp
     src/core/unity/ProjectService.cpp
+    src/core/unity/DirectoryWatcher.cpp
     src/core/ws/ProtocolRouter.cpp
     src/core/ws/WsServer.cpp
     src/core/llm/SseParser.cpp
@@ -121,6 +122,12 @@ add_executable(tst_folder_pick tests/tst_folder_pick.cpp)
 target_link_libraries(tst_folder_pick PRIVATE synthforge_core Qt6::Test Qt6::WebSockets)
 add_test(NAME tst_folder_pick COMMAND tst_folder_pick)
 set_tests_properties(tst_folder_pick PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_watcher tests/tst_watcher.cpp)
+target_link_libraries(tst_watcher PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_watcher COMMAND tst_watcher)
+set_tests_properties(tst_watcher PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
 add_executable(synthforge_cli src/cli/main.cpp)

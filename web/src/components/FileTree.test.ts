@@ -334,12 +334,50 @@ describe("FileTree", () => {
     expect(wrapper.find(".ctx-menu").exists()).toBe(false);
   });
 
-  it("never opens the custom menu for the Unity area", async () => {
-    const { client, wrapper } = mountTree("unity");
-    expect(wrapper.text()).toContain("尚未导入工程");
+  it("renders the Unity project tree from tree.refresh", async () => {
+    const { client, wrapper } = mountTree("unity", (fake) => {
+      fake.results.set("tree.refresh", {
+        ok: true,
+        tree: {
+          name: "Assets",
+          path: "",
+          type: "dir",
+          children: [
+            {
+              name: "Scripts",
+              path: "Scripts",
+              type: "dir",
+              children: [{ name: "Player.cs", path: "Scripts/Player.cs", type: "file" }],
+            },
+          ],
+        },
+      });
+    });
+    await flushPromises();
+    expect(wrapper.text()).toContain("Scripts");
+    expect(wrapper.text()).toContain("Player.cs");
     expect(client.callsOf("assets.list")).toHaveLength(0);
+  });
 
+  it("opens the context menu for the Unity area", async () => {
+    const { wrapper } = mountTree("unity", (fake) => {
+      fake.results.set("tree.refresh", {
+        ok: true,
+        tree: { name: "Assets", path: "", type: "dir", children: [] },
+      });
+    });
+    await flushPromises();
     await wrapper.find(".tree-body").trigger("contextmenu", { clientX: 10, clientY: 10 });
-    expect(wrapper.find(".ctx-menu").exists()).toBe(false);
+    expect(wrapper.find(".ctx-menu").exists()).toBe(true);
+    // 修改此资产是 blender 专属：unity 不出现
+    expect(menuItems(wrapper).map((item) => item.text())).not.toContain("修改此资产");
+  });
+
+  it("shows an empty Unity tree when no project is active", async () => {
+    const { wrapper } = mountTree("unity", (fake) => {
+      fake.results.set("tree.refresh", { ok: false, error: "no-active-project" });
+    });
+    await flushPromises();
+    expect(wrapper.find(".tree-empty").text()).toContain("尚未导入工程");
   });
 });

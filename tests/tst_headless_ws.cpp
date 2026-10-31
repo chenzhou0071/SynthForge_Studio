@@ -879,6 +879,89 @@ private slots:
         QCOMPARE(fbxInfo.value(QStringLiteral("blendPath")).toString(), QString());
     }
 
+    // Unity 区：激活工程后 tree.refresh / file.read / fs.operate 以 <project>/Assets 为根，
+    // 越界路径必须被拒（不依赖 watcher，Task 2 的树/文件链路）
+    void unityProjectFileTreeAndOps()
+    {
+        QTemporaryDir dir;
+        const QString project = dir.filePath(QStringLiteral("MyGame"));
+        QVERIFY(QDir().mkpath(project + QStringLiteral("/Assets/Scripts")));
+        QVERIFY(QDir().mkpath(project + QStringLiteral("/ProjectSettings")));
+        QFile cs(project + QStringLiteral("/Assets/Scripts/Player.cs"));
+        QVERIFY(cs.open(QIODevice::WriteOnly));
+        cs.write("class Player { }");
+        cs.close();
+
+        CoreApp app({dir.path(), true});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        // 未激活工程：tree.refresh 报 no-active-project
+        const QJsonObject before = client.request(QStringLiteral("tree.refresh"),
+                                                  {{"area", "unity"}})
+                                       .value(QStringLiteral("result"))
+                                       .toObject();
+        QCOMPARE(before.value(QStringLiteral("error")).toString(),
+                 QStringLiteral("no-active-project"));
+
+        // 激活工程
+        const QJsonObject selected = client.request(QStringLiteral("project.select"),
+                                                    {{"path", project}})
+                                         .value(QStringLiteral("result"))
+                                         .toObject();
+        QCOMPARE(selected.value(QStringLiteral("accepted")).toBool(), true);
+
+        // 整树：根节点 Assets，含 Scripts 子目录
+        const QJsonObject tree = client.request(QStringLiteral("tree.refresh"),
+                                                {{"area", "unity"}})
+                                     .value(QStringLiteral("result"))
+                                     .toObject();
+        QCOMPARE(tree.value(QStringLiteral("ok")).toBool(), true);
+        const QJsonObject root = tree.value(QStringLiteral("tree")).toObject();
+        QCOMPARE(root.value(QStringLiteral("name")).toString(), QStringLiteral("Assets"));
+        QVERIFY(QJsonDocument(root).toJson().contains("Scripts"));
+
+        // 读代码：kind text + 内容 + csharp 语言
+        const QJsonObject read = client.request(QStringLiteral("file.read"),
+                                                {{"area", "unity"},
+                                                 {"path", "Scripts/Player.cs"}})
+                                     .value(QStringLiteral("result"))
+                                     .toObject();
+        QCOMPARE(read.value(QStringLiteral("ok")).toBool(), true);
+        QCOMPARE(read.value(QStringLiteral("kind")).toString(), QStringLiteral("text"));
+        QCOMPARE(read.value(QStringLiteral("content")).toString(),
+                 QStringLiteral("class Player { }"));
+        QCOMPARE(read.value(QStringLiteral("language")).toString(), QStringLiteral("csharp"));
+
+        // 越界读取被拒
+        const QJsonObject escape = client.request(QStringLiteral("file.read"),
+                                                  {{"area", "unity"},
+                                                   {"path", "../../secret.txt"}})
+                                       .value(QStringLiteral("result"))
+                                       .toObject();
+        QCOMPARE(escape.value(QStringLiteral("error")).toString(),
+                 QStringLiteral("invalid-path"));
+
+        // mkdir 正常：Assets 下建目录
+        const QJsonObject mkdir = client.request(QStringLiteral("fs.operate"),
+                                                 {{"area", "unity"}, {"op", "mkdir"},
+                                                  {"path", ""}, {"name", "NewFolder"}})
+                                      .value(QStringLiteral("result"))
+                                      .toObject();
+        QCOMPARE(mkdir.value(QStringLiteral("ok")).toBool(), true);
+        QVERIFY(QDir(project + QStringLiteral("/Assets")).exists(QStringLiteral("NewFolder")));
+
+        // 越界 mkdir 被拒（name 含路径分隔符）
+        const QJsonObject badMkdir = client.request(QStringLiteral("fs.operate"),
+                                                    {{"area", "unity"}, {"op", "mkdir"},
+                                                     {"path", ""}, {"name", "../evil"}})
+                                         .value(QStringLiteral("result"))
+                                         .toObject();
+        QCOMPARE(badMkdir.value(QStringLiteral("error")).toString(),
+                 QStringLiteral("invalid-path"));
+    }
+
     void fileReadRejectsBadPaths()
     {
         QTemporaryDir dir;
@@ -909,7 +992,15 @@ private slots:
                                                  {{"area", "unity"}, {"path", "a.glb"}})
                                       .value(QStringLiteral("result"))
                                       .toObject();
+        // unity 区已由 P6 接管：未激活工程时是 no-active-project，不再是不支持
         QCOMPARE(unity.value(QStringLiteral("error")).toString(),
+                 QStringLiteral("no-active-project"));
+
+        const QJsonObject unknown = client.request(QStringLiteral("file.read"),
+                                                   {{"area", "photoshop"}, {"path", "a.psd"}})
+                                        .value(QStringLiteral("result"))
+                                        .toObject();
+        QCOMPARE(unknown.value(QStringLiteral("error")).toString(),
                  QStringLiteral("area-not-supported"));
     }
 

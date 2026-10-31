@@ -21,6 +21,7 @@
 #include "core/store/SessionStore.h"
 #include "core/tasks/TaskManager.h"
 #include "core/unity/ProjectService.h"
+#include "core/unity/DirectoryWatcher.h"
 #include "core/ws/ProtocolRouter.h"
 #include "core/ws/WsServer.h"
 
@@ -32,6 +33,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QProcess>
 #include <QStandardPaths>
 #include <QUrl>
 
@@ -39,6 +41,97 @@
 #include <memory>
 #include <stdexcept>
 #include <utility>
+
+namespace {
+
+// Unity 工程树节点：以 <project>/Assets 为根递归构建，忽略 *.meta 边车文件
+QJsonObject unityTreeNode(const QDir& assets, const QString& relative)
+{
+    QJsonArray children;
+    const QFileInfoList entries =
+        QDir(assets.filePath(relative))
+            .entryInfoList(QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QFileInfo& entry : entries) {
+        if (entry.fileName().endsWith(QLatin1String(".meta")))
+            continue;
+        const QString child = relative.isEmpty()
+                                  ? entry.fileName()
+                                  : relative + QLatin1Char('/') + entry.fileName();
+        if (entry.isDir())
+            children.append(unityTreeNode(assets, child));
+        else
+            children.append(QJsonObject{{QStringLiteral("name"), entry.fileName()},
+                                        {QStringLiteral("path"), child},
+                                        {QStringLiteral("type"), QStringLiteral("file")}});
+    }
+    return QJsonObject{{QStringLiteral("name"),
+                        relative.isEmpty() ? QStringLiteral("Assets")
+                                           : QFileInfo(relative).fileName()},
+                       {QStringLiteral("path"), relative},
+                       {QStringLiteral("type"), QStringLiteral("dir")},
+                       {QStringLiteral("children"), children}};
+}
+
+// 在给定根下执行文件操作，路径越界一律 invalid-path；返回空串表示成功
+QString operateUnderRoot(const QString& root, const QString& op, const QString& relative,
+                         const QString& name, QString* changedDir)
+{
+    const QDir base(root);
+    const QFileInfo info(base.filePath(relative));
+    *changedDir = relative.isEmpty() ? QStringLiteral(".") : QFileInfo(relative).path();
+    auto inside = [&root](const QString& abs) {
+        const QString canonicalRoot = QFileInfo(root).canonicalFilePath();
+        QString candidate = QFileInfo(abs).canonicalFilePath();
+        if (candidate.isEmpty()) // 目标尚不存在：用父目录 canonical + 文件名判断
+            candidate = QDir::cleanPath(QFileInfo(abs).absoluteDir().canonicalPath()
+                                        + QLatin1Char('/') + QFileInfo(abs).fileName());
+        return !candidate.isEmpty()
+            && (candidate == canonicalRoot
+                || candidate.startsWith(canonicalRoot + QLatin1Char('/')));
+    };
+
+    if (op == QLatin1String("mkdir")) {
+        if (name.isEmpty() || name.contains(QLatin1Char('/')) || name.contains(QLatin1Char('\\'))
+            || name == QLatin1String(".") || name == QLatin1String(".."))
+            return QStringLiteral("invalid-path");
+        const QString target =
+            base.filePath(relative.isEmpty() ? name : relative + QLatin1Char('/') + name);
+        if (!inside(target))
+            return QStringLiteral("invalid-path");
+        if (QFileInfo::exists(target))
+            return QStringLiteral("already-exists");
+        return QDir().mkpath(target) ? QString() : QStringLiteral("io-error");
+    }
+    if (!info.exists())
+        return QStringLiteral("not-found");
+    if (!inside(info.absoluteFilePath()))
+        return QStringLiteral("invalid-path");
+    if (op == QLatin1String("rename")) {
+        if (name.isEmpty() || name.contains(QLatin1Char('/')) || name.contains(QLatin1Char('\\')))
+            return QStringLiteral("invalid-path");
+        const QString target = info.dir().filePath(name);
+        if (QFileInfo::exists(target))
+            return QStringLiteral("already-exists");
+        return QDir().rename(info.absoluteFilePath(), target) ? QString()
+                                                              : QStringLiteral("io-error");
+    }
+    if (op == QLatin1String("delete")) {
+        const bool ok = info.isDir() ? QDir(info.absoluteFilePath()).removeRecursively()
+                                     : QFile::remove(info.absoluteFilePath());
+        return ok ? QString() : QStringLiteral("io-error");
+    }
+    if (op == QLatin1String("reveal")) {
+        QProcess::startDetached(QStringLiteral("explorer.exe"),
+                                {QStringLiteral("/select,"),
+                                 QDir::toNativeSeparators(info.absoluteFilePath())});
+        return QString();
+    }
+    if (op == QLatin1String("refresh"))
+        return QString();
+    return QStringLiteral("unknown-op");
+}
+
+} // namespace
 
 CoreApp::CoreApp(const CoreOptions& options, QObject* parent)
     : QObject(parent)
@@ -939,10 +1032,49 @@ bool CoreApp::start()
     m_router->registerHandler(
         QStringLiteral("file.read"), [this](const QJsonObject& params) {
             const QString area = params.value("area").toString(QStringLiteral("blender"));
-            if (area != QLatin1String("blender")) // unity 工程内文件由 P6 接管
+            const QString path = params.value("path").toString();
+            if (area == QLatin1String("unity")) {           // unity 工程内文件：以 <project>/Assets 为根
+                if (m_projects->activePath().isEmpty())
+                    return QJsonValue(QJsonObject{{"ok", false}, {"error", "no-active-project"}});
+                if (!m_projects->isInsideAssets(m_projects->absoluteFor(path)))
+                    return QJsonValue(QJsonObject{{"ok", false}, {"error", "invalid-path"}});
+                const QString uabs = m_projects->absoluteFor(path);
+                const QFileInfo uinfo(uabs);
+                if (!uinfo.exists() || uinfo.isDir())
+                    return QJsonValue(QJsonObject{{"ok", false}, {"error", "not-found"}});
+                const QString usuffix = uinfo.suffix().toLower();
+                if (QStringList{QStringLiteral("png"), QStringLiteral("jpg"),
+                                QStringLiteral("jpeg"), QStringLiteral("webp")}.contains(usuffix)) {
+                    QFile file(uabs);
+                    if (!file.open(QIODevice::ReadOnly))
+                        return QJsonValue(QJsonObject{{"ok", false}, {"error", "io-error"}});
+                    QString mime = QStringLiteral("image/jpeg");
+                    if (usuffix == QLatin1String("png"))
+                        mime = QStringLiteral("image/png");
+                    else if (usuffix == QLatin1String("webp"))
+                        mime = QStringLiteral("image/webp");
+                    return QJsonValue(QJsonObject{{"ok", true}, {"kind", "image"},
+                                                  {"dataUrl",
+                                                   QStringLiteral("data:%1;base64,").arg(mime)
+                                                       + QString::fromLatin1(file.readAll().toBase64())}});
+                }
+                QFile file(uabs);
+                if (!file.open(QIODevice::ReadOnly))
+                    return QJsonValue(QJsonObject{{"ok", false}, {"error", "io-error"}});
+                if (file.size() > 2 * 1024 * 1024)
+                    return QJsonValue(QJsonObject{{"ok", false}, {"error", "too-large"}});
+                const QString language = usuffix == QLatin1String("cs") ? QStringLiteral("csharp")
+                                         : usuffix == QLatin1String("json") ? QStringLiteral("json")
+                                         : usuffix == QLatin1String("lua") ? QStringLiteral("lua")
+                                         : usuffix == QLatin1String("ts") ? QStringLiteral("typescript")
+                                                                          : QString();
+                return QJsonValue(QJsonObject{{"ok", true}, {"kind", "text"},
+                                              {"content", QString::fromUtf8(file.readAll())},
+                                              {"language", language}});
+            }
+            if (area != QLatin1String("blender")) // 其余区未接管
                 return QJsonValue(
                     QJsonObject{{"ok", false}, {"error", "area-not-supported"}});
-            const QString path = params.value("path").toString();
             if (!m_library->isValidTarget(path))
                 return QJsonValue(QJsonObject{{"ok", false}, {"error", "invalid-path"}});
             const QString abs = m_library->absoluteFor(path);
@@ -1019,7 +1151,30 @@ bool CoreApp::start()
                               [this](const QJsonObject& params) {
                                   const QString area =
                                       params.value("area").toString(QStringLiteral("blender"));
-                                  if (area != QLatin1String("blender")) // unity 区由 P6 接管
+                                  if (area == QLatin1String("unity")) {   // unity 区：以 <project>/Assets 为根
+                                      if (m_projects->activePath().isEmpty())
+                                          return QJsonValue(QJsonObject{
+                                              {"ok", false}, {"error", "no-active-project"}});
+                                      const QString uop = params.value("op").toString();
+                                      QString changedDir;
+                                      const QString uerr = operateUnderRoot(
+                                          m_projects->assetsPath(), uop,
+                                          params.value("path").toString(),
+                                          params.value("name").toString(), &changedDir);
+                                      if (!uerr.isEmpty())
+                                          return QJsonValue(
+                                              QJsonObject{{"ok", false}, {"error", uerr}});
+                                      if (uop != QLatin1String("reveal")) // 打开资源管理器不改树
+                                          m_ws->broadcastEvent(
+                                              QStringLiteral("fileTree.changed"),
+                                              QJsonObject{{"area", "unity"},
+                                                         {"reason", uop == QLatin1String("refresh")
+                                                                        ? QStringLiteral("full")
+                                                                        : QStringLiteral("incremental")},
+                                                         {"paths", QJsonArray{changedDir}}});
+                                      return QJsonValue(QJsonObject{{"ok", true}});
+                                  }
+                                  if (area != QLatin1String("blender")) // 其余区未接管
                                       return QJsonValue(QJsonObject{
                                           {"ok", false}, {"error", "area-not-supported"}});
                                   const QString op = params.value("op").toString();
@@ -1134,6 +1289,13 @@ bool CoreApp::start()
 
     // Unity 区：唯一激活工程状态机（Task 1 用占位桥接钩子，Task 3 换成真实 m_unity 的 stop/start/isReady）
     m_projects = new ProjectService(this);
+    m_watcher = new DirectoryWatcher(this);
+    connect(m_watcher, &DirectoryWatcher::treeChanged, this,
+            [this](const QString& reason, const QStringList& dirs) {
+                m_ws->broadcastEvent(QStringLiteral("fileTree.changed"),
+                                     QJsonObject{{"area", "unity"}, {"reason", reason},
+                                                 {"paths", QJsonArray::fromStringList(dirs)}});
+            });
     m_projects->setBridgeHooks(
         [] {}, [] {},                                       // stopBridge / startBridge → Task 3
         [this](const QString&) { m_tasks->cancelArea(QStringLiteral("unity")); });
@@ -1143,12 +1305,15 @@ bool CoreApp::start()
 
     connect(m_projects, &ProjectService::stateChanged, this, [this](const ProjectInfo& info) {
         if (info.state == QLatin1String("active")) {        // 记住上次工程（规格 6.1）
+            m_watcher->watch(m_projects->assetsPath());     // 激活后开始监控 <project>/Assets
             QJsonObject root = m_settings->data();
             QJsonObject unity = root.value(QStringLiteral("unity")).toObject();
             unity.insert(QStringLiteral("lastProject"), info.path);
             root.insert(QStringLiteral("unity"), unity);
             m_settings->setData(root);
             m_settings->save();
+        } else if (info.state == QLatin1String("deactivating")) {
+            m_watcher->stop();                            // 旧工程：pending 全丢、监控移除
         }
         m_ws->broadcastEvent(QStringLiteral("project.state"),
                              QJsonObject{{"path", info.path}, {"name", info.name},
@@ -1225,6 +1390,24 @@ bool CoreApp::start()
                                              {"cancelled", clean.isEmpty()}});
         });
         return QJsonValue(QJsonObject{{"accepted", true}});
+    });
+
+    // tree.refresh：unity 区唯一树数据源，以 <project>/Assets 为根；无 path 回整树、有 path 回子树
+    m_router->registerHandler(QStringLiteral("tree.refresh"), [this](const QJsonObject& params) {
+        if (params.value(QStringLiteral("area")).toString() != QLatin1String("unity"))
+            return QJsonValue(QJsonObject{{"ok", false}, {"error", "area-not-supported"}});
+        if (m_projects->activePath().isEmpty())
+            return QJsonValue(QJsonObject{{"ok", false}, {"error", "no-active-project"}});
+        const QString relative = params.value(QStringLiteral("path")).toString();
+        if (!m_projects->isInsideAssets(m_projects->absoluteFor(relative)))
+            return QJsonValue(QJsonObject{{"ok", false}, {"error", "invalid-path"}});
+        const QDir assets(m_projects->assetsPath());
+        if (!assets.exists())
+            return QJsonValue(QJsonObject{{"ok", false}, {"error", "not-found"}});
+        const QJsonObject node = unityTreeNode(assets, relative);
+        return QJsonValue(params.contains(QStringLiteral("path"))
+                              ? QJsonObject{{"ok", true}, {"node", node}}
+                              : QJsonObject{{"ok", true}, {"tree", node}});
     });
 
     if (!m_ws->listen())
