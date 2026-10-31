@@ -63,7 +63,7 @@ tests/tst_asset_importer.cpp
 - `CoreApp::setFolderPicker(std::function<void(const QString& startDir, std::function<void(const QString&)> done)>)` — 由 GUI 入口注入（`QFileDialog`）；core 不依赖 QtWidgets。未注入（headless/单测）→ `dialog-unavailable`；单测注入 fake 直接回调临时目录。
 - Consumes: `TaskManager::runningCount(area)`（P2 Task 3 追加，含运行中 + 排队数）、`SettingsStore`（P2 Task 1）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```cpp
 #include <QDir>
@@ -168,7 +168,7 @@ QTEST_MAIN(ProjectServiceTest)
 #include "tst_project_service.moc"
 ```
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
 
 ```cpp
 ProjectService::ProjectService(QObject* parent) : QObject(parent)
@@ -322,7 +322,7 @@ m_router->registerHandler("project.switchConfirm", [this](const QJsonObject& par
 });
 ```
 
-- [ ] **Step 3: 写失败的 `tst_folder_pick`（4 用例）**
+- [x] **Step 3: 写失败的 `tst_folder_pick`（4 用例）**
 
 ```cpp
 #include <QDir>
@@ -487,7 +487,7 @@ QTEST_MAIN(FolderPickTest)
 Run: `cmake --build build --config Debug --target tst_folder_pick`
 Expected: 编译失败（`CoreApp::setFolderPicker` 尚未定义）。
 
-- [ ] **Step 4: 实现 `dialog.pickFolder` + GUI 注入**
+- [x] **Step 4: 实现 `dialog.pickFolder` + GUI 注入**
 
 `CoreApp.h`：
 
@@ -570,7 +570,7 @@ core.setFolderPicker([&window](const QString& startDir,
 Run: `cmake --build build --config Debug --target tst_folder_pick; ctest --test-dir build -C Debug -R tst_folder_pick --output-on-failure`
 Expected: 4 用例 Passed。
 
-- [ ] **Step 5: 前端导入改为原生选择**
+- [x] **Step 5: 前端导入改为原生选择**
 
 前端 TopBar「导入」→ `dialog.pickFolder`（系统文件夹选择框）→ `project.select`；返回 `reason:"switch-confirm"` 时弹确认框（文案「当前工程有 N 个任务运行中，切换将终止这些任务」），确认后发 `project.switchConfirm {path}`。`project.state` 的 `waiting:true` 显示为「等待 Unity 启动（第 N 次尝试）」。
 
@@ -644,7 +644,7 @@ client.on("project.state", (d: any) => { projectState.value = d; });
 
 模板：`<TopBar ... :importing="picking" @import-project="importProject" />`（`picking` 时禁用导入按钮；错误文本绑定 `importError`，显示在 TopBar 下方）；`<div v-if="projectState?.state === 'activating'" class="project-banner">等待 Unity 启动（第 {{ projectState.attempt ?? 1 }} 次尝试）…</div>`，`active` 时同一位置显示工程名。
 
-- [ ] **Step 6: CMake + 测试**（`tst_project_service` 4 用例 + `tst_folder_pick` 4 用例）→ **Commit**（`feat: Unity 工程校验、原生目录选择与激活互斥切换`）
+- [x] **Step 6: CMake + 测试**（`tst_project_service` 4 用例 + `tst_folder_pick` 4 用例）→ **Commit**（`feat: Unity 工程校验、原生目录选择与激活互斥切换`）
 
 ```cmake
 add_executable(tst_folder_pick tests/tst_folder_pick.cpp)
@@ -669,7 +669,7 @@ add_test(NAME tst_folder_pick COMMAND tst_folder_pick)
 - `file.read {area:"unity", path}`：路径基准 `<project>/Assets`，kind/语言/dataUrl 映射与 P4 Task 5 完全一致。
 - watcher 事件转发：`fileTree.changed {area:"unity", reason, paths}`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```cpp
 #include <QTemporaryDir>
@@ -727,7 +727,7 @@ QTEST_MAIN(WatcherTest)
 #include "tst_watcher.moc"
 ```
 
-- [ ] **Step 2: 实现 watcher**
+- [x] **Step 2: 实现 watcher**
 
 ```cpp
 void DirectoryWatcher::watch(const QString& root)
@@ -808,7 +808,7 @@ void DirectoryWatcher::flush()
 
 > 构造函数中 `m_debounce.setSingleShot(true)` 并连接 `timeout` → `flush`；`watch()` 只负责 stop + 注册。`m_pending` 为 `QSet<QString>`；`registerRecursive` 跳过 `isIgnored` 目录。
 
-- [ ] **Step 3: CoreApp 接线（watcher / tree.refresh / fs.operate / file.read）**
+- [x] **Step 3: CoreApp 接线（watcher / tree.refresh / fs.operate / file.read）**
 
 watcher 事件转发：
 
@@ -974,7 +974,7 @@ const QString abs = QDir(root).filePath(path);
 // 其余 kind/大小上限/语言映射/dataUrl 逻辑与 P4 Task 5 完全一致
 ```
 
-- [ ] **Step 4: FileTree.vue 的 unity 分支（局部刷新）**
+- [x] **Step 4: FileTree.vue 的 unity 分支（局部刷新）**
 
 保持 P4 的 blender（`assets.list`）分支不变，按 `area` 分流追加：
 
@@ -1020,7 +1020,7 @@ props.client.on("fileTree.changed", onUnityTreeChanged);
 watch(() => props.area, () => { if (props.area === "unity") refreshTree(); });
 ```
 
-- [ ] **Step 5: CMake + 测试 + 手工验收**
+- [x] **Step 5: CMake + 测试 + 手工验收**
 
 `tst_watcher` 3 用例；手工验收：
 
@@ -1029,7 +1029,7 @@ watch(() => props.area, () => { if (props.area === "unity") refreshTree(); });
 3. 让 agent 通过 MCP 写脚本 → 抑制窗口内 watcher 零事件，文件树仅由 `tool.step`/定向刷新驱动。
 4. 切换工程后旧工程再发生文件变更 → 无任何事件（pending 已丢弃、监控已移除）。
 
-- [ ] **Step 6: Commit**（`feat: 工程目录监控与文件树双源同步（防抖/限流/抑制窗口）`）
+- [x] **Step 6: Commit**（`feat: 工程目录监控与文件树双源同步（防抖/限流/抑制窗口）`）
 
 ---
 
@@ -1048,7 +1048,7 @@ watch(() => props.area, () => { if (props.area === "unity") refreshTree(); });
 - 系统提示词追加 Unity 规则段：脚本修改后必须 `read_console` 确认无编译错误；阶段收尾回传 Game 截图（`manage_editor` 截图动作）。
 - 启动恢复：若 `settings.json` 的 `unity.lastProject` 仍合法 → `m_projects->select(lastProject)`（走等待 Unity 流程，不弹确认）。
 
-- [ ] **Step 1: 实现工具白名单过滤**
+- [x] **Step 1: 实现工具白名单过滤**
 
 ```cpp
 QJsonArray filterUnityTools(const QJsonArray& all)
@@ -1069,7 +1069,7 @@ QJsonArray filterUnityTools(const QJsonArray& all)
 }
 ```
 
-- [ ] **Step 2: CoreApp 运行时与 orchestrator 接线**
+- [x] **Step 2: CoreApp 运行时与 orchestrator 接线**
 
 `CoreApp::broadcastConnStatus` 由 P4 Task 1 提供（已含 `m_everReady`/`m_crashNotified` 维护与 `bridge-crashed` 出卡逻辑），两个运行时直接连接同一成员函数，本任务不重复定义。
 
@@ -1202,7 +1202,7 @@ if (!lastProject.isEmpty() && m_projects->validate(lastProject))
     m_projects->select(lastProject);
 ```
 
-- [ ] **Step 3: `handleChatSend` 的 unity 分支**
+- [x] **Step 3: `handleChatSend` 的 unity 分支**
 
 插到 P4 `handleChatSend` 的 `mode` 分支之前（用户消息落库与广播复用 `appendUser` 语义）：
 
@@ -1247,7 +1247,7 @@ if (area == QLatin1String("unity")) {
 
 > Task 4 会把 enqueue 内的 `execute` 换成 `m_importer->prepare(...)` 链（先转换附件再执行）；本任务不处理 `attachments`。
 
-- [ ] **Step 4: 手工验收**
+- [x] **Step 4: 手工验收**
 
 1. 导入含 MCP for Unity 包的工程 → 顶部灯绿 → 发送「创建一个红色立方体并保存场景」→ 步骤卡显示工具调用 → 对话区出现 Game 截图 → 场景中出现物体。
 2. 故意让其写一个编译错误脚本 → agent 自动 `read_console` 回读并修复（观察步骤卡循环）。
@@ -1255,7 +1255,7 @@ if (area == QLatin1String("unity")) {
 4. 关掉 Unity 编辑器再切换到工程 B → `project.state` 显示 waiting 与尝试次数 → 打开工程后自动变为 active。
 5. 重启应用 → 自动恢复到上次工程（若编辑器未开则进入 waiting）。
 
-- [ ] **Step 5: Commit**（`feat: Unity 区 agent 任务（运行时/工具白名单/截图/Console 回读）`）
+- [x] **Step 5: Commit**（`feat: Unity 区 agent 任务（运行时/工具白名单/截图/Console 回读）`）
 
 ---
 
@@ -1275,7 +1275,7 @@ if (area == QLatin1String("unity")) {
 - 前端：unity 输入区 [添加资产] → `AssetPicker`（复用 P4 `assets.list`，按 `kind` 取 `glb`/`fbx`，多选）→ 输入框上方 chip；随消息发送后清空。
 - 转换需要 Blender 链就绪；未就绪 → `error.card {reason:"blender-not-ready"}`（规格 6.4 的「请先启动 Blender + 重试」由 P7 错误卡渲染，用户重发即重试）。
 
-- [ ] **Step 1: 写失败测试（纯逻辑部分）**
+- [x] **Step 1: 写失败测试（纯逻辑部分）**
 
 ```cpp
 #include <QTemporaryDir>
@@ -1392,7 +1392,7 @@ QTEST_MAIN(AssetImporterTest)
 #include "tst_asset_importer.moc"
 ```
 
-- [ ] **Step 2: 实现 AssetImporter**
+- [x] **Step 2: 实现 AssetImporter**
 
 ```cpp
 class BlenderGate;
@@ -1566,7 +1566,7 @@ void AssetImporter::importToUnity(const QString& fbx, const QJsonObject& options
 
 > `prepare` 使用成员状态串行推进（unity 区任务队列本身串行），避免 `std::function` 自捕获悬垂；转换脚本对路径中的单引号需转义（Windows 常规路径不包含）。`.cpp` 需 `#include "core/mcp/BlenderGate.h"`；门禁在 `finishPrepare` 统一释放，覆盖成功、`blender-busy`、`blender-not-ready`、`blender-convert-failed` 全部出口。
 
-- [ ] **Step 3: CoreApp 接 attachments + asset.import**
+- [x] **Step 3: CoreApp 接 attachments + asset.import**
 
 创建 importer 并注入门禁（`CoreApp.h` 增加 `AssetImporter* m_importer = nullptr;`，并 `#include "core/unity/AssetImporter.h"`）：
 
@@ -1660,7 +1660,7 @@ m_router->registerHandler("asset.import", [this](const QJsonObject& params) {
 });
 ```
 
-- [ ] **Step 4: 前端 AssetPicker + ChatPanel chip**
+- [x] **Step 4: 前端 AssetPicker + ChatPanel chip**
 
 `AssetPicker.vue`：
 
@@ -1760,7 +1760,7 @@ async function send() {
              @close="pickerOpen = false" @confirm="onAssetsPicked" />
 ```
 
-- [ ] **Step 5: 手工验收**
+- [x] **Step 5: 手工验收**
 
 1. blender 区生成 GLB（无 fbx）→ unity 区 [添加资产] 选中 → chip 出现 → 发送「放在 (1,0,2) 并命名为 Sword」→ 自动转换（Blender 需开启）→ Unity 工程内出现模型与实例 → 对话区回传结果与 Game 截图 → chip 已清空。
 2. 已有 `.fbx` 配对文件时不触发 Blender 转换（观察 Blender 无操作事件）。
@@ -1772,19 +1772,21 @@ async function send() {
 8. Unity 区大 GLB 转换进行中，在 blender 区确认计划或发送修改指令 → `blender-busy`；计划卡保留，转换结束后再点 [开始生成] 成功。
 9. 纯 `.fbx` 或已有配对 `.fbx` 的附件在 Blender 任务运行中发送 → 不触发转换，正常导入（不占用门禁）。
 
-- [ ] **Step 6: Commit**（`feat: 跨区添加资产（附件 chip / glb→fbx 转换 / unity 导入实例化）`）
+- [x] **Step 6: Commit**（`feat: 跨区添加资产（附件 chip / glb→fbx 转换 / unity 导入实例化）`）
 
 ---
 
 ## P6 完成标准
 
-- [ ] 互斥切换事件顺序严格为 deactivating → activating → active；有运行任务时先确认、无任务直接切换；旧任务全部取消并标记「已中断：切换工程」
-- [ ] 等待 Unity：未就绪时 `project.state` 带 waiting/attempt 自动重试，60s 后 `unity-not-ready`；重启应用自动恢复上次工程（`unity.lastProject`）
-- [ ] watcher：防抖合并、忽略规则、抑制窗口三测全绿；>200 条变更降级全量刷新；切换工程后旧工程事件全部丢弃
-- [ ] `tree.refresh` 可全量/单目录拉取；`fs.operate` 与 `file.read` 的 unity 分支以 `<project>/Assets` 为根且越界拒绝；文件树局部刷新
-- [ ] Unity agent 真实跑通创建物体 + 截图回传 + 编译错误 Console 回读自修；前置未满足时零 LLM 调用
-- [ ] 添加资产：chip 多选 → 发送后清空；配对直接导入 / 无配对转换 / 转换后再次添加三条路径均验证；Blender 未就绪正确报错
-- [ ] 转换期间持有 `BlenderGate`（owner=`unity-convert`），成功 / 失败均释放；Blender 任务运行中转换返回 `blender-busy`，反向（转换中发 Blender 任务）亦然；纯 FBX / 已有配对路径不占门禁
-- [ ] 导入走系统文件夹选择框：`dialog.pickFolder` → `dialog.result` → `project.select`；取消静默、busy 时不可重复弹框；headless 返回 `dialog-unavailable`
-- [ ] 方法/事件族仅新增 `dialog.pickFolder` / `dialog.result` 一对；切换确认仍走 `project.select` 返回值，导入结果仍用 `chat.message` + `fileTree.changed`
-- [ ] `tst_project_service`、`tst_folder_pick`、`tst_watcher`、`tst_asset_importer` 全绿（后者含门禁忙拒绝与失败释放两用例）
+- [x] 互斥切换事件顺序严格为 deactivating → activating → active；有运行任务时先确认、无任务直接切换；旧任务全部取消并标记「已中断：切换工程」
+- [x] 等待 Unity：未就绪时 `project.state` 带 waiting/attempt 自动重试，60s 后 `unity-not-ready`；重启应用自动恢复上次工程（`unity.lastProject`）
+- [x] watcher：防抖合并、忽略规则、抑制窗口三测全绿；>200 条变更降级全量刷新；切换工程后旧工程事件全部丢弃
+- [x] `tree.refresh` 可全量/单目录拉取；`fs.operate` 与 `file.read` 的 unity 分支以 `<project>/Assets` 为根且越界拒绝；文件树局部刷新
+- [x] Unity agent 真实跑通创建物体 + 截图回传 + 编译错误 Console 回读自修；前置未满足时零 LLM 调用
+- [x] 添加资产：chip 多选 → 发送后清空；配对直接导入 / 无配对转换 / 转换后再次添加三条路径均验证；Blender 未就绪正确报错
+- [x] 转换期间持有 `BlenderGate`（owner=`unity-convert`），成功 / 失败均释放；Blender 任务运行中转换返回 `blender-busy`，反向（转换中发 Blender 任务）亦然；纯 FBX / 已有配对路径不占门禁
+- [x] 导入走系统文件夹选择框：`dialog.pickFolder` → `dialog.result` → `project.select`；取消静默、busy 时不可重复弹框；headless 返回 `dialog-unavailable`
+- [x] 方法/事件族仅新增 `dialog.pickFolder` / `dialog.result` 一对；切换确认仍走 `project.select` 返回值，导入结果仍用 `chat.message` + `fileTree.changed`
+- [x] `tst_project_service`、`tst_folder_pick`、`tst_watcher`、`tst_asset_importer` 全绿（后者含门禁忙拒绝与失败释放两用例）
+
+> 验收记录（2026-10-31）：自动化 ctest 34/34、vitest 177/177 全绿；Task 2/3/4 手工验收清单由用户在实机环境逐条跑通。期间实机暴露并修复了 fbx 转换回执误报与建造轮空转两个问题（`65c5480`）。
