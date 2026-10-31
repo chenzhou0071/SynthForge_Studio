@@ -33,7 +33,11 @@ function toggle(path: string) {
 <template>
   <div class="modal-mask" @click.self="emit('close')">
     <div class="modal">
-      <header>添加资产（可多选）</header>
+      <header>
+        <span>添加资产（可多选）</span>
+        <!-- 列表长了会滚走：头部随时告诉用户选了几项 -->
+        <span v-if="selected.length" class="picked-count">已选 {{ selected.length }} 项</span>
+      </header>
       <p v-if="loadError" class="picker-error">{{ loadError }}</p>
       <p v-else-if="!assets.length" class="picker-empty">模型库里暂无可导入的 glb/fbx</p>
       <ul>
@@ -69,15 +73,25 @@ function toggle(path: string) {
   max-height: 70vh;
   display: flex;
   flex-direction: column;
+  overflow: hidden; /* 圆角内裁剪，防止列表把弹窗撑破 */
   background: var(--panel-alt);
   border: 1px solid var(--border);
   border-radius: 6px;
 }
 
 header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
   padding: 10px 14px;
   border-bottom: 1px solid var(--border);
   font-size: 13px;
+}
+
+.picked-count {
+  color: var(--accent);
+  font-size: 12px;
 }
 
 ul {
@@ -86,6 +100,27 @@ ul {
   list-style: none;
   overflow: auto;
   flex: 1;
+  /* flex 子项默认 min-height:auto 会拒绝收缩，内容多了滚动就失效、把弹窗撑破 */
+  min-height: 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+ul::-webkit-scrollbar {
+  width: 8px;
+}
+
+ul::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+ul::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
+
+ul::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 li {

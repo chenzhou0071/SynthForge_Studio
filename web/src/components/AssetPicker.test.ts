@@ -41,6 +41,21 @@ describe("AssetPicker", () => {
     expect(wrapper.emitted("confirm")?.[0]).toEqual([["a.glb", "b.fbx"]]);
   });
 
+  // 列表长了会滚走，头部得随时能看见选了几项
+  it("shows how many assets are selected", async () => {
+    const { wrapper } = mountPicker([
+      { relativePath: "a.glb", name: "a", kind: "glb" },
+      { relativePath: "b.fbx", name: "b", kind: "fbx" },
+    ]);
+    await flushPromises();
+    expect(wrapper.find(".picked-count").exists()).toBe(false);
+
+    const items = wrapper.findAll("li");
+    await items[0].trigger("click");
+    await items[1].trigger("click");
+    expect(wrapper.find(".picked-count").text()).toContain("已选 2 项");
+  });
+
   it("disables 添加 until something is selected", async () => {
     const { wrapper } = mountPicker([{ relativePath: "a.glb", name: "a", kind: "glb" }]);
     await flushPromises();
