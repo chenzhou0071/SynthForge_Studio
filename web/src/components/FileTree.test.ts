@@ -334,7 +334,7 @@ describe("FileTree", () => {
     expect(wrapper.find(".ctx-menu").exists()).toBe(false);
   });
 
-  it("renders the Unity project tree from tree.refresh", async () => {
+  it("renders the Unity project tree collapsed by default and expands on click", async () => {
     const { client, wrapper } = mountTree("unity", (fake) => {
       fake.results.set("tree.refresh", {
         ok: true,
@@ -354,9 +354,27 @@ describe("FileTree", () => {
       });
     });
     await flushPromises();
-    expect(wrapper.text()).toContain("Scripts");
-    expect(wrapper.text()).toContain("Player.cs");
     expect(client.callsOf("assets.list")).toHaveLength(0);
+    // 默认折叠：顶层目录可见，子文件不渲染
+    expect(wrapper.text()).toContain("Scripts");
+    expect(wrapper.text()).not.toContain("Player.cs");
+    // 点开 Scripts 才出现子文件
+    await wrapper.find(".tree-dir").trigger("click");
+    expect(wrapper.text()).toContain("Player.cs");
+  });
+
+  it("reloads the Unity tree when a project becomes active", async () => {
+    const { client } = mountTree("unity", (fake) => {
+      fake.results.set("tree.refresh", {
+        ok: true,
+        tree: { name: "Assets", path: "", type: "dir", children: [] },
+      });
+    });
+    await flushPromises();
+    const before = client.callsOf("tree.refresh").length;
+    client.emit("project.state", { state: "active", path: "d:/p" });
+    await flushPromises();
+    expect(client.callsOf("tree.refresh").length).toBeGreaterThan(before);
   });
 
   it("opens the context menu for the Unity area", async () => {

@@ -60,6 +60,8 @@ function flashMessage(kind: "notice" | "error", text: string, ms = 6000) {
 const tree = ref<DirNode>({ name: "", path: "", dirs: [], files: [] });
 // 默认全展开，只记收起的目录；树刷新后已有目录的展开状态不会被重置
 const collapsed = ref(new Set<string>());
+// Unity 工程树默认折叠：记住用户手动开合过的目录，刷新时不重置它们的开合状态
+const userToggled = ref(new Set<string>());
 const unsubscribers: Array<() => void> = [];
 let fetchSeq = 0;
 
@@ -171,6 +173,22 @@ function unityToDirNode(node: TreeNode): DirNode {
   return dir;
 }
 
+function collectDirPaths(node: DirNode, acc: string[] = []): string[] {
+  for (const dir of node.dirs) {
+    acc.push(dir.path);
+    collectDirPaths(dir, acc);
+  }
+  return acc;
+}
+
+// Unity 大工程默认折叠：未手动开合过的目录一律收起，避免几百个目录一次渲染卡顿
+function applyUnityDefaultCollapse() {
+  const next = new Set<string>();
+  for (const path of collectDirPaths(tree.value))
+    if (!userToggled.value.has(path)) next.add(path);
+  collapsed.value = next;
+}
+
 async function loadTree() {
   const seq = ++fetchSeq;
   try {
@@ -189,6 +207,7 @@ async function loadTree() {
       res && res.ok && res.tree
         ? unityToDirNode(res.tree)
         : { name: "", path: "", dirs: [], files: [] };
+    if (res && res.ok && res.tree) applyUnityDefaultCollapse(); // 大工程默认折叠
   } catch (cause) {
     if (seq !== fetchSeq) return;
     message.value = { kind: "error", text: cause instanceof Error ? cause.message : String(cause) };
@@ -197,6 +216,7 @@ async function loadTree() {
 
 function toggleDir(row: Row) {
   if (row.kind !== "dir") return;
+  userToggled.value.add(row.path); // 用户手动开合过：刷新时不再强制折叠
   if (collapsed.value.has(row.path)) collapsed.value.delete(row.path);
   else collapsed.value.add(row.path);
 }
@@ -251,6 +271,16 @@ onMounted(() => {
       if ((data as { area?: string }).area === props.area) void loadTree();
     }),
   );
+  unsubscribers.push(
+    props.client.on("project.state", (data) => {
+      const d = data as { state?: string };
+      // 激活/切工程：立即刷新（消除延迟），并重置为新工程默认全折叠
+      if (props.area === "unity" && d.state === "active") {
+        userToggled.value = new Set();
+        void loadTree();
+      }
+    }),
+  );
   void loadTree();
 });
 
@@ -266,6 +296,7 @@ watch(
     closeMenu();
     message.value = null;
     collapsed.value = new Set();
+    userToggled.value = new Set();
     void loadTree();
   },
 );
