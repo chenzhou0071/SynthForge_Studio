@@ -271,6 +271,11 @@ onBeforeUnmount(() => {
           :src="props.file.dataUrl"
           :alt="props.file.path"
         />
+        <div v-else-if="props.file.kind === 'audio'" class="audio-card">
+          <h3>{{ baseName(props.file.path) }}</h3>
+          <audio controls :src="props.file.dataUrl" />
+          <p class="file-info-hint">音频预览；若文件过大（&gt; 8MB）则不内联，只显示信息卡。</p>
+        </div>
         <pre v-else-if="props.file.kind === 'text'" class="code"><code class="hljs" v-html="highlighted(props.file)" /></pre>
         <div v-else-if="props.file.kind === 'info'" class="info-card file-info">
           <h3>{{ baseName(props.file.path) }}</h3>
@@ -445,7 +450,28 @@ onBeforeUnmount(() => {
   inset: 0;
   overflow: auto;
   margin: 0;
-  padding: 12px;
+  padding: 12px 14px;
+  font-family: "Cascadia Code", ui-monospace, Consolas, "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  tab-size: 4;
+}
+
+.audio-card {
+  margin: auto;
+  padding: 20px 28px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.audio-card h3 {
+  margin: 0 0 14px;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.audio-card audio {
+  width: min(360px, 80%);
 }
 
 .info-card {

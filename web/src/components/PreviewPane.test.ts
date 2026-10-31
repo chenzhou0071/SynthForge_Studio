@@ -82,6 +82,19 @@ describe("PreviewPane", () => {
     expect(wrapper.find("img.preview-image").attributes("src")).toBe("data:image/png;base64,AAA");
   });
 
+  it("renders an audio player for wav files", () => {
+    const wrapper = mount(PreviewPane, {
+      props: {
+        area: "unity",
+        file: { path: "Audio/step.wav", kind: "audio", dataUrl: "data:audio/wav;base64,RklG" },
+      },
+    });
+
+    const player = wrapper.find("audio[controls]");
+    expect(player.exists()).toBe(true);
+    expect(player.attributes("src")).toBe("data:audio/wav;base64,RklG");
+  });
+
   it("shows the file info card for fbx and blend files", () => {
     const wrapper = mount(PreviewPane, {
       props: {

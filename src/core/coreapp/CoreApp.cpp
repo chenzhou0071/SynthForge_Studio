@@ -145,6 +145,29 @@ QString withAttachmentBlock(const QString& text, const QStringList& fbxPaths)
     return text + block;
 }
 
+bool isAudioSuffix(const QString& suffix)
+{
+    return suffix == QLatin1String("wav") || suffix == QLatin1String("ogg")
+        || suffix == QLatin1String("mp3") || suffix == QLatin1String("flac");
+}
+
+// 音频文件：≤ 8MB 内联成 data URL 供 <audio> 播放；太大或读不了回空串（调用方给信息卡）
+QString audioDataUrlIfPlayable(const QString& abs, const QString& suffix)
+{
+    static const QHash<QString, QString> mime{{QStringLiteral("wav"), QStringLiteral("audio/wav")},
+                                              {QStringLiteral("ogg"), QStringLiteral("audio/ogg")},
+                                              {QStringLiteral("mp3"), QStringLiteral("audio/mpeg")},
+                                              {QStringLiteral("flac"), QStringLiteral("audio/flac")}};
+    const QString type = mime.value(suffix);
+    if (type.isEmpty() || QFileInfo(abs).size() > 8LL * 1024 * 1024)
+        return QString();
+    QFile file(abs);
+    if (!file.open(QIODevice::ReadOnly))
+        return QString();
+    return QStringLiteral("data:%1;base64,").arg(type)
+        + QString::fromLatin1(file.readAll().toBase64());
+}
+
 } // namespace
 
 CoreApp::CoreApp(const CoreOptions& options, QObject* parent)
@@ -1125,6 +1148,15 @@ bool CoreApp::start()
                                                    QStringLiteral("data:%1;base64,").arg(mime)
                                                        + QString::fromLatin1(file.readAll().toBase64())}});
                 }
+                if (isAudioSuffix(usuffix)) {
+                    const QString audioUrl = audioDataUrlIfPlayable(uabs, usuffix);
+                    if (!audioUrl.isEmpty())
+                        return QJsonValue(QJsonObject{{"ok", true}, {"kind", "audio"},
+                                                      {"dataUrl", audioUrl}});
+                    return QJsonValue(QJsonObject{{"ok", true}, {"kind", "info"},
+                                                  {"size", static_cast<double>(uinfo.size())},
+                                                  {"modified", uinfo.lastModified().toString(Qt::ISODate)}});
+                }
                 QFile file(uabs);
                 if (!file.open(QIODevice::ReadOnly))
                     return QJsonValue(QJsonObject{{"ok", false}, {"error", "io-error"}});
@@ -1165,6 +1197,15 @@ bool CoreApp::start()
                                 {"kind", "image"},
                                 {"dataUrl", QStringLiteral("data:%1;base64,").arg(mime)
                                                 + QString::fromLatin1(file.readAll().toBase64())}});
+            }
+            if (isAudioSuffix(suffix)) {
+                const QString audioUrl = audioDataUrlIfPlayable(abs, suffix);
+                if (!audioUrl.isEmpty())
+                    return QJsonValue(QJsonObject{{"ok", true}, {"kind", "audio"},
+                                                  {"dataUrl", audioUrl}});
+                return QJsonValue(QJsonObject{{"ok", true}, {"kind", "info"},
+                                              {"size", static_cast<double>(info.size())},
+                                              {"modified", info.lastModified().toString(Qt::ISODate)}});
             }
             if (suffix == QLatin1String("glb")) {
                 // 模型三种格式都回 blendPath：修改入口据此判断有没有可编辑源文件

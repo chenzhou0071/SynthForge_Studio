@@ -879,6 +879,31 @@ private slots:
         QCOMPARE(fbxInfo.value(QStringLiteral("blendPath")).toString(), QString());
     }
 
+    // 音频文件：file.read 回 kind=audio + data:audio/wav 的 data URL，供预览区 <audio> 播放
+    void fileReadServesAudio()
+    {
+        QTemporaryDir dir;
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library + QStringLiteral("/Audio")));
+        QFile wav(library + QStringLiteral("/Audio/step.wav"));
+        QVERIFY(wav.open(QIODevice::WriteOnly));
+        wav.write("RIFFxxxxWAVEfmt ");
+        wav.close();
+
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        const QJsonObject audio = client.request(QStringLiteral("file.read"),
+                                                 {{"area", "blender"}, {"path", "Audio/step.wav"}})
+                                     .value(QStringLiteral("result")).toObject();
+        QCOMPARE(audio.value(QStringLiteral("kind")).toString(), QStringLiteral("audio"));
+        QVERIFY(audio.value(QStringLiteral("dataUrl"))
+                    .toString()
+                    .startsWith(QStringLiteral("data:audio/wav;base64,")));
+    }
+
     // Unity 区：激活工程后 tree.refresh / file.read / fs.operate 以 <project>/Assets 为根，
     // 越界路径必须被拒（不依赖 watcher，Task 2 的树/文件链路）
     void unityProjectFileTreeAndOps()
