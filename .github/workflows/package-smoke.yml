@@ -49,7 +49,9 @@ jobs:
           }
           Write-Host "选中 Qt：$qtVersion / $qtArch（可用版本尾部：$(($versions | Select-Object -Last 5) -join ' ')）"
 
-          aqt install-qt windows desktop $qtVersion $qtArch --outputdir "$env:GITHUB_WORKSPACE\Qt"
+          # Qt6 的 WebSockets 不在 qtbase 仓库里，属于独立的 qtwebsockets 模块，
+          # 必须显式带 -m：上一版我把它当“多余的可选模块”删了，于是 configure 卡在找不到 Qt6WebSockets
+          aqt install-qt windows desktop $qtVersion $qtArch -m qtwebsockets --outputdir "$env:GITHUB_WORKSPACE\Qt"
           "QT_VERSION=$qtVersion" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           # aqt 的目录名不等于 arch 参数：传 win64_msvc2022_64，落地目录叫 msvc2022_64。
@@ -121,7 +123,9 @@ jobs:
           if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { throw "runner 上没有 ninja，Ninja generator 用不了（应改回 VS generator 或装 ninja）" }
 
           cmake -S . -B build -G "Ninja Multi-Config" -DCMAKE_PREFIX_PATH="$env:QT_DIR"
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure 失败：真正的原因在上面，不是最后那句 ninja" }
           cmake --build build --config Release --target synthforge_cli
+          if ($LASTEXITCODE -ne 0) { throw "编译/链接失败。" }
 
       # 部署到独立目录后静态扫描：依赖要么在包内，要么是系统自带
       - name: 部署依赖并静态自检
