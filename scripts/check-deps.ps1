@@ -39,16 +39,18 @@ if ($null -eq $Required) {
 function Find-DumpBin {
     $cmd = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
-    foreach ($root in @("C:\Program Files\Microsoft Visual Studio",
-                        "C:\Program Files (x86)\Microsoft Visual Studio")) {
-        if (-not (Test-Path $root)) { continue }
-        $found = Get-ChildItem -Path $root -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '\\Hostx64\\x64\\dumpbin\.exe$' } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-        if ($found) { return $found.FullName }
+    # 只按已知布局做通配匹配，绝不递归整个 VS 目录：CI runner 上那是几十 GB，
+    # 递归扫会慢到整个 job 超时；在开发机上它也只是白等几秒。
+    $patterns = @(
+        "C:\Program Files\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe",
+        "C:\Program Files (x86)\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe",
+        "C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe")
+    foreach ($pattern in $patterns) {
+        $hit = Get-Item -Path $pattern -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+        if ($hit) { return $hit.FullName }
     }
-    throw "找不到 dumpbin.exe：请在 Developer PowerShell 里运行，或确认 VS 的 C++ 工具链已安装。"
+    throw "找不到 dumpbin.exe。在 Developer PowerShell 里跑，或确认 VS 装了 C++ 工具链。"
 }
 
 # dumpbin 输出里只有依赖行本身是 "xxx.dll" 独占一行，其余行不会误匹配
