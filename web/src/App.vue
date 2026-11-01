@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import ActivityBar from "./components/ActivityBar.vue";
 import ChatPanel from "./components/ChatPanel.vue";
 import FileTree from "./components/FileTree.vue";
+import LogDrawer from "./components/LogDrawer.vue";
 import PreviewPane from "./components/PreviewPane.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import TopBar from "./components/TopBar.vue";
@@ -42,6 +43,9 @@ const modifyTargetShape = ref<"prop" | "diorama" | "open" | undefined>(undefined
 // 设置保存后递增，让常驻的 ChatPanel 重新拉取云API 徽标状态
 const settingsVersion = ref(0);
 const lamp = ref<{ blender: LampState; unity: LampState }>({ blender: "off", unity: "off" });
+// 「第 N 次重连」「桥接异常退出」这类细节只有后端知道，直接用它广播的 hints
+const backendHints = ref<{ blender?: string; unity?: string }>({});
+const logsOpen = ref(false);
 let restoreNativeMenu: (() => void) | null = null;
 let offAssetCreated: (() => void) | null = null;
 let offExportStarted: (() => void) | null = null;
@@ -50,8 +54,8 @@ let offErrorCard: (() => void) | null = null;
 let offProjectState: (() => void) | null = null;
 
 const lampHints = computed(() => ({
-  blender: `Blender：${stateLabel(lamp.value.blender)}`,
-  unity: `Unity：${stateLabel(lamp.value.unity)}`,
+  blender: backendHints.value.blender ?? `Blender：${stateLabel(lamp.value.blender)}`,
+  unity: backendHints.value.unity ?? `Unity：${stateLabel(lamp.value.unity)}`,
 }));
 
 function stateLabel(state: LampState) {
@@ -242,11 +246,16 @@ onMounted(async () => {
     // 后端未启动时保持双灯灰，页面骨架仍可用。
   }
   client.on("conn.status", (data) => {
-    const next = data as { blender?: LampState; unity?: LampState };
+    const next = data as {
+      blender?: LampState;
+      unity?: LampState;
+      hints?: { blender?: string; unity?: string };
+    };
     lamp.value = {
       blender: next.blender ?? lamp.value.blender,
       unity: next.unity ?? lamp.value.unity,
     };
+    backendHints.value = next.hints ?? {};
   });
   offProjectState = client.on("project.state", (data) => {
     projectState.value = data as {
@@ -295,6 +304,7 @@ onBeforeUnmount(() => {
         :hints="lampHints"
         :importing="picking"
         @import-project="importProject"
+        @open-logs="logsOpen = true"
       />
       <p v-if="importError" class="import-error">{{ importError }}</p>
       <div
@@ -345,5 +355,7 @@ onBeforeUnmount(() => {
       :initial-tab="settingsTab"
       @saved="settingsVersion++"
     />
+    <!-- 诊断抽屉自己订阅 log.append / env.status：常驻，关掉面板不丢后端事件 -->
+    <LogDrawer :client="client" :open="logsOpen" @close="logsOpen = false" />
   </div>
 </template>

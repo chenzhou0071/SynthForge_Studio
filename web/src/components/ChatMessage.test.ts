@@ -40,7 +40,7 @@ describe("ChatMessage", () => {
   });
 
   it("emits resume when a resumable error card is clicked", async () => {
-    const item: ChatItem = { role: "error", content: "步数用完", resumable: true };
+    const item: ChatItem = { role: "error", reason: "max-steps-exceeded", resumable: true };
     const { wrapper } = mountMessage(item);
     const button = wrapper.findAll(".error-card button").find((b) => b.text() === "继续工作");
     expect(button).toBeTruthy();
@@ -48,22 +48,33 @@ describe("ChatMessage", () => {
     expect(wrapper.emitted("resume")?.[0]).toEqual([item]);
   });
 
-  it("emits retry when a retryable error card is clicked", async () => {
-    const item: ChatItem = { role: "error", content: "云失败", retryable: true };
+  it("emits retry when the card offers a retry", async () => {
+    const item: ChatItem = { role: "error", reason: "cloud3d-failed", message: "网络连接被拒绝" };
     const { wrapper } = mountMessage(item);
+    expect(wrapper.find(".error-card").text()).toContain("网络连接被拒绝");
     const button = wrapper.findAll(".error-card button").find((b) => b.text() === "重试");
     expect(button).toBeTruthy();
     await button!.trigger("click");
     expect(wrapper.emitted("retry")?.[0]).toEqual([item]);
   });
 
+  // 链路挂了时两个动作应并存：[重试] 只重发指令，[重启桥接] 修链路，不互相顶替
+  it("emits restartBridge for a dead link while still offering retry", async () => {
+    const item: ChatItem = { role: "error", reason: "blender-not-ready" };
+    const { wrapper } = mountMessage(item);
+    const texts = wrapper.findAll(".error-card button").map((b) => b.text());
+    expect(texts).toContain("重试");
+    expect(texts).toContain("重启桥接");
+    await wrapper
+      .findAll(".error-card button")
+      .find((b) => b.text() === "重启桥接")!
+      .trigger("click");
+    expect(wrapper.emitted("restartBridge")?.[0]).toEqual([item]);
+  });
+
   it("emits openSettings when the not-configured card is clicked", async () => {
-    const { wrapper } = mountMessage({
-      role: "error",
-      content: "未配置",
-      settings: "agent",
-    });
-    const button = wrapper.findAll(".error-card button").find((b) => b.text() === "去设置");
+    const { wrapper } = mountMessage({ role: "error", reason: "agent-not-configured" });
+    const button = wrapper.findAll(".error-card button").find((b) => b.text() === "打开设置");
     expect(button).toBeTruthy();
     await button!.trigger("click");
     expect(wrapper.emitted("openSettings")?.[0]).toEqual(["agent"]);
@@ -71,7 +82,7 @@ describe("ChatMessage", () => {
 
   it("disables the resume button while the panel is busy", () => {
     const { wrapper } = mountMessage(
-      { role: "error", content: "步数用完", resumable: true },
+      { role: "error", reason: "max-steps-exceeded", resumable: true },
       { busy: true },
     );
     const button = wrapper.findAll(".error-card button").find((b) => b.text() === "继续工作");

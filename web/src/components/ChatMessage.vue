@@ -4,6 +4,7 @@ import type { WsClient } from "../ws/WsClient";
 import { renderMarkdown } from "../chat/markdown";
 import AssetCard from "./AssetCard.vue";
 import DraftCard from "./DraftCard.vue";
+import ErrorCard from "./ErrorCard.vue";
 import PlanCard from "./PlanCard.vue";
 
 // 单条消息的渲染。父组件只传 item（对象引用），流式时只有这一条子组件因 item.content
@@ -14,6 +15,7 @@ const emit = defineEmits<{
   openSettings: [target: "agent" | "cloud"];
   resume: [item: ChatItem];
   retry: [item: ChatItem];
+  restartBridge: [item: ChatItem];
   draftSent: [];
 }>();
 </script>
@@ -23,19 +25,20 @@ const emit = defineEmits<{
     <img class="shot" :src="item.dataUrl" :alt="item.caption ?? '任务截图'" />
     <span v-if="item.caption" class="caption">{{ item.caption }}</span>
   </div>
-  <div v-else-if="item.role === 'error'" class="error-card">
-    <strong>请求失败</strong>
-    <p>{{ item.content }}</p>
-    <button v-if="item.resumable" class="resume" :disabled="busy" @click="emit('resume', item)">
-      继续工作
-    </button>
-    <button v-else-if="item.retryable" class="resume" :disabled="busy" @click="emit('retry', item)">
-      重试
-    </button>
-    <button v-else-if="item.settings" class="resume" @click="emit('openSettings', item.settings)">
-      去设置
-    </button>
-  </div>
+  <ErrorCard
+    v-else-if="item.role === 'error'"
+    :reason="item.reason ?? ''"
+    :message="item.message"
+    :steps="item.steps"
+    :max-steps="item.maxSteps"
+    :resumable="item.resumable"
+    :resolved="item.resolved"
+    :busy="busy"
+    @retry="emit('retry', item)"
+    @restart-bridge="emit('restartBridge', item)"
+    @continue-work="emit('resume', item)"
+    @open-settings="(page: 'agent' | 'cloud') => emit('openSettings', page)"
+  />
   <div v-else-if="item.role === 'asset' && item.asset" class="draft-row">
     <AssetCard :asset="item.asset" @preview="emit('preview', $event)" />
   </div>
@@ -85,20 +88,6 @@ const emit = defineEmits<{
   margin-top: 4px;
   color: var(--muted);
   font-size: 12px;
-}
-
-.error-card .resume {
-  margin-top: 6px;
-  background: var(--accent);
-  border: 0;
-  color: #fff;
-  border-radius: 3px;
-  padding: 4px 12px;
-  font-size: 12px;
-}
-
-.error-card .resume:disabled {
-  opacity: 0.5;
 }
 
 .group-divider {

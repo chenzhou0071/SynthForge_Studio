@@ -584,6 +584,42 @@ describe("ChatPanel", () => {
     expect(wrapper.emitted("preview")?.[0]).toEqual(["props/chair_01.glb"]);
   });
 
+  // 链路挂了就必须能真去重启桥；点了之后卡片收起，不让人反复发
+  it("restarts the bridge from the dead-link card and settles it", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.results.set("bridge.restart", { ok: true });
+
+    client.emit("error.card", { area: "blender", reason: "blender-not-ready" });
+    await flushPromises();
+
+    const button = wrapper
+      .findAll(".error-card button")
+      .find((item) => item.text() === "重启桥接");
+    expect(button).toBeTruthy();
+    await button!.trigger("click");
+    await flushPromises();
+
+    expect(client.callsOf("bridge.restart")[0].params).toMatchObject({ area: "blender" });
+    expect(wrapper.findAll(".error-card button")).toHaveLength(0); // 已发起重启，别重复点
+  });
+
+  it("tells the user when the area has no bridge to restart", async () => {
+    const { client, wrapper } = mountPanel("blender");
+    await flushPromises();
+    client.results.set("bridge.restart", { ok: false });
+
+    client.emit("error.card", { area: "blender", reason: "bridge-crashed" });
+    await flushPromises();
+    await wrapper
+      .findAll(".error-card button")
+      .find((item) => item.text() === "重启桥接")!
+      .trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".error-card").text()).toContain("没有可重启的桥接");
+  });
+
   it("offers a settings shortcut when the agent is not configured", async () => {
     const { client, wrapper } = mountPanel("blender");
     await flushPromises();
@@ -591,7 +627,7 @@ describe("ChatPanel", () => {
     client.emit("error.card", { area: "blender", reason: "agent-not-configured" });
     await flushPromises();
 
-    const button = wrapper.findAll(".error-card button").find((item) => item.text() === "去设置");
+    const button = wrapper.findAll(".error-card button").find((item) => item.text() === "打开设置");
     expect(button).toBeTruthy();
     await button!.trigger("click");
     expect(wrapper.emitted("openSettings")?.[0]).toEqual(["agent"]);
@@ -663,7 +699,7 @@ describe("ChatPanel", () => {
     await flushPromises();
 
     expect(wrapper.find(".error-card").text()).toContain("未配置云 API");
-    const button = wrapper.findAll(".error-card button").find((item) => item.text() === "去设置");
+    const button = wrapper.findAll(".error-card button").find((item) => item.text() === "打开设置");
     expect(button).toBeTruthy();
     expect(wrapper.findAll(".error-card button").find((item) => item.text() === "重试")).toBeUndefined();
     await button!.trigger("click");

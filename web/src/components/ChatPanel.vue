@@ -153,35 +153,6 @@ let streaming: ChatItem | null = null; // 指向 messages 里的流式气泡；�
 // 用户已点停止：abort 前发出的帧可能晚到，不能让它们把 busy/气泡重新拉起来
 let cancelRequested = false;
 
-function reasonText(reason: string, steps?: number, maxSteps?: number) {
-  if (reason === "agent-not-configured") {
-    return "未配置 Agent：请先在设置中填写服务商、模型与密钥。";
-  }
-  if (reason === "cloud3d-not-configured") {
-    return "未配置云 API：请先在设置中填写 3D 服务商与密钥。";
-  }
-  if (reason === "max-steps-exceeded") {
-    const usage =
-      typeof steps === "number" && typeof maxSteps === "number"
-        ? `（已用 ${steps} / 上限 ${maxSteps} 步）`
-        : "";
-    return `步数预算用完了${usage}。前面的成果还在 Blender 场景里，点「继续工作」接着干，不会重新清场。`;
-  }
-  if (reason === "blender-busy") return "Blender 正忙，等当前任务结束后再试一次。";
-  // 回执超时不等于转换失败：命令常已发出，fbx 会迟到落地；重试会直接复用产物
-  if (reason === "blender-convert-timeout") {
-    return "转换没等到结果：Blender 可能还在执行上一条命令。等它空闲后再点一次导入即可，已生成的 fbx 会直接复用。";
-  }
-  // 建造轮连续空转被叫停：不是建坏了，是模型一直在复述自检、根本没动手
-  if (reason === "group-stalled") {
-    return "这一组连续几次都没有任何建造动作，已停止，避免空转。请把这一组拆分成更小的几组后重发，或直接说明这一步具体要建什么。";
-  }
-  if (reason === "nothing-to-resume") {
-    return "这份任务的现场已经不在了（可能已有新任务开始），请重新发指令。";
-  }
-  return reason;
-}
-
 function onScroll() {
   const el = scroller.value;
   if (!el) return;
@@ -205,25 +176,14 @@ function pushError(
   reason: string,
   options: { resumable?: boolean; message?: string; steps?: number; maxSteps?: number } = {},
 ) {
-  const cloud = reason.startsWith("cloud3d-");
-  // 未配置类错误直达设置：Agent 页 / 3D 模型页
-  const settings =
-    reason === "agent-not-configured"
-      ? "agent"
-      : reason === "cloud3d-not-configured"
-        ? "cloud"
-        : undefined;
+  // 只存错误码与原文：给人看的文案由 ErrorCard 字典统一给，新增错误码不会漏文案
   messages.value.push({
     role: "error",
-    // 云失败透传服务端原因；本地化文案只用于已知的低模失败
-    content:
-      cloud && options.message
-        ? options.message
-        : reasonText(reason, options.steps, options.maxSteps),
+    reason,
+    message: options.message,
+    steps: options.steps,
+    maxSteps: options.maxSteps,
     resumable: options.resumable === true,
-    // 未配置是设置问题，重试没意义；其余云失败可续轮询/重下
-    retryable: cloud && reason !== "cloud3d-not-configured",
-    settings,
   });
 }
 
@@ -699,8 +659,8 @@ function setPlanCardState(from: "pending" | "started", to: "pending" | "started"
   }
 }
 
-// 云任务失败后重试：有 taskId 续轮询/重下，不重复提交；没有才重新提交
-async function retryCloudTask(item: ChatItem) {
+// 失败卡上的「重试」：统一走 chat.retry，有任务就续轮询/重下，不重复提交扣费
+async function retryTask(item: ChatItem) {
   if (busy.value) return;
   try {
     const result = await props.client.request<{ accepted?: boolean; error?: string }>(
@@ -708,18 +668,17 @@ async function retryCloudTask(item: ChatItem) {
       { area: props.area },
     );
     if (result?.accepted) {
-      item.retryable = false; // 已接续，同一张卡不再重复点击
+      item.resolved = true; // 已接续，同一张卡不再重复点击
       busy.value = true;
       scrollToBottom(true);
       return;
     }
-    item.content =
-      result?.error === "no-task-to-retry"
-        ? "没有可重试的任务，请重新发送指令。"
-        : result?.error ?? "重试失败";
+    if (result?.error === "no-task-to-retry") item.reason = "no-task-to-retry";
+    else item.message = result?.error ?? "重试失败";
   } catch (error) {
-    item.content = error instanceof Error ? error.message : "重试失败";
+    item.message = error instanceof Error ? error.message : "重试失败";
   }
+  item.resolved = true;
 }
 
 // 步数耗尽的失败卡：不清场续跑，旧会话与分组位置都在后端
@@ -732,18 +691,36 @@ async function resumeWork(item: ChatItem) {
       area: props.area,
     });
     if (result?.ok) {
-      item.resumable = false; // 已接续，同一张卡不再重复点击
+      item.resolved = true; // 已接续，同一张卡不再重复点击
       scrollToBottom(true);
       return;
     }
     busy.value = false;
-    const reason = result?.error ?? "nothing-to-resume";
-    item.content = reasonText(reason);
-    if (reason !== "blender-busy") item.resumable = false; // 现场没了，再点也没用
+    // 换一条更准确的文案：现场没了不能重点击，Blender 还忙则保留续跑资格
+    item.reason = result?.error ?? "nothing-to-resume";
+    if (item.reason !== "blender-busy") item.resumable = false;
   } catch (error) {
     busy.value = false;
-    item.content = error instanceof Error ? error.message : "继续失败";
+    item.message = error instanceof Error ? error.message : "继续失败";
+    item.resolved = true;
   }
+}
+
+// 链路类错误卡直接重启桥接：重启不了就换成人话，别把内部码留在卡上
+async function restartBridge(item: ChatItem) {
+  try {
+    const result = await props.client.request<{ ok?: boolean }>("bridge.restart", {
+      area: props.area,
+    });
+    if (result?.ok) {
+      item.resolved = true; // 重启已发起，等 conn.status 把灯点亮
+      return;
+    }
+    item.reason = "bridge-not-registered";
+  } catch (error) {
+    item.message = error instanceof Error ? error.message : "重启桥接失败";
+  }
+  item.resolved = true;
 }
 
 async function clearChat() {
@@ -816,7 +793,8 @@ function onKeydown(event: KeyboardEvent) {
           @preview="(path: string) => emit('preview', path)"
           @open-settings="(target: 'agent' | 'cloud') => emit('openSettings', target)"
           @resume="resumeWork"
-          @retry="retryCloudTask"
+          @retry="retryTask"
+          @restart-bridge="restartBridge"
           @draft-sent="onDraftSent"
         />
 

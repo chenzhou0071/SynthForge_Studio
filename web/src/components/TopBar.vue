@@ -9,7 +9,7 @@ const props = defineProps<{
   importing?: boolean;
 }>();
 
-const emit = defineEmits<{ (e: "importProject"): void }>();
+const emit = defineEmits<{ (e: "importProject"): void; (e: "openLogs"): void }>();
 
 const color = (state: LampState) =>
   state === "ready" ? "#4ec9b0" : state === "reconnecting" ? "#cca700" : "#555";
@@ -28,5 +28,6 @@ const tip = (area: "blender" | "unity") =>
     <span class="spacer" />
     <span class="lamp" :title="tip('blender')"><i :style="{ background: color(blender) }" />Blender</span>
     <span class="lamp" :title="tip('unity')"><i :style="{ background: color(unity) }" />Unity</span>
+    <button class="logs" title="环境自检结果与最近的告警" @click="emit('openLogs')">日志</button>
   </header>
 </template>

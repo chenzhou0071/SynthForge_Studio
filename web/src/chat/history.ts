@@ -68,12 +68,16 @@ export interface ChatItem {
   groupIndex?: number;
   groupCount?: number;
   title?: string;
+  // 错误卡：只带错误码与服务端原文，给人看的文案由 ErrorCard 字典统一决定
+  reason?: string;
+  message?: string;
+  // 步数耗尽卡要报出用量
+  steps?: number;
+  maxSteps?: number;
   // 步数耗尽失败卡：可点「继续工作」接着跑，不清场
   resumable?: boolean;
-  // 云任务失败卡：可点「重试」续轮询/重下，不重复提交扣费
-  retryable?: boolean;
-  // 未配置类错误卡：可点「去设置」直达对应设置页
-  settings?: "agent" | "cloud";
+  // 已重试/已续跑/已发起重启：保留文案但收起按钮
+  resolved?: boolean;
 }
 
 // session.load 返回 {messages, hasMore, nextCursor}；界面只认能渲染的角色
