@@ -96,16 +96,28 @@ jobs:
           # 只要求 cl.exe 在 PATH，不再依赖 CMake 的 VS 探测。
           cmake --version | Select-Object -First 1
           $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (-not (Test-Path $vswhere)) { throw "runner 上没有 vswhere：它不存在就意味着没装 VS" }
-          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualCpp.Tools.HostX64 -property installationPath
+          if (-not (Test-Path $vswhere)) { throw "runner 上没有 vswhere：意味着没装任何 VS" }
+
+          # 不要按组件 ID 过滤：runner 镜像升到了 VS 18，Microsoft.VisualCpp.Tools.HostX64
+          # 在它上头查不到，就会误判“没 C++ 工具链”。直接遍历实例，用有没有 cl.exe 说事。
+          $instances = & $vswhere -products * -prerelease -property installationPath
+          if (-not $instances) { throw "vswhere 没报出任何 VS 实例" }
+          $vsPath = $null
+          foreach ($candidate in $instances) {
+              $cl = Get-Item (Join-Path $candidate "VC\Tools\MSVC\*\bin\HostX64\x64\cl.exe") -ErrorAction SilentlyContinue
+              if ($cl) { $vsPath = $candidate; break }
+          }
           if (-not $vsPath) {
-              & $vswhere -latest -products * -property installationPath
-              throw "vswhere 找不到带 C++ 工具链的 VS 实例（上面列出了它看到的实例）"
+              ($instances -join "`n")
+              throw "上面列出的 VS 实例里没有一个带 cl.exe：镜像缺 C++ 工具链"
           }
           Write-Host "VS: $vsPath"
           Import-Module (Join-Path $vsPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
           Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64" | Out-Null
           if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) { throw "Dev Shell 后仍没有 cl.exe" }
+          # 打印工具链版本：runner 是 VS 18，编译链接 Qt 的 msvc2022 预编译库时
+          # 真出问题靠这一行就能看出是哪个 toolset，不用再来一轮
+          cl 2>&1 | Select-Object -First 1
           if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { throw "runner 上没有 ninja，Ninja generator 用不了（应改回 VS generator 或装 ninja）" }
 
           cmake -S . -B build -G "Ninja Multi-Config" -DCMAKE_PREFIX_PATH="$env:QT_DIR"
