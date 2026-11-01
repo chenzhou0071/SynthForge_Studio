@@ -36,7 +36,8 @@ signals:
     void toolStep(const QString& area, const QString& tool, const QString& status);
     void imageReceived(const QString& area, const QString& dataUrl, const QString& tool);
     void finished(const QString& area, const QString& visible, const QString& executable);
-    void failed(const QString& area, const QString& reason);
+    // reason 固定是错误码（供前端字典查文案），detail 是模型/服务端原文（只展示不匹配）
+    void failed(const QString& area, const QString& reason, const QString& detail);
 
 private:
     void streamOnce(); // 发一轮对话：流式过滤 + 工具回调 + 无工具时收尾

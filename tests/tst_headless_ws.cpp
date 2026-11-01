@@ -971,7 +971,13 @@ private slots:
             {{QStringLiteral("area"), QStringLiteral("blender")},
              {QStringLiteral("text"), QStringLiteral("你好")},
              {QStringLiteral("mode"), QStringLiteral("ask")}});
-        QCOMPARE(reply.value(QStringLiteral("accepted")).toBool(), false);
+        // 响应帧是 {id, result}：不先确认 result 存在，取不到字段的默认 false 会把断言装成通过
+        QVERIFY2(reply.contains(QStringLiteral("result")),
+                 qPrintable(QJsonDocument(reply).toJson(QJsonDocument::Compact)));
+        const QJsonObject result = reply.value(QStringLiteral("result")).toObject();
+        QCOMPARE(result.value(QStringLiteral("accepted")).toBool(), false);
+        QCOMPARE(result.value(QStringLiteral("reason")).toString(),
+                 QStringLiteral("agent-not-configured"));
         QVERIFY(!client.lastEvent(QStringLiteral("error.card"), mark).isEmpty()); // 原有行为
 
         qInfo() << QStringLiteral("埋点验证占位行"); // 日志文件懒创建，先确保它存在
@@ -983,6 +989,42 @@ private slots:
         QVERIFY2(text.contains(QStringLiteral("agent-not-configured")),
                  qPrintable(text)); // 同一件错得在盘上留下痕迹
         LogService::shutdown();
+    }
+
+    // 启动自检：三路结论（uvx / Blender / Unity）必须齐，缺一路前端诊断面板就空一块
+    void envStatusReportsThreeChecks()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library));
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+        const int mark = client.mark();
+
+        QTRY_VERIFY_WITH_TIMEOUT(!client.lastEvent(QStringLiteral("env.status"), mark).isEmpty(),
+                                 12000);
+        const QJsonObject report = client.lastEvent(QStringLiteral("env.status"), mark);
+        for (const QString& key : {QStringLiteral("uvx"), QStringLiteral("blender"),
+                                   QStringLiteral("unity")}) {
+            const QJsonObject item = report.value(key).toObject();
+            QVERIFY2(item.contains(QStringLiteral("state")), qPrintable(key));
+            const QString state = item.value(QStringLiteral("state")).toString();
+            QVERIFY2(state == QLatin1String("ready") || state == QLatin1String("failed"),
+                     qPrintable(key + QStringLiteral("=") + state));
+        }
+
+        // 手动复检：请求立即返回 ok，结果仍旧走 env.status（不阻塞 WS 线程）
+        const int before = client.payloadsSince(QStringLiteral("env.status"), mark).size();
+        const QJsonObject checkReply = client.request(QStringLiteral("env.check"), QJsonObject{});
+        QCOMPARE(checkReply.value(QStringLiteral("result")).toObject()
+                     .value(QStringLiteral("ok"))
+                     .toBool(),
+                 true);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            client.payloadsSince(QStringLiteral("env.status"), mark).size() > before, 12000);
     }
 
     // Unity 区：激活工程后 tree.refresh / file.read / fs.operate 以 <project>/Assets 为根，

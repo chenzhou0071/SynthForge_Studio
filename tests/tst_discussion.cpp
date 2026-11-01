@@ -187,6 +187,30 @@ private slots:
         QVERIFY(!streamed.contains(QStringLiteral("把护栏加到 1.1 米")));
         QCOMPARE(finished.at(0).at(2).toString(), QStringLiteral("把护栏加到 1.1 米"));
     }
+
+    // LLM 的错误原文不是错误码：直接当 reason 发出去，前端字典匹配不上就会把英文原文甩给用户
+    void llmFailureEmitsNormalizedReasonWithDetail()
+    {
+        MockLlmServer::Turn unauthorized;
+        unauthorized.status = 401;
+        MockLlmServer server({unauthorized});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        DiscussionAgent agent(&llm, &mcp.client());
+        agent.setModelConfig(server.config());
+        QSignalSpy failed(&agent, &DiscussionAgent::failed);
+
+        agent.ask(QStringLiteral("blender"), QStringLiteral("系统提示"), QJsonArray{},
+                  QStringLiteral("桌面多宽？"), false);
+
+        QVERIFY(failed.wait(8000));
+        QCOMPARE(failed.first().at(0).toString(), QStringLiteral("blender"));
+        QCOMPARE(failed.first().at(1).toString(), QStringLiteral("llm-request-failed"));
+        // 原文必须作为 detail 留着：归一成错误码不能把排查线索也抹掉
+        QVERIFY2(failed.first().size() >= 3 && !failed.first().at(2).toString().isEmpty(),
+                 "没有 detail，前端只能看到一个冷冰冰的错误码");
+    }
 };
 
 QTEST_GUILESS_MAIN(DiscussionTest)

@@ -911,6 +911,32 @@ private slots:
         QVERIFY(!exportTurn.contains(QStringLiteral("已被有意排除")));
     }
 
+    // 执行链上的 LLM 错误同样不能当错误码：归一成 llm-request-failed，原文进 detail
+    void llmFailureInExecutionIsNormalizedWithDetail()
+    {
+        MockLlmServer::Turn unauthorized;
+        unauthorized.status = 401;
+        MockLlmServer server({unauthorized});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+        orch.setModelConfig(server.config());
+        BuildPlan plan;
+        plan.groups = {{QStringLiteral("底座"), {}, {}, QStringLiteral("底座完整")}};
+        plan.maxSteps = 20;
+        QSignalSpy failed(&orch, &AgentOrchestrator::failed);
+
+        orch.execute(QStringLiteral("t-llm"), nullptr, openAiTools(), plan,
+                     QStringLiteral("p"), QStringLiteral("/tmp/out"),
+                     QStringLiteral("blender"));
+
+        QVERIFY(failed.wait(8000));
+        QCOMPARE(failed.first().at(1).toString(), QStringLiteral("llm-request-failed"));
+        QVERIFY2(failed.first().size() >= 3 && !failed.first().at(2).toString().isEmpty(),
+                 "detail 丢了就没法排查是密钥错还是额度尽");
+    }
+
     // 工具失败与桥瞬断重试都不会弹错误卡，事后只能靠日志追：这两条路径必须留痕
     void toolFailureAndBridgeRetryAreWrittenToLog()
     {

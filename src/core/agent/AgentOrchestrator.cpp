@@ -233,8 +233,9 @@ void AgentOrchestrator::attemptPlan(int attempt)
                  m_stream += d;
              },
          .onToolCalls = nullptr,
+         // LLM 的报错原文不是错误码：归一成 llm-request-failed，原文当 detail 带走
          .onError = [this](const QString& e) {
-             fail(e);
+             fail(QStringLiteral("llm-request-failed"), e);
          },
          .onDone =
              [this, attempt]() {
@@ -395,7 +396,7 @@ void AgentOrchestrator::finishCancelled()
     m_taskId.clear();
 }
 
-void AgentOrchestrator::fail(const QString& reason)
+void AgentOrchestrator::fail(const QString& reason, const QString& detail)
 {
     m_planning.remove(m_area);
     if (m_tm && m_tm->isCancelled(m_taskId)) {
@@ -412,7 +413,7 @@ void AgentOrchestrator::fail(const QString& reason)
     // 只有步数耗尽值得续跑；busy 是暂时的，不清掉已攒下的续跑资格
     m_resumable = normalized == QLatin1String("max-steps-exceeded")
                   || (m_resumable && normalized == QLatin1String("blender-busy"));
-    emit failed(m_area, normalized);
+    emit failed(m_area, normalized, detail);
     releaseGate();
     if (m_tm)
         m_tm->finish(m_taskId);
@@ -626,7 +627,7 @@ void AgentOrchestrator::tick()
                  emit delta(m_area, d);
              },
          .onToolCalls = [this](const QJsonArray& calls) { executeToolCalls(calls); },
-         .onError = [this](const QString& e) { fail(e); },
+         .onError = [this](const QString& e) { fail(QStringLiteral("llm-request-failed"), e); },
          .onDone =
              [this]() {
                  if (m_pendingToolCalls == 0 && !m_awaitingTools)

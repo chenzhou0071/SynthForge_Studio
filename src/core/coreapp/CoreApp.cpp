@@ -9,6 +9,7 @@
 #include "core/assets/AssetLibrary.h"
 #include "core/cloud3d/Cloud3dService.h"
 #include "core/coreapp/AssetCard.h"
+#include "core/env/EnvChecker.h"
 #include "core/llm/LlmGateway.h"
 #include "core/llm/ToolBridge.h"
 #include "core/logging/LogService.h"
@@ -220,13 +221,13 @@ void CoreApp::wireUnityOrchestrator(AgentOrchestrator* orch)
                                                  {"content", text}});
             });
     connect(orch, &AgentOrchestrator::failed, this,
-            [this, orch](const QString& area, const QString& reason) {
-                reportError(
-                                     QJsonObject{{"area", area},
-                                                 {"reason", reason},
-                                                 {"resumable", orch->canResume(area)},
-                                                 {"steps", orch->stepCount()},
-                                                 {"maxSteps", orch->stepBudget()}});
+            [this, orch](const QString& area, const QString& reason, const QString& detail) {
+                reportError(QJsonObject{{"area", area},
+                                        {"reason", reason},
+                                        {"message", detail},
+                                        {"resumable", orch->canResume(area)},
+                                        {"steps", orch->stepCount()},
+                                        {"maxSteps", orch->stepBudget()}});
             });
     connect(orch, &AgentOrchestrator::groupProgress, this,
             [this](const QString& area, int index, int count, const QString& title) {
@@ -412,9 +413,8 @@ bool CoreApp::start()
                                                  {"caption", tool}});
             });
     connect(m_ask.get(), &DiscussionAgent::failed, this,
-            [this](const QString& area, const QString& reason) {
-                reportError(
-                                     QJsonObject{{"area", area}, {"reason", reason}});
+            [this](const QString& area, const QString& reason, const QString& detail) {
+                reportError(QJsonObject{{"area", area}, {"reason", reason}, {"message", detail}});
                 if (const QString tid = m_askWait.take(area); !tid.isEmpty()) {
                     m_sessions->upsertTask(tid, area, QStringLiteral("chat"),
                                            QStringLiteral("failed"), {});
@@ -486,14 +486,14 @@ bool CoreApp::start()
                                      QJsonObject{{"area", area}, {"completed", true}});
             });
     connect(m_orch, &AgentOrchestrator::failed, this,
-            [this](const QString& area, const QString& reason) {
+            [this](const QString& area, const QString& reason, const QString& detail) {
                 // 步数耗尽时前端给「继续工作」：带上用量，让用户知道还差多少
-                reportError(
-                                     QJsonObject{{"area", area},
-                                                 {"reason", reason},
-                                                 {"resumable", m_orch->canResume(area)},
-                                                 {"steps", m_orch->stepCount()},
-                                                 {"maxSteps", m_orch->stepBudget()}});
+                reportError(QJsonObject{{"area", area},
+                                        {"reason", reason},
+                                        {"message", detail},
+                                        {"resumable", m_orch->canResume(area)},
+                                        {"steps", m_orch->stepCount()},
+                                        {"maxSteps", m_orch->stepBudget()}});
             });
     connect(m_orch, &AgentOrchestrator::groupProgress, this,
             [this](const QString& area, int index, int count, const QString& title) {
@@ -1619,6 +1619,19 @@ bool CoreApp::start()
     LogService::setEventSink(this, [this](const QJsonObject& entry) {
         m_ws->broadcastEvent(QStringLiteral("log.append"), entry);
     });
+
+    // 环境自检：uvx 能否执行 + 两条桥是否就绪。启动跑一次，前端可随时 env.check 复检。
+    m_env = new EnvChecker(defaultBridgeCommand(QStringLiteral("blender")).program, m_blender,
+                           m_unity, this);
+    connect(m_env, &EnvChecker::result, this, [this](const QJsonObject& report) {
+        m_ws->broadcastEvent(QStringLiteral("env.status"), report);
+    });
+    m_router->registerHandler(QStringLiteral("env.check"), [this](const QJsonObject&) {
+        QTimer::singleShot(0, m_env, &EnvChecker::run); // 异步出结果，不占 WS 线程
+        return QJsonValue(QJsonObject{{QStringLiteral("ok"), true}});
+    });
+    // 推迟到桥首次握手之后再跑：否则刚 start 的桥一定被判为未就绪，自检结果骗人
+    QTimer::singleShot(1500, m_env, &EnvChecker::run);
 
     m_blender->start(); // 异步启动：握手完成后通过 conn.status 点亮顶栏
     return true;

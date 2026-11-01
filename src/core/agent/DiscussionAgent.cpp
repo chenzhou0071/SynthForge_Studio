@@ -189,7 +189,10 @@ void DiscussionAgent::streamOnce()
         }
     };
     handlers.onToolCalls = [this](const QJsonArray& calls) { executeCalls(calls); };
-    handlers.onError = [this](const QString& error) { emit failed(m_area, error); };
+    // 报错原文当 reason 会让前端字典匹配不上，把英文原文直接甩给用户：归一为码，原文进 detail
+    handlers.onError = [this](const QString& error) {
+        emit failed(m_area, QStringLiteral("llm-request-failed"), error);
+    };
     handlers.onDone = [this, filter]() {
         if (m_inFlight > 0 || m_roundDone)
             return; // 工具在途：等最后一个结果回来再继续；已收尾：不双发

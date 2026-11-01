@@ -77,7 +77,8 @@ signals:
     void planReady(const QString& area, const QString& taskId, const QJsonObject& plan);
     void groupProgress(const QString& area, int index, int count, const QString& title);
     void finalText(const QString& area, const QString& text);
-    void failed(const QString& area, const QString& reason);
+    // reason 固定是错误码（供前端字典查文案），detail 是原文（只展示，不参与匹配）
+    void failed(const QString& area, const QString& reason, const QString& detail);
     void toolStep(const QString& area, const QString& tool, const QString& status);
     void delta(const QString& area, const QString& text);
     // 一轮助手的文字说完（即将执行工具/进入下一组）：前端据此收口当前气泡
@@ -109,7 +110,7 @@ private:
                            int attempt);
     void finishOk(const QString& text);
     void finishCancelled();
-    void fail(const QString& reason);
+    void fail(const QString& reason, const QString& detail = QString());
     void releaseGate();
     QStringList collectNewGlbs() const;
 

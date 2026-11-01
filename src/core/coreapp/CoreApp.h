@@ -32,6 +32,7 @@ class DiscussionAgent;
 class ProjectService;
 class DirectoryWatcher;
 class AssetImporter;
+class EnvChecker;
 
 struct CoreOptions
 {
@@ -104,6 +105,7 @@ private:
     std::unique_ptr<LlmGateway> m_llm;
     McpRuntime* m_blender = nullptr; // QObject child，析构由 parent 负责
     McpRuntime* m_unity = nullptr;   // QObject child：Unity 区 MCP 桥接运行时
+    EnvChecker* m_env = nullptr;     // QObject child：启动环境自检（uvx + 两条桥）
     std::unique_ptr<PreflightChecker> m_preflight;
     SummarizerAgent* m_summarizer = nullptr; // QObject child，析构由 parent 负责
     std::unique_ptr<DiscussionAgent> m_ask;  // 讨论模式：只读感知 Blender 的多轮问答
