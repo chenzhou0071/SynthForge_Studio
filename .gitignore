@@ -5,6 +5,7 @@ web/dist/
 .vite/
 
 # 打包产物与本地验证的临时目录
+build-*/
 dist/
 dist_ci/
 ci-data/

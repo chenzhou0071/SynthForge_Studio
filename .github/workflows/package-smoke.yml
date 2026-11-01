@@ -88,8 +88,27 @@ jobs:
           npm run build
 
       - name: 配置并构建无头 CLI（Release）
+        shell: pwsh
         run: |
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="$env:QT_DIR"
+          # 不用 "Visual Studio 17 2022" generator：它靠自己的发现逻辑找 VS，
+          # 在 runner 上会报“could not find any instance of Visual Studio”。
+          # 改用 vswhere（它才是官方定位器）拿到安装路径，进 Dev Shell 后走 Ninja：
+          # 只要求 cl.exe 在 PATH，不再依赖 CMake 的 VS 探测。
+          cmake --version | Select-Object -First 1
+          $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "runner 上没有 vswhere：它不存在就意味着没装 VS" }
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualCpp.Tools.HostX64 -property installationPath
+          if (-not $vsPath) {
+              & $vswhere -latest -products * -property installationPath
+              throw "vswhere 找不到带 C++ 工具链的 VS 实例（上面列出了它看到的实例）"
+          }
+          Write-Host "VS: $vsPath"
+          Import-Module (Join-Path $vsPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+          Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64" | Out-Null
+          if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) { throw "Dev Shell 后仍没有 cl.exe" }
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { throw "runner 上没有 ninja，Ninja generator 用不了（应改回 VS generator 或装 ninja）" }
+
+          cmake -S . -B build -G "Ninja Multi-Config" -DCMAKE_PREFIX_PATH="$env:QT_DIR"
           cmake --build build --config Release --target synthforge_cli
 
       # 部署到独立目录后静态扫描：依赖要么在包内，要么是系统自带
