@@ -12,21 +12,32 @@ jobs:
   no-qt-smoke:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
 
-      # 只装核心库用到的模块：core 依赖 Sql / WebSockets / Gui，不需要 WebEngine
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 不用 install-qt-action：它默认拉最新 Python（含预览版），aqtinstall 在其上直接挂掉。
+      # 自己调 aqt 反而可控：版本、镜像、安装路径全部写在本子上。
+      # core 只用到 qtbase（Core/Gui/Widgets/Network/WebSockets/Sql 都在里面），无需 additional modules
       - name: 安装 Qt
-        id: qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.10.3"
-          arch: win64_msvc2022_64
-          modules: qtsql qtwebsockets
-          cache: true
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install aqtinstall
+          aqt install-qt windows desktop 6.10.3 win64_msvc2022_64 --outputdir "$env:GITHUB_WORKSPACE\Qt"
+          # aqt 用 arch 号做目录名（win64_msvc2022_64），与官方在线安装器的 msvc2022_64 不一样，别写错
+          "QT_DIR=$env:GITHUB_WORKSPACE\Qt\6.10.3\win64_msvc2022_64" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if (-not (Test-Path "$env:GITHUB_WORKSPACE\Qt\6.10.3\win64_msvc2022_64\bin\windeployqt.exe")) {
+            Get-ChildItem "$env:GITHUB_WORKSPACE\Qt" -Recurse -Depth 2 -Directory | Select-Object -Expand FullName
+            throw "Qt 安装后找不到 windeployqt，检查上面列出的实际目录结构"
+          }
 
       - name: 前端构建
         working-directory: web
@@ -36,7 +47,7 @@ jobs:
 
       - name: 配置并构建无头 CLI（Release）
         run: |
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="${{ steps.qt.outputs.qt-dir }}"
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="$env:QT_DIR"
           cmake --build build --config Release --target synthforge_cli
 
       # 部署到独立目录后静态扫描：依赖要么在包内，要么是系统自带
@@ -44,7 +55,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist_ci | Out-Null
           Copy-Item build/Release/synthforge_cli.exe dist_ci/
-          & "${{ steps.qt.outputs.qt-dir }}/bin/windeployqt.exe" --release --no-translations dist_ci/synthforge_cli.exe
+          & "$env:QT_DIR\bin\windeployqt.exe" --release --no-translations dist_ci/synthforge_cli.exe
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-deps.ps1 -Stage dist_ci -Exe synthforge_cli.exe
 
       # 把 PATH 缩到只有系统目录：这一刻起本机“没有 Qt”，能不能跑全看包自己
