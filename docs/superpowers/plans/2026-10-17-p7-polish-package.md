@@ -591,6 +591,15 @@ install(TARGETS synthforge_app RUNTIME DESTINATION .)
 
 在一台未装 Qt 的 Win10/11 x64 机器（或临时虚拟机）执行：
 
+> **验收方式已按实际环境调整**：开发机是 Win11 家庭中文版（没有 Windows Sandbox / Hyper-V，也没有第二台机器）。
+> 下面这些项里，只有「缺 DLL / 缺插件」需要干净环境，它们改由三重等价证据覆盖；需要 Blender/Unity 的联调项本来就得有这些软件，直接用 `dist` 里的打包版在本机跑。
+>
+> - `scripts/check-deps.ps1`：递归解析 `synthforge_app.exe` 的导入表，依赖必须「在包内」或「系统自带」（`api-ms-win-*` / `ext-ms-*` 这类 API Set 磁盘上无文件，放行），并强制校核 `platforms\qwindows.dll`、`Qt6WebEngineCore.dll`、`QtWebEngineProcess.exe`、`resources`、`translations\qtwebengine_locales` 到齐
+> - CI `.github/workflows/package-smoke.yml`：runner 从未装过 Qt——构建 Release 无头 CLI → windeployqt → 静态自检 → **把 PATH 缩到只剩 `C:\Windows\System32;C:\Windows`** 起服务，必须在 60s 内看到 `READY ws=`
+> - 本机裸 PATH 启动：`$env:PATH="C:\Windows\System32;C:\Windows"` 后跑 `dist\SynthForgeStudio\synthforge_app.exe`，确认窗口能起、日志里有启动行
+>
+> 已知未覆盖：目标机缺 VC++ 运行库的情形（开发机装了 VS，本机测不出）。所以打包输出与 README 都要写明「装 VC++ 2015-2022 x64 可再发行组件」。
+
 1. 复制 `dist/SynthForgeStudio/` 整个目录双击 exe → 主窗口出现、无缺 DLL 报错。
 2. 设置页保存 Agent 配置 → 重启应用配置仍在（`%APPDATA%/SynthForgeStudio/settings.json`）。
 3. 打开 Blender + 插件 → 双灯变绿（≤10s）；关闭 Blender → 灯变黄（重连中）→ 再开 → 恢复绿。

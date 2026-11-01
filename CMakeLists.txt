@@ -167,8 +167,10 @@ qt_add_resources(synthforge_app "app_icons"
     PREFIX "/icons"
     BASE "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons"
     FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/app.png")
-# TODO(完工打包时)：set_target_properties(synthforge_app PROPERTIES WIN32_EXECUTABLE TRUE)
-# 改成 GUI 子系统后双击不再弹控制台，但 stdout/stderr 也看不到了；开发期先保留控制台。
+# 双击不得弹黑框：编成 Windows GUI 子系统。代价是从终端启动看不到 stderr，
+# 排查改看 %APPDATA%/SynthForgeStudio/logs/，或跑仍是控制台程序的 synthforge_cli --headless。
+# scripts/check-deps.ps1 会校验产物子系统，退回 CUI 会直接报错。
+set_target_properties(synthforge_app PROPERTIES WIN32_EXECUTABLE TRUE)
 if(WEB_DIST_FILES)
     qt_add_resources(synthforge_app "web_assets"
         PREFIX "/web"

@@ -1,0 +1,71 @@
+name: package-smoke
+
+# 目标：在一台从未装过 Qt 的 Windows 上，证明核心（无头 CLI）能自己起服务。
+# GUI 那半边由 windeployqt + check-deps 静态保证：CI 没有桌面会话，WebEngine 起不来。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  no-qt-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 只装核心库用到的模块：core 依赖 Sql / WebSockets / Gui，不需要 WebEngine
+      - name: 安装 Qt
+        id: qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.10.3"
+          arch: win64_msvc2022_64
+          modules: qtsql qtwebsockets
+          cache: true
+
+      - name: 前端构建
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: 配置并构建无头 CLI（Release）
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="${{ steps.qt.outputs.qt-dir }}"
+          cmake --build build --config Release --target synthforge_cli
+
+      # 部署到独立目录后静态扫描：依赖要么在包内，要么是系统自带
+      - name: 部署依赖并静态自检
+        run: |
+          New-Item -ItemType Directory -Path dist_ci | Out-Null
+          Copy-Item build/Release/synthforge_cli.exe dist_ci/
+          & "${{ steps.qt.outputs.qt-dir }}/bin/windeployqt.exe" --release --no-translations dist_ci/synthforge_cli.exe
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-deps.ps1 -Stage dist_ci -Exe synthforge_cli.exe
+
+      # 把 PATH 缩到只有系统目录：这一刻起本机“没有 Qt”，能不能跑全看包自己
+      - name: 无 Qt 环境冒烟：清 PATH 起服务并等 READY
+        run: |
+          $env:PATH = "C:\Windows\System32;C:\Windows"
+          $exe = Join-Path $PWD "dist_ci/synthforge_cli.exe"
+          $proc = Start-Process -FilePath $exe `
+            -ArgumentList "--headless", "--data-dir", (Join-Path $PWD "ci-data") `
+            -RedirectStandardError "cli-stderr.log" -NoNewWindow -PassThru
+          $ready = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 1
+            if ((Test-Path cli-stderr.log) -and (Select-String -Path cli-stderr.log -Pattern "READY ws=" -Quiet)) {
+              $ready = $true
+              break
+            }
+          }
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          if (-not $ready) {
+            if (Test-Path cli-stderr.log) { Get-Content cli-stderr.log }
+            throw "60 秒内没等到 READY：无 Qt 环境下核心起不来"
+          }
+          Get-Content cli-stderr.log | Select-Object -First 5

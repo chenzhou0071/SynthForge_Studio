@@ -3,3 +3,9 @@ node_modules/
 web/node_modules/
 web/dist/
 .vite/
+
+# 打包产物与本地验证的临时目录
+dist/
+dist_ci/
+ci-data/
+*.log
