@@ -1665,7 +1665,10 @@ void CoreApp::broadcastConnStatus(const QString& area, const QString& status,
     if (status == QLatin1String("ready")) {
         m_everReady.insert(area);
         m_crashNotified.remove(area); // 恢复后再次崩溃会重新出卡
-        qInfo() << QStringLiteral("桥接就绪") << area;
+        // 首次握手会先后报两次 ready：statusChanged 带空 hint，紧随的 toolsChanged 带工具数。
+        // 只记有工具数的那次，日志里就不会出现两行一模一样的“桥接就绪”。
+        if (!hint.isEmpty())
+            qInfo() << QStringLiteral("桥接就绪") << area << hint;
     } else if (status == QLatin1String("reconnecting")) {
         qWarning() << QStringLiteral("桥接重连中") << area << hint;
     } else if (status == QLatin1String("off")) {

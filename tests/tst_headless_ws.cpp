@@ -1027,6 +1027,40 @@ private slots:
             client.payloadsSince(QStringLiteral("env.status"), mark).size() > before, 12000);
     }
 
+    // 首次握手会先后报两次 ready（statusChanged 带空 hint + toolsChanged 带工具数）：
+    // 日志里只该留一行有信息量的，重复两行会让人以为桥接抖动了两次
+    void readyIsWrittenToLogOnlyOnce()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library));
+        LogService::install(dir.filePath(QStringLiteral("logs")));
+        CoreApp app({dir.path(), true, library, mockBlenderBridge()});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            client.lastEvent(QStringLiteral("conn.status"))
+                    .value(QStringLiteral("blender"))
+                    .toString()
+                == QLatin1String("ready"),
+            8000);
+        QTest::qWait(500); // 给可能重复的那一行留出时间
+
+        QFile file(LogService::currentLogFile());
+        QVERIFY2(file.open(QIODevice::ReadOnly), qPrintable(LogService::currentLogFile()));
+        const QStringList lines =
+            QString::fromUtf8(file.readAll()).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        int readyLines = 0;
+        for (const QString& line : lines)
+            if (line.contains(QStringLiteral("桥接就绪")))
+                ++readyLines;
+        QCOMPARE(readyLines, 1);
+        LogService::shutdown();
+    }
+
     // Unity 区：激活工程后 tree.refresh / file.read / fs.operate 以 <project>/Assets 为根，
     // 越界路径必须被拒（不依赖 watcher，Task 2 的树/文件链路）
     void unityProjectFileTreeAndOps()
