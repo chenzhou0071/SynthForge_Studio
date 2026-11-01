@@ -171,7 +171,10 @@ powershell -File scripts\package.ps1 -QtKit C:\Qt\6.10.3\msvc2022_64
 
 已知放行规则：`api-ms-win-*` / `ext-ms-*` 是 Windows 的 API Set，磁盘上没有对应文件，由加载器内联解析，不算缺失依赖。
 
-CI（`.github\workflows\package-smoke.yml`）在**从未装过 Qt 的 runner** 上：构建 Release 无头 CLI → `windeployqt` → 静态自检 → 把 `PATH` 缩到只剩 `C:\Windows\System32;C:\Windows` 起服务，必须在 60 秒内看到 `READY ws=`。GUI 那半边不做真启动（runner 没有桌面会话），靠上面的静态扫描兜。
+CI（`.github\workflows\package-smoke.yml`）的设计目标是在**从未装过 Qt 的 runner** 上：构建 Release 无头 CLI → `windeployqt` → 静态自检 → 把 `PATH` 缩到只剩 `C:\Windows\System32;C:\Windows` 起服务，必须在 60 秒内看到 `READY ws=`。GUI 那半边不做真启动（runner 没有桌面会话），靠上面的静态扫描兜。
+
+> **当前状态：这条流程尚未在 runner 上完整跑通过一次，而且已改成只能手动触发**（Actions → `package-smoke` → Run workflow）。
+> 它停在 configure 阶段的一个组件问题上（本地已修但未再验证）；runner 环境会自己漂移——镜像从 VS 2022 升到 VS 18、`aqtinstall` 的落地目录名不带 `win64_` 前缀，都是实跑才撞得到的。分发的可用性以上面三条本地证据为准。
 
 **目标机需要**：VC++ 2015-2022 x64 可再发行组件。开发机装了 VS 所以本机测不出这个分支，是唯一没被自动化覆盖的装机风险。
 
@@ -232,6 +235,7 @@ cmake --build build --config Debug ; ctest --test-dir build -C Debug   # 提交�
 - **没有崩溃转储、没有遥测**：出问题时得靠用户把日志文件发回来。
 - 前端只有组件级测试（jsdom），**没有端到端测试**；Release 与 Debug 的差异（qrc 资源、优化、WebEngine 行为）也没有自动化覆盖，靠打包版本机手测。
 - CI 无法验证 GUI 真实启动与 VC++ 运行库缺失分支（见[打包与分发](#打包与分发)）。
+- **`package-smoke` 这条 CI 从未完整跑绿过一次**，现已改成仅手动触发。本地等价验证（静态依赖扫描 / 裸 PATH 启动 / headless READY / Ninja 全量编译）都做过了，但“在别人的干净机器上自动重跑”这件事目前不成立。
 
 ---
 

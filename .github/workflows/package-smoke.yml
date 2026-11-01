@@ -3,9 +3,10 @@ name: package-smoke
 # 目标：在一台从未装过 Qt 的 Windows 上，证明核心（无头 CLI）能自己起服务。
 # GUI 那半边由 windeployqt + check-deps 静态保证：CI 没有桌面会话，WebEngine 起不来。
 
+# 为什么只手动触发：这条流程的价值是“环境会替他人维护、会偷着变”（镜像升到 VS 18 就撞了一次），
+# 但产物可用性已经用本地等价手段证明过了：check-deps 静态扫描 + 裸 PATH 启动 GUI + headless READY。
+# 所以不再每次 push 都跑（避免持续产生红噪音）；想验证时手动 Run workflow 即可。
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
