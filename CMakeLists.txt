@@ -5,7 +5,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Test Sql WebSockets Network WebEngineWidgets)
+# 无头核心（core / cli / 测试）只需要这几个组件
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Test Sql WebSockets Network)
+# WebEngine 只有 GUI 壳用得上，所以单独 QUIET 查：缺它的机器（比如只构建 CLI 的 CI）
+# 不该在 configure 阶段直接失败，下面按 target 是否存在决定要不要编 synthforge_app
+find_package(Qt6 6.5 QUIET COMPONENTS WebEngineWidgets)
 
 add_library(synthforge_core STATIC
     src/core/mcp/JsonRpcLineCodec.cpp
@@ -150,6 +154,7 @@ add_executable(synthforge_cli src/cli/main.cpp)
 target_link_libraries(synthforge_cli PRIVATE synthforge_core)
 
 # GUI 壳：web/dist 打进 qrc，app://ui/ 从 :/web/ 取文件
+if(TARGET Qt6::WebEngineWidgets)
 file(GLOB_RECURSE WEB_DIST_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/web/dist/*")
 add_executable(synthforge_app
     src/main.cpp
@@ -178,6 +183,9 @@ if(WEB_DIST_FILES)
         FILES ${WEB_DIST_FILES})
 else()
     message(WARNING "web/dist 为空：先运行 cd web && npm run build，否则 synthforge_app 无法加载界面")
+endif()
+else()
+    message(STATUS "没找到 Qt6::WebEngineWidgets：跳过 GUI 壳 synthforge_app（CI 只构建无头核心时就是这种情形）")
 endif()
 
 add_executable(tst_reconnect tests/tst_reconnect.cpp)
