@@ -51,13 +51,19 @@ jobs:
 
           aqt install-qt windows desktop $qtVersion $qtArch --outputdir "$env:GITHUB_WORKSPACE\Qt"
           "QT_VERSION=$qtVersion" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "QT_DIR=$env:GITHUB_WORKSPACE\Qt\$qtVersion\$qtArch" |
-            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          if (-not (Test-Path "$env:GITHUB_WORKSPACE\Qt\$qtVersion\$qtArch\bin\windeployqt.exe")) {
-              Get-ChildItem "$env:GITHUB_WORKSPACE\Qt" -Recurse -Depth 2 -Directory |
-                  Select-Object -Expand FullName
-              throw "装完没有 windeployqt.exe，上面是实际目录结构"
+
+          # aqt 的目录名不等于 arch 参数：传 win64_msvc2022_64，落地目录叫 msvc2022_64。
+          # 所以不拼路径也不猜命名：直接在版本目录里找带 windeployqt 的那个单子目录。
+          $candidates = Get-ChildItem "$env:GITHUB_WORKSPACE\Qt\$qtVersion" -Directory -ErrorAction SilentlyContinue
+          $qtDir = $candidates | Where-Object {
+              Test-Path (Join-Path $_.FullName "bin\windeployqt.exe")
+          } | Select-Object -First 1
+          if (-not $qtDir) {
+              $candidates | Select-Object -Expand FullName
+              throw "装完找不到 bin\windeployqt.exe；上面是 $qtVersion 下的实际目录"
           }
+          "QT_DIR=$($qtDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Qt 就位：$($qtDir.FullName)"
 
       # 失败时把诊断写进 step summary：Annotations 只给退出码，没这一步就只能来回猜
       - name: 安装失败时输出诊断
