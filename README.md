@@ -25,7 +25,6 @@
 - [测试](#测试)
 - [已知缺陷与限制](#已知缺陷与限制)
 - [致谢](#致谢)
-- [这个项目可以拿来学什么](#这个项目可以拿来学什么)
 - [目录结构](#目录结构)
 - [许可](#许可)
 
@@ -37,7 +36,7 @@
 
 | 区域 | 能力 |
 |---|---|
-| Blender 区 | 低模建模全链（草稿 → 计划 → 逐组执行 → 自检 → 导出）、云 API 生成（Tripo / 腾讯混元 3D / TC3 / 自定义）、修改已有资产、讨论模式（只读问答，模型不能改场景） |
+| Blender 区 | 低模建模全链（草稿 → 计划 → 逐组执行 → 自检 → 导出）、云 API 生成（只有 **Tripo** 这一条路径用真账号跑通过，其余见[已知缺陷](#已知缺陷与限制)）、修改已有资产、讨论模式（只读问答，模型不能改场景） |
 | Unity 区 | 工程导入与互斥激活、Agent 直接编辑场景/脚本/组件、Console 回读自修编译错误、文件树双源同步、添加资产（glb→fbx 转换后导入实例化） |
 
 **界面**：左侧活动栏切区、中部文件树 + 3D 预览、右侧对话区（流式气泡、计划卡、进度卡、截图、错误卡）、顶栏双灯与诊断抽屉。
@@ -197,8 +196,6 @@ cmake --build build --config Debug ; ctest --test-dir build -C Debug   # 提交�
 
 ## 已知缺陷与限制
 
-写得越诚实，越少人替我踩坑。
-
 ### 平台与环境
 
 - **仅支持 Windows**。MSVC 工具链、`windeployqt`、Qt WebEngine、控制台本地码页输出、路径分隔符假设，都没在 Linux/macOS 上验证过。
@@ -213,6 +210,12 @@ cmake --build build --config Debug ; ctest --test-dir build -C Debug   # 提交�
 - **Unity 编辑器 domain reload 会把桥打成「未找到实例」**。连接类错误会自动重试 2 次（2.5s / 5s），仍失败就停下来要求人工在 MCP for Unity 窗口点重连。
 - **MCP 客户端实现是子集**：`initialize` / `tools/list` / `tools/call` / `ping` 心跳 / `progressToken` 透传 / stdio 传输。没有 resources、prompts、sampling、elicitation，也没有 Streamable HTTP 传输与请求取消通知。
 - 桥重连的退避到 30 秒封顶后无限重试，但**首次启动失败不自动重试**（顶栏保持灰，发送时由前置检查报错）。
+
+### 云 3D 生成
+
+- **混元 3D / TC3 从未用真实账号跑通过**。只有签名与请求构造的实现，以及 mock 层的协议测试。密钥格式、region、模型名、线上实际返回结构是否与代码里的假设一致，全部未验证——把它当“已实现待验证”，而不是“可用功能”。
+- **“自定义服务商”不是通用适配层**。它复用了 Tripo 那条链路的**响应形状假设**：状态字段只认 `queued` / `success` / `failed` / `cancelled`，进度读 `progress`，产物从 `output` 里取，认证固定 `Authorization: Bearer <token>`（提交与查询的 URL 是 `POST {baseUrl}/task` 与 `GET {baseUrl}/task/{id}`，与 Tripo 官方的 `/v3/...` 路径本来就不同）。字段名或结构不同的服务接不上，需要改代码而不是改配置。
+- **未知状态一律当“继续轮询”**：`mapState` 把不认识的状态归为 `running`。好处是兼容中间态，代价是对方字段名不一样时会闷头轮到超时，而不是当场告诉你“这个服务我看不懂”。排查时看日志里 `cloud3d` 相关的行。
 
 ### 模型行为
 
@@ -246,29 +249,6 @@ cmake --build build --config Debug ; ctest --test-dir build -C Debug   # 提交�
 - 各家提供 OpenAI 兼容接口的模型服务商，以及 **[Tripo](https://tripo3d.ai)**、**腾讯混元 3D** 的云生成服务。
 
 一处需要澄清：Blender 官方也有自己的 [MCP server](https://www.blender.org/lab/mcp-server/)，本项目用的是上面那个社区版本（工具面更贴合建模脚本流），两者不通用。
-
----
-
-## 这个项目可以拿来学什么
-
-按「想解决什么问题 → 直接去读哪个文件」组织，每处都是为真实故障写的，不是为示例写的。
-
-| 想学什么 | 读这里 | 为什么值得读 |
-|---|---|---|
-| 手写 MCP / JSON-RPC 客户端 | `src/core/mcp/McpClient.cpp`、`StdioTransport.cpp`、`JsonRpcLineCodec.cpp` | ~390 行，只做 stdio 版协议，但心跳、指数退避重连（1s→30s）、请求超时、pending 结算、"曾就绪才自动重连"这些工程细节都在 |
-| 让 LLM 长时间自动执行任务的编排状态机 | `src/core/agent/AgentOrchestrator.cpp` | Build / SelfCheck / 导出三阶段、门禁互斥、工具调用计数、续跑资格、空转护栏、禁止中途导出——一个能跑的手写 agent loop |
-| 提示词工程如何被现实逼着迭代 | `src/resources/prompts/`（8 份） | 每条硬约束都对应一次真实翻车：组号权威、别复述截图细节、底座边长按真实尺度反推、禁悬空自发光面片、FX 集合的导出取舍 |
-| Qt WebEngine + 前端的混合桌面架构 | `src/main.cpp`、`src/app/AppSchemeHandler.cpp`、`src/core/ws/WsServer.cpp` | dist 打进 qrc 免外置、自定义 `app://` scheme、token 保护的本地 WebSocket、GUI 子系统与控制台的取舍 |
-| 事件驱动 GUI 与流式渲染的性能 | `web/src/components/ChatPanel.vue`、`ChatMessage.vue` | 「只重渲一条气泡」的拆分方式、粘性滚动、分组分隔条、错误卡动作与 resolved 状态 |
-| 文件系统双源同步 | `src/core/unity/DirectoryWatcher.cpp` | 防抖合并、忽略 `Library/` 与 `*.meta`、agent 写文件时的抑制窗口、>200 变更降级全量刷新、切工程后旧事件必须丢弃 |
-| 编辑器生命周期与状态机 | `src/core/unity/ProjectService.cpp` | 工程互斥激活的 `deactivating→activating→active`、等待编辑器 5s×12、重启恢复上次工程、原生目录选择的 headless 退化 |
-| 异步产物的正确判定与超时分层 | `src/core/unity/AssetImporter.cpp` | 「回执丢失但产物会迟到」怎么处理：以文件为唯一事实 + 宽限轮询 + 不阻塞事件循环 + 耗时工具单独放宽超时 |
-| 全局日志接管与轮转 | `src/core/logging/LogService.cpp` | `qInstallMessageHandler`、按天 + 50MB 轮转 + 保留 7 天、非递归锁与 `QFile` 析构死锁的规避、**文件 UTF-8 / 控制台本地码页**的双通道编码 |
-| 前后端契约如何强制同步 | `web/src/components/ErrorCard.test.ts`、`ErrorCard.vue` | 遍历后端全部错误码断言「有文案、不显示码、动作正确」，新增码忘了配文案就直接红 |
-| 没有干净机器时怎么证明产物可用 | `scripts/check-deps.ps1`、`.github/workflows/package-smoke.yml` | 递归导入表扫描、API Set 放行、GUI 子系统校验、CI 上把 PATH 缩到只剩 System32 再起服务 |
-| TDD 在一个非 Web 项目里怎么落地 | `tests/`（43 文件 / 7 000 行）、`tests/mock/` | 假 LLM 服务端（真 socket + 真 SSE 字节）、假 MCP server 可执行、`MockMcpHarness` 注入瞬断与失败；以及「测试自己写错」的识别过程 |
-
-顺带会看到的几个"坑的形状"：Windows 终端的代码页、`-File` 传空数组、PowerShell 需要 UTF-8 BOM、`QFile` 未 close 就 delete 会在持锁的日志回调里递归、增量构建产物损坏会让一堆无关测试集体段错误。
 
 ---
 
@@ -319,4 +299,4 @@ cmake --build build --config Debug ; ctest --test-dir build -C Debug   # 提交�
 1. 选定项目本身的许可证（MIT / Apache-2.0 / GPL-3.0 都有可能，但要看 Qt 的牵连）。
 2. 核对 Qt 义务：Qt6 是 **LGPLv3 / GPL 双许可**（商业许可除外），Qt WebEngine 内含 Chromium 等第三方组件。用**动态链接**（本项目即 `Qt6*.dll`）+ 随包提供 Qt 的许可与源码获取声明，是 LGPL 分发的常见合规路径；`translations`、`resources`、`qtwebengine_locales` 这些随包文件不要裁剪掉。
 
-上面的致谢列出的第三方项目各有自己的许可证（例如 `mcp-for-blender`、`MCP for Unity`、`uv`、Vue/three.js/marked/DOMPurify/highlight.js），分发前请逐个核对——**这条不是形式主义，是本项目现在还没做完的功课之一**。
+上面的致谢列出的第三方项目各有自己的许可证（例如 `mcp-for-blender`、`MCP for Unity`、`uv`、Vue/three.js/marked/DOMPurify/highlight.js），分发前请逐个核对。
