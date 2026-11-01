@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QByteArray>
 #include <QDate>
 #include <QJsonObject>
 #include <QObject>
@@ -31,4 +32,8 @@ public:
     static QString filePathFor(const QString& dir, const QDate& date, int rotate);
     static Slot nextSlot(const QDate& writtenDate, int writtenRotate, qint64 writtenSize,
                          const QDate& today, qint64 maxBytes);
+
+    // 镜像到控制台的字节：按本地码页编码，否则中文 Windows 控制台把 UTF-8 当 GBK 解，满屏乱码。
+    // 日志文件不受影响，固定 UTF-8。
+    static QByteArray consoleBytes(const QString& line);
 };

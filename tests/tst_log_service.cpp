@@ -120,6 +120,25 @@ private slots:
         QVERIFY(QFileInfo::exists(logs + QStringLiteral("/keep.txt")));
     }
 
+    // 文件固定 UTF-8，控制台按本地码页：直接喷 UTF-8 到中文 Windows 控制台就是乱码
+    void fileStaysUtf8WhileConsoleUsesLocalEncoding()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        LogService::install(dir.filePath(QStringLiteral("logs")));
+        qWarning() << QStringLiteral("桥接就绪");
+
+        QFile file(LogService::currentLogFile());
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const QByteArray bytes = file.readAll();
+        QVERIFY2(bytes.contains(QString::fromUtf8("桥接就绪").toUtf8()),
+                 "日志文件必须是 UTF-8，否则换台机器又读不出来");
+        QVERIFY2(LogService::consoleBytes(QStringLiteral("桥接就绪"))
+                     == QStringLiteral("桥接就绪").toLocal8Bit(),
+                 "控制台输出得用本地码页，不能直接喷 UTF-8 字节");
+        LogService::shutdown();
+    }
+
     // 只有 warning 及以上进事件桥：info/debug 仅落盘，避免日志洪水
     void forwardsWarningAndErrorOnly()
     {

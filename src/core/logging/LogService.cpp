@@ -99,7 +99,7 @@ void handler(QtMsgType type, const QMessageLogContext& context, const QString& m
             s.file->flush(); // 崩溃前的日志也要留在盘上
         }
     }
-    std::fprintf(stderr, "%s", line.toUtf8().constData());
+    std::fprintf(stderr, "%s", LogService::consoleBytes(line).constData());
     std::fflush(stderr);
 
     // 诊断事件桥：只有 warning 及以上转发，info/debug 仅落盘
@@ -132,6 +132,13 @@ QString LogService::filePathFor(const QString& dir, const QDate& date, int rotat
         rotate > 0 ? QStringLiteral("-%1").arg(rotate) : QString();
     return dir + QLatin1Char('/') + date.toString(QStringLiteral("yyyy-MM-dd")) + suffix
            + QStringLiteral(".log");
+}
+
+QByteArray LogService::consoleBytes(const QString& line)
+{
+    // 控制台按系统本地码页解释字节（中文 Windows 是 GBK）；直接喷 UTF-8 就是乱码。
+    // 子进程透传过来的也是本地码页原文，两者保持一致才能同屏共存。
+    return line.toLocal8Bit();
 }
 
 LogService::Slot LogService::nextSlot(const QDate& writtenDate, int writtenRotate,
