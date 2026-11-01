@@ -14,6 +14,7 @@
 #include "app/AppSchemeHandler.h"
 #include "app/MainWindow.h"
 #include "core/coreapp/CoreApp.h"
+#include "core/logging/LogService.h"
 #include "core/settings/SettingsStore.h"
 #include "core/settings/UiState.h"
 #include "core/ws/WsServer.h"
@@ -39,15 +40,21 @@ int main(int argc, char* argv[])
     app.setWindowIcon(QIcon(QStringLiteral(":/icons/app.png"))); // qrc 见 CMake app_icons
 
     const QStringList args = QCoreApplication::arguments();
+    // 启动即接管日志：GUI 壳没有控制台，出了问题只能翻 %APPDATA%/SynthForgeStudio/logs
+    const QString dataDir = dataDirFromArgs(args);
+    LogService::install(dataDir + QStringLiteral("/logs"));
+    qInfo() << QStringLiteral("SynthForge Studio 启动") << args;
+
     const int devIdx = args.indexOf(QStringLiteral("--dev-url"));
     QUrl uiUrl = devIdx >= 0 && devIdx + 1 < args.size()
                      ? QUrl(args.at(devIdx + 1))
                      : QUrl(QStringLiteral("app://ui/index.html"));
 
-    const QString dataDir = dataDirFromArgs(args);
     CoreApp core({dataDir, false});
-    if (!core.start())
+    if (!core.start()) {
+        LogService::shutdown();
         return 1;
+    }
 
     QUrlQuery query;
     query.addQueryItem(QStringLiteral("ws"),
@@ -83,5 +90,7 @@ int main(int argc, char* argv[])
     });
 
     window.show();
-    return app.exec();
+    const int code = app.exec();
+    LogService::shutdown(); // 摘掉 handler：退出过程不再往已关闭的文件里写
+    return code;
 }

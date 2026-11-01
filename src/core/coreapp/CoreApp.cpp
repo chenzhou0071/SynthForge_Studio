@@ -11,6 +11,7 @@
 #include "core/coreapp/AssetCard.h"
 #include "core/llm/LlmGateway.h"
 #include "core/llm/ToolBridge.h"
+#include "core/logging/LogService.h"
 #include "core/mcp/BridgeCommands.h"
 #include "core/mcp/McpClient.h"
 #include "core/mcp/McpRuntime.h"
@@ -220,7 +221,7 @@ void CoreApp::wireUnityOrchestrator(AgentOrchestrator* orch)
             });
     connect(orch, &AgentOrchestrator::failed, this,
             [this, orch](const QString& area, const QString& reason) {
-                m_ws->broadcastEvent(QStringLiteral("error.card"),
+                reportError(
                                      QJsonObject{{"area", area},
                                                  {"reason", reason},
                                                  {"resumable", orch->canResume(area)},
@@ -386,7 +387,7 @@ bool CoreApp::start()
                         QStringLiteral("draft.failed"),
                         QJsonObject{{"area", area}, {"id", regenId}, {"reason", reason}});
                 }
-                m_ws->broadcastEvent(QStringLiteral("error.card"),
+                reportError(
                                      QJsonObject{{"area", area}, {"reason", reason}});
             });
 
@@ -412,7 +413,7 @@ bool CoreApp::start()
             });
     connect(m_ask.get(), &DiscussionAgent::failed, this,
             [this](const QString& area, const QString& reason) {
-                m_ws->broadcastEvent(QStringLiteral("error.card"),
+                reportError(
                                      QJsonObject{{"area", area}, {"reason", reason}});
                 if (const QString tid = m_askWait.take(area); !tid.isEmpty()) {
                     m_sessions->upsertTask(tid, area, QStringLiteral("chat"),
@@ -487,7 +488,7 @@ bool CoreApp::start()
     connect(m_orch, &AgentOrchestrator::failed, this,
             [this](const QString& area, const QString& reason) {
                 // 步数耗尽时前端给「继续工作」：带上用量，让用户知道还差多少
-                m_ws->broadcastEvent(QStringLiteral("error.card"),
+                reportError(
                                      QJsonObject{{"area", area},
                                                  {"reason", reason},
                                                  {"resumable", m_orch->canResume(area)},
@@ -700,7 +701,7 @@ bool CoreApp::start()
         if (!cloud) {
             const PreflightResult pre = m_preflight->checkLowpoly();
             if (!pre.ok) {
-                m_ws->broadcastEvent(QStringLiteral("error.card"),
+                reportError(
                                      QJsonObject{{"area", area}, {"reason", pre.reason}});
                 return QJsonValue(QJsonObject{{"accepted", false}, {"reason", pre.reason}});
             }
@@ -1478,7 +1479,7 @@ bool CoreApp::start()
                                                  {"waiting", true}, {"attempt", attempt}});
             });
     connect(m_projects, &ProjectService::errorOccurred, this, [this](const QString& reason) {
-        m_ws->broadcastEvent(QStringLiteral("error.card"),
+        reportError(
                              QJsonObject{{"area", "unity"}, {"reason", reason}});
     });
 
@@ -1573,7 +1574,7 @@ bool CoreApp::start()
             QJsonArray{relative},
             [this, params, relative](bool ok, const QStringList& fbx, const QString& error) {
                 if (!ok || fbx.isEmpty()) {
-                    m_ws->broadcastEvent(QStringLiteral("error.card"),
+                    reportError(
                                          QJsonObject{{"area", "unity"},
                                                     {"reason", ok ? QStringLiteral("invalid-attachment") : error}});
                     return;
@@ -1582,7 +1583,7 @@ bool CoreApp::start()
                     fbx.first(), params,
                     [this, relative](bool imported, const QString& importError) {
                         if (!imported) {
-                            m_ws->broadcastEvent(QStringLiteral("error.card"),
+                            reportError(
                                                  QJsonObject{{"area", "unity"}, {"reason", importError}});
                             return;
                         }
@@ -1613,8 +1614,23 @@ bool CoreApp::start()
                      m_ws->token().toUtf8().constData());
         std::fflush(stderr);
     }
+    // 诊断事件桥：warning 及以上实时广播给前端。不回放历史：日志文件才是真相源，
+    // 客户端连接之前的日志只能去翻盘上的文件。
+    LogService::setEventSink(this, [this](const QJsonObject& entry) {
+        m_ws->broadcastEvent(QStringLiteral("log.append"), entry);
+    });
+
     m_blender->start(); // 异步启动：握手完成后通过 conn.status 点亮顶栏
     return true;
+}
+
+void CoreApp::reportError(const QJsonObject& card)
+{
+    m_ws->broadcastEvent(QStringLiteral("error.card"), card);
+    // 盘上留一行：前端一关就查不到的失败，至少时间线与 reason 还在
+    qWarning() << QStringLiteral("错误卡") << card.value(QStringLiteral("area")).toString()
+               << card.value(QStringLiteral("reason")).toString()
+               << card.value(QStringLiteral("message")).toString();
 }
 
 void CoreApp::registerBridge(const QString& area, RestartFn fn)
@@ -1636,13 +1652,18 @@ void CoreApp::broadcastConnStatus(const QString& area, const QString& status,
     if (status == QLatin1String("ready")) {
         m_everReady.insert(area);
         m_crashNotified.remove(area); // 恢复后再次崩溃会重新出卡
-    } else if (status == QLatin1String("off") && m_everReady.contains(area)
-               && !m_crashNotified.contains(area)) {
-        m_crashNotified.insert(area); // 一次断链只报一张卡（重试循环不重复弹）
-        m_ws->broadcastEvent("error.card",
-                             QJsonObject{{"area", area},
-                                         {"reason", "bridge-crashed"},
-                                         {"message", hint}});
+        qInfo() << QStringLiteral("桥接就绪") << area;
+    } else if (status == QLatin1String("reconnecting")) {
+        qWarning() << QStringLiteral("桥接重连中") << area << hint;
+    } else if (status == QLatin1String("off")) {
+        if (m_everReady.contains(area) && !m_crashNotified.contains(area)) {
+            m_crashNotified.insert(area); // 一次断链只报一张卡（重试循环不重复弹）
+            reportError(QJsonObject{{"area", area},
+                                    {"reason", "bridge-crashed"},
+                                    {"message", hint}});
+        } else if (!m_everReady.contains(area)) {
+            qWarning() << QStringLiteral("桥接未就绪") << area << hint;
+        }
     }
 }
 
@@ -1705,12 +1726,12 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
     // Unity 区：不走草稿→计划两步（规格 8.4），前置校验后直接构造单组计划执行
     if (area == QLatin1String("unity")) {
         if (m_projects->activePath().isEmpty()) {
-            m_ws->broadcastEvent(QStringLiteral("error.card"),
+            reportError(
                                  QJsonObject{{"area", "unity"}, {"reason", "project-not-active"}});
             return QJsonValue(QJsonObject{{"accepted", false}});
         }
         if (!m_unity || !m_unity->isReady()) {
-            m_ws->broadcastEvent(QStringLiteral("error.card"),
+            reportError(
                                  QJsonObject{{"area", "unity"}, {"reason", "unity-not-ready"}});
             return QJsonValue(QJsonObject{{"accepted", false}});
         }
@@ -1761,7 +1782,7 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
     if (mode == QLatin1String("cloud3d")) {
         const PreflightResult pre = m_preflight->checkCloud3d();
         if (!pre.ok) {
-            m_ws->broadcastEvent(QStringLiteral("error.card"),
+            reportError(
                                  QJsonObject{{"area", area}, {"reason", pre.reason}});
             return QJsonValue(QJsonObject{{"accepted", false}});
         }
@@ -1783,7 +1804,7 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         }
         const LlmConfig cfg = primaryAgentConfig();
         if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty() || cfg.model.isEmpty()) {
-            m_ws->broadcastEvent(QStringLiteral("error.card"),
+            reportError(
                                  QJsonObject{{"area", area}, {"reason", "agent-not-configured"}});
             return QJsonValue(QJsonObject{{"accepted", false}, {"reason", "agent-not-configured"}});
         }
@@ -1881,7 +1902,7 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         }
         const LlmConfig cfg = primaryAgentConfig();
         if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty() || cfg.model.isEmpty()) {
-            m_ws->broadcastEvent(QStringLiteral("error.card"),
+            reportError(
                                  QJsonObject{{"area", area}, {"reason", "agent-not-configured"}});
             return QJsonValue(
                 QJsonObject{{"accepted", false}, {"reason", "agent-not-configured"}});
@@ -1905,7 +1926,7 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         }
         const LlmConfig cfg = primaryAgentConfig();
         if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty() || cfg.model.isEmpty()) {
-            m_ws->broadcastEvent(QStringLiteral("error.card"),
+            reportError(
                                  QJsonObject{{"area", area}, {"reason", "agent-not-configured"}});
             return QJsonValue(
                 QJsonObject{{"accepted", false}, {"reason", "agent-not-configured"}});
@@ -1930,7 +1951,7 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
         }
         const LlmConfig cfg = primaryAgentConfig();
         if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty() || cfg.model.isEmpty()) {
-            m_ws->broadcastEvent(QStringLiteral("error.card"),
+            reportError(
                                  QJsonObject{{"area", area}, {"reason", "agent-not-configured"}});
             return QJsonValue(
                 QJsonObject{{"accepted", false}, {"reason", "agent-not-configured"}});
@@ -1952,7 +1973,7 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
 
     const LlmConfig cfg = primaryAgentConfig();
     if (cfg.baseUrl.isEmpty() || cfg.apiKey.isEmpty() || cfg.model.isEmpty()) {
-        m_ws->broadcastEvent(QStringLiteral("error.card"),
+        reportError(
                              QJsonObject{{"area", area}, {"reason", "agent-not-configured"}});
         return QJsonValue(
             QJsonObject{{"accepted", false}, {"reason", "agent-not-configured"}});
@@ -2002,7 +2023,7 @@ QJsonValue CoreApp::handleChatSend(const QJsonObject& params, bool appendUser)
                 m_sessions->upsertTask(tid, area, QStringLiteral("chat"),
                                        QStringLiteral("failed"), params,
                                        QJsonObject{{"error", error}});
-                m_ws->broadcastEvent(QStringLiteral("error.card"),
+                reportError(
                                      QJsonObject{{"area", area}, {"reason", error}});
                 tm->finish(tid);
             };

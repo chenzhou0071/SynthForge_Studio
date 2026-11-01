@@ -7,6 +7,7 @@
 #include "core/tasks/TaskManager.h"
 
 #include <QBuffer>
+#include <QDebug>
 #include <QDir>
 #include <QFileInfo>
 #include <QImage>
@@ -658,6 +659,18 @@ void AgentOrchestrator::executeToolCalls(const QJsonArray& calls)
             if (m_toolCallHook)
                 m_toolCallHook(name, false);
             emit toolStep(m_area, name, error.isEmpty() ? "done" : "error");
+            // 工具报错不一定会弹错误卡（模型自己可能消化掉），但盘上必须留一行：
+            // 事后只能靠这行知道是哪个工具、输出了什么
+            if (!error.isEmpty() || result.toObject().value(QStringLiteral("isError")).toBool()) {
+                QString detail = error.value(QStringLiteral("message")).toString();
+                if (detail.isEmpty()) {
+                    for (const QJsonValue& item :
+                         result.toObject().value(QStringLiteral("content")).toArray())
+                        detail += item.toObject().value(QStringLiteral("text")).toString()
+                                  + QLatin1Char(' ');
+                }
+                qWarning() << QStringLiteral("工具失败") << m_area << name << detail.left(200);
+            }
             QStringList images;
             m_messages.append(toolResultMessage(call.value(QStringLiteral("id")).toString(),
                                                 result, error, &images));
@@ -705,6 +718,8 @@ void AgentOrchestrator::callToolWithRetry(
                                 finishCall(result, error);
                                 return;
                             }
+                            qWarning() << QStringLiteral("桥接瞬断，重试第") << attempt + 1
+                                       << QStringLiteral("次") << m_area << name;
                             emit toolStep(m_area, name, "running"); // 前端能看到还在等
                             QTimer::singleShot(kBridgeRetryDelaysMs[attempt], this,
                                                [this, name, args, finishCall, attempt]() {

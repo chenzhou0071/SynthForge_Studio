@@ -1,11 +1,13 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QSignalSpy>
+#include <QTemporaryDir>
 #include <QtTest>
 
 #include "core/agent/AgentOrchestrator.h"
 #include "core/llm/LlmGateway.h"
 #include "core/llm/ToolMessage.h"
+#include "core/logging/LogService.h"
 #include "core/mcp/BlenderGate.h"
 #include "core/tasks/TaskManager.h"
 #include "mock/MockLlmServer.h"
@@ -907,6 +909,56 @@ private slots:
                  "道具档没提醒清掉误长的底座");
         // 道具没有氛围层，那句舞台档的 FX 交代不该出现
         QVERIFY(!exportTurn.contains(QStringLiteral("已被有意排除")));
+    }
+
+    // 工具失败与桥瞬断重试都不会弹错误卡，事后只能靠日志追：这两条路径必须留痕
+    void toolFailureAndBridgeRetryAreWrittenToLog()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        LogService::install(dir.filePath(QStringLiteral("logs")));
+        QObject context;
+        QStringList lines;
+        LogService::setEventSink(&context,
+                                 [&lines](const QJsonObject& entry) {
+                                     lines << entry.value(QStringLiteral("message")).toString();
+                                 });
+
+        MockLlmServer server({toolTurn(QStringLiteral("manage_scene")),
+                              textTurn(QStringLiteral("建好了")),
+                              textTurn(QStringLiteral("自检通过"))});
+        QVERIFY(server.listen());
+        LlmGateway llm;
+        MockMcpHarness mcp;
+        mcp.transientFailures = 3; // 连重试额度用完：先重试、再把错误交回模型
+        AgentOrchestrator orch(&llm, &mcp.client(), nullptr);
+        orch.setModelConfig(server.config());
+        BuildPlan plan;
+        plan.groups = {{QStringLiteral("Unity 任务"), {}, {},
+                       QStringLiteral("read_console 无编译错误")}};
+        plan.maxSteps = 10;
+        QSignalSpy finalSpy(&orch, &AgentOrchestrator::finalText);
+
+        orch.execute(QStringLiteral("t-log"), nullptr, QJsonArray{}, plan,
+                     QStringLiteral("建一个红方块"), QStringLiteral("Assets"),
+                     QStringLiteral("unity"));
+        QTRY_COMPARE_WITH_TIMEOUT(finalSpy.count(), 1, 20000);
+
+        // 重试退避要 2.5s+5s，事件桥又是异步的，给足时间
+        const QString all = [&lines] {
+            for (int attempt = 0; attempt < 40; ++attempt) {
+                const QString joined = lines.join(QLatin1Char('|'));
+                if (joined.contains(QStringLiteral("重试"))
+                    && joined.contains(QStringLiteral("工具失败")))
+                    return joined;
+                QTest::qWait(200);
+            }
+            return lines.join(QLatin1Char('|'));
+        }();
+        QVERIFY2(all.contains(QStringLiteral("重试")), qPrintable(all)); // 桥瞬断重试没留痕
+        QVERIFY2(all.contains(QStringLiteral("工具失败")), qPrintable(all)); // 工具失败没留痕
+        QVERIFY2(all.contains(QStringLiteral("manage_scene")), qPrintable(all)); // 得知道是哪个工具
+        LogService::shutdown();
     }
 };
 

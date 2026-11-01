@@ -17,6 +17,7 @@
 #include <QtTest>
 
 #include "core/coreapp/CoreApp.h"
+#include "core/logging/LogService.h"
 #include "core/mcp/BridgeCommands.h"
 #include "core/store/SessionStore.h"
 #include "core/ws/WsServer.h"
@@ -164,6 +165,18 @@ public:
                         .toString();
         }
         return text;
+    }
+
+    // mark 之后某类事件的全部 payload：用于统计条数与按内容过滤
+    QList<QJsonObject> payloadsSince(const QString& name, int mark = 0) const
+    {
+        QList<QJsonObject> out;
+        for (int i = mark; i < m_log.size(); ++i) {
+            const QJsonObject& frame = m_log.at(i);
+            if (frame.value(QStringLiteral("event")).toString() == name)
+                out.append(frame.value(QStringLiteral("data")).toObject());
+        }
+        return out;
     }
 
 private:
@@ -902,6 +915,74 @@ private slots:
         QVERIFY(audio.value(QStringLiteral("dataUrl"))
                     .toString()
                     .startsWith(QStringLiteral("data:audio/wav;base64,")));
+    }
+
+    // 诊断事件桥：warning 及以上实时广播给已连接的客户端，info/debug 只落盘不广播
+    void logAppendBroadcastsWarningButNotInfo()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library));
+        // 真实入口（main.cpp / cli）是先装 handler 再起 core：这里同样走一遍启动顺序
+        LogService::install(dir.filePath(QStringLiteral("logs")));
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+        QTest::qWait(50); // 启动类事件先落地，免得和日志桥混在一起
+        const int mark = client.mark();
+
+        qInfo() << QStringLiteral("日志桥-info");
+        qWarning() << QStringLiteral("日志桥-warning");
+        QTRY_VERIFY_WITH_TIMEOUT(!client.payloadsSince(QStringLiteral("log.append"), mark).isEmpty(),
+                                 3000);
+
+        const QList<QJsonObject> entries = client.payloadsSince(QStringLiteral("log.append"), mark);
+        QString joined;
+        for (const QJsonObject& entry : entries) {
+            QCOMPARE(entry.value(QStringLiteral("level")).toString(), QStringLiteral("warning"));
+            QVERIFY(entry.keys().contains(QStringLiteral("time"))); // 前端要能显示时刻
+            joined += entry.value(QStringLiteral("message")).toString() + QLatin1Char('|');
+        }
+        // Qt 流式日志会给字符串参数加双引号（message 实际是 "日志桥-warning"），所以按子串比
+        QVERIFY2(joined.contains(QStringLiteral("日志桥-warning")), qPrintable(joined));
+        QVERIFY2(!joined.contains(QStringLiteral("日志桥-info")), "info 不该广播");
+        LogService::shutdown(); // 不摘掉会把后续用例的告警一起广播出去
+    }
+
+    // 业务错误必须落盘：error.card 只发给了前端，用户关掉窗口就什么都查不到
+    void businessErrorIsWrittenToLogFile()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString library = dir.filePath(QStringLiteral("library"));
+        QVERIFY(QDir().mkpath(library));
+        LogService::install(dir.filePath(QStringLiteral("logs")));
+        CoreApp app({dir.path(), true, library});
+        QVERIFY(app.start());
+        WsClient client;
+        QVERIFY(client.connectTo(app));
+        const int mark = client.mark();
+
+        // 讨论模式不查桥接，只查 Agent 配置：未配置必报 agent-not-configured
+        const QJsonObject reply = client.request(
+            QStringLiteral("chat.send"),
+            {{QStringLiteral("area"), QStringLiteral("blender")},
+             {QStringLiteral("text"), QStringLiteral("你好")},
+             {QStringLiteral("mode"), QStringLiteral("ask")}});
+        QCOMPARE(reply.value(QStringLiteral("accepted")).toBool(), false);
+        QVERIFY(!client.lastEvent(QStringLiteral("error.card"), mark).isEmpty()); // 原有行为
+
+        qInfo() << QStringLiteral("埋点验证占位行"); // 日志文件懒创建，先确保它存在
+        const QString logPath = LogService::currentLogFile();
+        QVERIFY(!logPath.isEmpty());
+        QFile file(logPath);
+        QVERIFY2(file.open(QIODevice::ReadOnly), qPrintable(logPath));
+        const QString text = QString::fromUtf8(file.readAll());
+        QVERIFY2(text.contains(QStringLiteral("agent-not-configured")),
+                 qPrintable(text)); // 同一件错得在盘上留下痕迹
+        LogService::shutdown();
     }
 
     // Unity 区：激活工程后 tree.refresh / file.read / fs.operate 以 <project>/Assets 为根，

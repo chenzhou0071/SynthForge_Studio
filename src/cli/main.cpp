@@ -9,6 +9,7 @@
 #include <cstdio>
 
 #include "core/coreapp/CoreApp.h"
+#include "core/logging/LogService.h"
 #include "core/mcp/BridgeCommands.h"
 #include "core/mcp/McpClient.h"
 #include "core/mcp/StdioTransport.h"
@@ -28,14 +29,19 @@ int main(int argc, char* argv[])
         // 先亮出实际数据目录：自动测试靠它确认没有写到真实用户配置
         std::fprintf(stderr, "data dir: %s\n", dataDir.toUtf8().constData());
         std::fflush(stderr);
+        // 常驻服务同样接管日志；一次性冒烟命令不接管，免得改动 stdout/stderr 的解析语义
+        LogService::install(dataDir + QStringLiteral("/logs"));
         CoreApp core({dataDir, true});
         if (!core.start()) {
             std::fprintf(stderr, "error: core start failed (data dir: %s)\n",
                          dataDir.toUtf8().constData());
             std::fflush(stderr);
+            LogService::shutdown();
             return 1;
         }
-        return QCoreApplication::exec();
+        const int code = QCoreApplication::exec();
+        LogService::shutdown();
+        return code;
     }
 
     QCoreApplication::setApplicationName(QStringLiteral("synthforge-cli"));

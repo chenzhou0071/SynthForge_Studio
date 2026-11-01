@@ -15,6 +15,7 @@ add_library(synthforge_core STATIC
     src/core/mcp/StdioTransport.cpp
     src/core/mcp/BridgeCommands.cpp
     src/core/mcp/BlenderGate.cpp
+    src/core/logging/LogService.cpp
     src/core/preflight/PreflightChecker.cpp
     src/core/settings/SettingsStore.cpp
     src/core/settings/UiState.cpp
@@ -192,6 +193,13 @@ add_test(NAME tst_heartbeat_long COMMAND tst_heartbeat_long)
 set_tests_properties(tst_heartbeat_long PROPERTIES
     LABELS "slow"
     TIMEOUT 120
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+add_executable(tst_log_service tests/tst_log_service.cpp)
+target_link_libraries(tst_log_service PRIVATE synthforge_core Qt6::Test)
+add_test(NAME tst_log_service COMMAND tst_log_service)
+set_tests_properties(tst_log_service PROPERTIES
+    TIMEOUT 60
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
 add_executable(tst_settings_store tests/tst_settings_store.cpp)

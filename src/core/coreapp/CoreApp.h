@@ -80,6 +80,9 @@ private:
     QJsonValue startModify(const QString& area, const QString& asset, const QString& text);
     // 按 .blend 相对路径回查该资产的产出形态（prop/diorama/open），查不到返回空
     QString assetShapeForPath(const QString& area, const QString& blendRelative) const;
+    // 错误统一出口：广播 error.card 的同时往日志落一行。只发前端的话，用户关掉窗口这次失败就没痕迹了。
+    void reportError(const QJsonObject& card);
+
     void broadcastConnStatus(const QString& area, const QString& status, const QString& hint);
     // Unity 编排器的信号接线：复用与 blender 同构的通用广播（不含 blender 专属的 plan/导出卡）
     void wireUnityOrchestrator(AgentOrchestrator* orch);
