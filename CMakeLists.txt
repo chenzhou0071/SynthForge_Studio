@@ -5,8 +5,9 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-# 无头核心（core / cli / 测试）只需要这几个组件
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Test Sql WebSockets Network)
+# 无头核心（core / cli / 测试）需要的组件。Gui 必须显式列出：
+# 以前它是靠 WebEngineWidgets 传递进来的，把 WebEngine 改成可选后不写就会“target 找不到”
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Test Sql WebSockets Network)
 # WebEngine 只有 GUI 壳用得上，所以单独 QUIET 查：缺它的机器（比如只构建 CLI 的 CI）
 # 不该在 configure 阶段直接失败，下面按 target 是否存在决定要不要编 synthforge_app
 find_package(Qt6 6.5 QUIET COMPONENTS WebEngineWidgets)
